@@ -79,12 +79,23 @@ def _check_demand(df_raw: pd.DataFrame):
         if not bad.empty:
             raise ValueError(f"demand: column '{col}' has values outside [0,1]. Offenders (first 5 rows):\n{bad.head(5)}")
 
-def _check_injection_distribution(df_raw: pd.DataFrame):
-    df = _norm_cols(df_raw)
+def _check_injection_distribution(df: pd.DataFrame):
     required = {"facility_name", "absolute_share"}
-    missing = sorted(required - set(df.columns))
-    if missing:
-        _fail(f"injection_distribution missing required columns: {missing}", df)
+    if not required.issubset(df.columns):
+        missing = required - set(df.columns)
+        raise ValueError(f"injection_distribution missing required columns: {sorted(missing)}")
+    # Enabled flag optional, but if present must be 0/1
+    if "enabled_for_injection" in df.columns:
+        bad = ~pd.to_numeric(df["enabled_for_injection"], errors="coerce").isin([0, 1])
+        if bad.any():
+            raise ValueError("injection_distribution.enabled_for_injection must be 0/1 when present")
+    # absolute_share must sum > 0 across enabled rows
+    tmp = df.copy()
+    if "enabled_for_injection" in tmp.columns:
+        tmp = tmp[tmp["enabled_for_injection"].astype(int) == 1]
+    w = pd.to_numeric(tmp["absolute_share"], errors="coerce").fillna(0.0)
+    if float(w.sum()) <= 0:
+        raise ValueError("injection_distribution.absolute_share must sum > 0 over enabled rows")
 
 def _check_mileage_bands(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)

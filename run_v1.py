@@ -14,16 +14,16 @@ from veho_net.reporting import (
     build_dwell_hotspots,
     build_facility_rollup,
     add_zone,
+    build_lane_summary,   # compat shim around arc_summary
 )
 from veho_net.write_outputs import write_workbook, write_compare_workbook
-from veho_net.config import OUTPUT_DIR
 
-
-# ------------------------------------------------------------
-# File naming control (edit these to change output filenames)
+# ----------------------------
+# Output naming control
+# ----------------------------
 OUTPUT_FILE_TEMPLATE = "{scenario_id}_results_v1.xlsx"
 COMPARE_FILE_TEMPLATE = "{base_id}_compare.xlsx"
-# ------------------------------------------------------------
+# ----------------------------
 
 
 def _run_one_strategy(
@@ -43,26 +43,25 @@ def _run_one_strategy(
     out_dir: Path,
 ):
     """
-    Executes a single strategy (container or fluid) for one scenarios row.
-    Returns:
-        scenario_id, out_path, kpis (pd.Series)
+    Run one strategy ('container' or 'fluid') for a single scenario row.
+    Returns: (scenario_id, out_path, kpis: pd.Series)
     """
-    # containers per truck (for reporting)
-    containers_per_truck = int(
-        cont[cont["container_type"].str.lower() == "gaylord"].iloc[0]["containers_per_truck"]
-    )
-
+    # Scenario primitives
     year = int(scenario_row["year"]) if "year" in scenario_row else int(scenario_row["demand_year"])
     day_type = str(scenario_row["day_type"]).strip().lower()
 
-    # Scenario ID: base_id + strategy suffix
+    # Scenario id uses base_id + strategy for clarity
     scenario_id = f"{base_id}_{strategy}"
 
-    # Timing: inject strategy for time/cost functions
+    # Inject load strategy into timing for cost/time functions
     timing_local = dict(timing)
     timing_local["load_strategy"] = strategy
 
-    # Build OD + DIRECT (day-type MM shares)
+    # Parent-hub enforcement threshold into facilities attrs for candidate_paths
+    facilities = facilities.copy()
+    facilities.attrs["enforce_parent_hub_over_miles"] = int(run_kv.get("enforce_parent_hub_over_miles", 500))
+
+    # Build OD and direct-injection (this respects peak/offpeak middle-mile shares from demand)
     year_demand = demand.query("year == @year").copy()
     od, dir_fac, _dest_pop = build_od_and_direct(facilities, zips, year_demand, inj)
 
@@ -70,19 +69,20 @@ def _run_one_strategy(
     direct_day_col = "dir_pkgs_offpeak_day" if day_type == "offpeak" else "dir_pkgs_peak_day"
     od = od[od[od_day_col] > 0].copy()
 
-    # Candidate paths (shortest direct/1-touch/2-touch); pass bands & guard factor
+    # Candidate paths with policy-first rules (parent hub enforced above threshold)
     around_factor = float(run_kv.get("path_around_the_world_factor", 2.0))
     cands = candidate_paths(od, facilities, mb, around_factor=around_factor)
+    if cands.empty:
+        print(f"[{scenario_id}] No candidate paths generated. Skipping.")
+        return scenario_id, None, pd.Series(dtype=float)
 
-    # Candidate timing/cost + steps
+    # Compute timing/cost for each candidate and collect detailed per-leg steps
     cand_rows, detail_rows, direct_dist = [], [], {}
     for _, r in cands.iterrows():
         sub = od[(od["origin"] == r["origin"]) & (od["dest"] == r["dest"])]
         if sub.empty:
             continue
         pkgs_day = float(sub.iloc[0][od_day_col])
-
-        path_str = r["path_str"]
 
         cost, hours, sums, steps = path_cost_and_time(
             r, facilities, mb, timing_local, costs, pkgmix, cont, pkgs_day
@@ -94,11 +94,10 @@ def _run_one_strategy(
                 "scenario_id": scenario_id,
                 "origin": r["origin"],
                 "dest": r["dest"],
-                "year": year,
                 "day_type": day_type,
                 "path_type": r["path_type"],
                 "path_nodes": r.get("path_nodes", None),
-                "path_str": path_str,
+                "path_str": r.get("path_str", "->".join(r["path_nodes"]) if isinstance(r.get("path_nodes"), list) else None),
                 "pkgs_day": pkgs_day,
                 "containers_cont": conts,
                 "time_hours": hours,
@@ -119,7 +118,7 @@ def _run_one_strategy(
                 "dest": r["dest"],
                 "day_type": day_type,
                 "path_type": r["path_type"],
-                "path_str": path_str,
+                "path_str": r.get("path_str"),
                 "pkgs_day": pkgs_day,
                 "containers_cont": conts,
             }
@@ -131,11 +130,13 @@ def _run_one_strategy(
             direct_dist[key] = sums["distance_miles_total"]
 
     cand_tbl = pd.DataFrame(cand_rows)
+    detail_all = pd.DataFrame(detail_rows)
+
     if cand_tbl.empty:
         print(f"[{scenario_id}] No OD volume for {day_type}. Skipping.")
         return scenario_id, None, pd.Series(dtype=float)
 
-    # MILP path selection with arc pooling
+    # MILP selection with arc pooling
     selected_basic, arc_summary = solve_arc_pooled_path_selection(
         cand_tbl[
             [
@@ -157,16 +158,16 @@ def _run_one_strategy(
         costs,
     )
 
-    # Merge back timing/candidate metrics for chosen rows (avoid list keys)
+    # Merge back candidate metrics
     merge_keys = ["scenario_id", "origin", "dest", "day_type", "path_str"]
     selected = selected_basic.merge(
-        cand_tbl.drop(columns=["year"]),
+        cand_tbl,
         on=merge_keys,
         how="left",
         suffixes=("", "_cand"),
     )
 
-    # ---- Normalize candidate metric column names (avoid *_cand surprises) ----
+    # Normalize possible *_cand columns (keep canonical names)
     cand_rename = {
         "distance_miles_cand": "distance_miles",
         "linehaul_hours_cand": "linehaul_hours",
@@ -181,26 +182,25 @@ def _run_one_strategy(
         if old in selected.columns and new not in selected.columns:
             selected = selected.rename(columns={old: new})
 
-    # Flags (around-the-world, SLA target days from run_settings)
+    # Build flags (around-the-world, SLA)
     dd = pd.Series(direct_dist, name="distance_miles")
-    dd.index = pd.MultiIndex.from_tuples(dd.index, names=["scenario_id", "origin", "dest", "day_type"])
+    if not dd.empty:
+        dd.index = pd.MultiIndex.from_tuples(dd.index, names=["scenario_id", "origin", "dest", "day_type"])
     flags = {
         "path_around_the_world_factor": float(run_kv.get("path_around_the_world_factor", 2.0)),
         "sla_target_days": int(run_kv.get("sla_target_days", 3)),
     }
     od_out = build_od_selected_outputs(selected, dd, flags)
     od_out["scenario_id"] = scenario_id
-    od_out["containers_per_truck"] = containers_per_truck
 
-    # Zones (add if not present)
+    # Zones
     od_out = add_zone(od_out, facilities)
 
-    # Keep only selected steps for detail
-    detail_all = pd.DataFrame(detail_rows)
+    # Selected steps only
     key_cols = ["scenario_id", "origin", "dest", "day_type", "path_type", "path_str"]
     detail_sel = detail_all.merge(od_out[key_cols].drop_duplicates(), on=key_cols, how="inner")
 
-    # Facility-level direct day for this year/day type (origin lens needs direct at O==D; direct_day is dest-based)
+    # Direct day (origin lens needs O==D as facility==dest)
     direct_day = (
         dir_fac[dir_fac["year"] == year][["dest", direct_day_col]]
         .groupby("dest", as_index=False)[direct_day_col]
@@ -208,7 +208,7 @@ def _run_one_strategy(
         .rename(columns={direct_day_col: "dir_pkgs_day"})
     )
 
-    # Facility rollup (origin-based CPPs + zones)
+    # Facility rollup (origin lens) + lane summary
     facility_rollup = build_facility_rollup(
         facilities=facilities,
         zips=zips,
@@ -219,12 +219,14 @@ def _run_one_strategy(
         costs=costs,
         load_strategy=strategy,
     )
+    lane_summary = build_lane_summary(arc_summary)
 
+    # Scenario summary + dwell hotspots + KPIs
     scen_sum = _scenario_summary(run_kv, scenario_id, year, day_type, mb, timing_local, cont)
     dwell_hotspots = build_dwell_hotspots(detail_sel)
     kpis = _network_kpis(od_out)
 
-    # Write workbook
+    # Write xlsx
     out_path = out_dir / OUTPUT_FILE_TEMPLATE.format(scenario_id=scenario_id)
     write_workbook(
         out_path,
@@ -233,31 +235,33 @@ def _run_one_strategy(
         detail_sel,
         dwell_hotspots,
         facility_rollup,
-        arc_summary,
+        lane_summary,      # write lane summary (arc-level aggregations)
         kpis,
     )
 
-    # Console reconciliation
+    # Console reconciliation (sanity check)
     annual_total = float(demand.query("year == @year")["annual_pkgs"].sum())
     daily_off = float(demand.query("year == @year")["offpeak_pct_of_annual"].iloc[0])
     daily_peak = float(demand.query("year == @year")["peak_pct_of_annual"].iloc[0])
     expected_daily_total = annual_total * (daily_peak if day_type == "peak" else daily_off)
     actual_daily_total = direct_day["dir_pkgs_day"].sum() + od_out["pkgs_day"].sum()
-    print(
-        f"[{scenario_id}] expected daily={expected_daily_total:,.0f}; actual (direct+MMdest)={actual_daily_total:,.0f}"
-    )
+    print(f"[{scenario_id}] expected daily={expected_daily_total:,.0f}; actual (direct+MMdest)={actual_daily_total:,.0f}")
 
     return scenario_id, out_path, kpis
 
 
 def main(input_path: str, output_dir: str | None):
     inp = Path(input_path)
-    out_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+    out_dir = Path(output_dir) if output_dir else Path("outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load workbook using our helper (handles dtype/cols well)
     dfs = load_workbook(inp)
+
+    # Validate schemas and critical columns
     validate_inputs(dfs)
 
+    # Extract sheets with canonical names
     facilities = dfs["facilities"].copy()
     zips = dfs["zips"].copy()
     demand = dfs["demand"].copy()
@@ -270,10 +274,10 @@ def main(input_path: str, output_dir: str | None):
     run_kv = params_to_dict(dfs["run_settings"])
     scenarios = dfs["scenarios"].copy()
 
+    # Compare mode
     compare_mode = str(run_kv.get("compare_mode", "single")).strip().lower()
-    valid_modes = {"single", "paired"}
-    if compare_mode not in valid_modes:
-        raise ValueError(f"run_settings.compare_mode must be one of {valid_modes}, got '{compare_mode}'")
+    if compare_mode not in {"single", "paired"}:
+        raise ValueError(f"run_settings.compare_mode must be 'single' or 'paired', got '{compare_mode}'")
 
     for _, s in scenarios.iterrows():
         # base id: prefer pair_id if present, else year_dayType
@@ -287,8 +291,10 @@ def main(input_path: str, output_dir: str | None):
             scenario_id, out_path, _kpis = _run_one_strategy(
                 base_id, strategy, facilities, zips, demand, inj, mb, timing, costs, cont, pkgmix, run_kv, s, out_dir
             )
-            print(f"Wrote {out_path}")
+            if out_path:
+                print(f"Wrote {out_path}")
         else:
+            # paired run: container and fluid; write a small compare workbook
             per_base = []
             for strategy in ["container", "fluid"]:
                 scenario_id, out_path, kpis = _run_one_strategy(
@@ -314,6 +320,7 @@ def main(input_path: str, output_dir: str | None):
 
 
 def _scenario_summary(run_kv, scenario_id, year, day_type, mb, timing, cont):
+    # Pull gaylord row for shape/cube settings
     g = cont[cont["container_type"].str.lower() == "gaylord"].iloc[0]
     rows = [
         {"key": "scenario_id", "value": scenario_id},
@@ -334,6 +341,7 @@ def _scenario_summary(run_kv, scenario_id, year, day_type, mb, timing, cont):
         {"key": "departure_cutoff_hours_per_move", "value": float(timing.get("departure_cutoff_hours_per_move", 1.0))},
         {"key": "sla_target_days", "value": int(run_kv.get("sla_target_days", 3))},
         {"key": "path_around_the_world_factor", "value": float(run_kv.get("path_around_the_world_factor", 2.0))},
+        {"key": "enforce_parent_hub_over_miles", "value": int(run_kv.get("enforce_parent_hub_over_miles", 500))},
         {"key": "mileage_bands_json", "value": mb.to_json(orient="records")},
     ]
     return pd.DataFrame(rows)
@@ -358,7 +366,7 @@ def _network_kpis(od_selected: pd.DataFrame) -> pd.Series:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to input workbook")
-    ap.add_argument("--output_dir", default=None, help="Output directory, default ./outputs")
+    ap.add_argument("--input", required=True, help="Path to input workbook (.xlsx)")
+    ap.add_argument("--output_dir", default=None, help="Output directory (default: ./outputs)")
     args = ap.parse_args()
     main(args.input, args.output_dir)

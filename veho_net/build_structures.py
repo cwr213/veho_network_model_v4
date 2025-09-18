@@ -1,210 +1,251 @@
+# veho_net/build_structures.py
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
 
-def _banded_miles(m_raw: float, bands: pd.DataFrame) -> float:
-    """Apply circuity factor from the band that covers raw haversine miles."""
-    if pd.isna(m_raw):
-        return np.inf
-    # find band row
-    r = bands[(bands["mileage_band_min"] <= m_raw) & (m_raw <= bands["mileage_band_max"])]
-    if r.empty:
-        r = bands.iloc[[-1]]
-    circuit = float(r.iloc[0]["circuity_factor"])
-    return float(m_raw) * circuit
+# Canonical column names this module expects (strict):
+# facilities: ['facility_name','type','lat','lon','parent_hub_name','is_injection_node', ...]
+# zips:       ['zip','facility_name_assigned','population']
+# demand:     ['year','annual_pkgs','offpeak_pct_of_annual','peak_pct_of_annual',
+#              'middle_mile_share_offpeak','middle_mile_share_peak']  (one row for the chosen year)
+# injection_distribution: ['facility_name','absolute_share']  (weights); optionally you may include others
+#   NOTE: enablement is taken from facilities.is_injection_node (1/0). We normalize shares over enabled nodes only.
 
-def _facility_population_shares(zips: pd.DataFrame) -> pd.DataFrame:
-    pop = (
-        zips.groupby("facility_name_assigned", as_index=False)["population"]
-        .sum()
-        .rename(columns={"facility_name_assigned": "dest", "population": "facility_population"})
-    )
-    total_pop = float(pop["facility_population"].sum())
-    pop["dest_pop_share"] = 0.0 if total_pop <= 0 else pop["facility_population"] / total_pop
-    return pop
-
-def _enabled_injection_nodes(injection_distribution: pd.DataFrame, facilities: pd.DataFrame) -> pd.DataFrame:
-    enabled = facilities.query("is_injection_node == 1")[["facility_name"]].copy()
-    inj = injection_distribution.merge(enabled, on="facility_name", how="inner").copy()
-    if inj.empty:
-        inj["norm_share"] = 0.0
-        return inj
-    inj["norm_share"] = inj["absolute_share"] / inj["absolute_share"].sum()
-    return inj
-
-def _dest_facilities(facilities: pd.DataFrame) -> pd.DataFrame:
-    return (
-        facilities[facilities["type"].isin(["launch", "hybrid"])][["facility_name"]]
-        .rename(columns={"facility_name": "dest"})
-        .copy()
-    )
-
-def _origins_enabled(facilities: pd.DataFrame) -> pd.DataFrame:
-    return facilities.query("is_injection_node == 1")[["facility_name"]].rename(columns={"facility_name": "origin"}).copy()
-
-# --------- OD + Direct (strict shares already implemented earlier) ---------
 
 def build_od_and_direct(
     facilities: pd.DataFrame,
     zips: pd.DataFrame,
-    demand_year_df: pd.DataFrame,
-    injection_distribution: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    req = ["annual_pkgs", "offpeak_pct_of_annual", "peak_pct_of_annual",
-           "middle_mile_share_offpeak", "middle_mile_share_peak"]
-    missing = [c for c in req if c not in demand_year_df.columns]
-    if missing:
+    year_demand: pd.DataFrame,
+    injection_distribution: pd.DataFrame,
+):
+    """
+    Returns:
+      od: O!=D pairs with daily MM volumes by day type
+          ['origin','dest','inj_share','dest_pop_share','pkgs_offpeak_day','pkgs_peak_day']
+      direct_fac: direct-injection (O==D) daily volumes by day type
+          ['dest','year','dest_pop_share','dir_pkgs_offpeak_day','dir_pkgs_peak_day']
+      dest_pop: destination population totals/shares
+          ['facility_name_assigned','population','dest_pop_share']
+    """
+    # ----- Strict schema checks
+    req_fac = {"facility_name", "type", "lat", "lon", "parent_hub_name", "is_injection_node"}
+    if not req_fac.issubset(facilities.columns):
+        missing = req_fac - set(facilities.columns)
+        raise ValueError(f"facilities missing required columns: {sorted(missing)}")
+
+    req_zips = {"zip", "facility_name_assigned", "population"}
+    if not req_zips.issubset(zips.columns):
+        missing = req_zips - set(zips.columns)
+        raise ValueError(f"zips sheet missing required columns: {sorted(missing)}")
+
+    req_dem = {
+        "year",
+        "annual_pkgs",
+        "offpeak_pct_of_annual",
+        "peak_pct_of_annual",
+        "middle_mile_share_offpeak",
+        "middle_mile_share_peak",
+    }
+    if not req_dem.issubset(year_demand.columns):
+        missing = req_dem - set(year_demand.columns)
+        raise ValueError(f"demand sheet missing required columns: {sorted(missing)}")
+
+    req_inj = {"facility_name", "absolute_share"}
+    if not req_inj.issubset(injection_distribution.columns):
+        missing = req_inj - set(injection_distribution.columns)
+        raise ValueError(f"injection_distribution missing required columns: {sorted(missing)}")
+
+    # ----- Dedup and prep
+    fac = facilities.drop_duplicates(subset=["facility_name"]).reset_index(drop=True)
+
+    z = (
+        zips[["zip", "facility_name_assigned", "population"]]
+        .drop_duplicates(subset=["zip"])
+        .copy()
+    )
+
+    # Destination population shares by assigned facility
+    pop_by_dest = z.groupby("facility_name_assigned", as_index=False)["population"].sum()
+    pop_by_dest["dest_pop_share"] = pop_by_dest["population"] / pop_by_dest["population"].sum()
+
+    # Demand primitives
+    yd = year_demand.copy()
+    year_val = int(yd["year"].iloc[0])
+    annual_total = float(yd["annual_pkgs"].sum())
+    off_pct = float(yd["offpeak_pct_of_annual"].iloc[0])
+    peak_pct = float(yd["peak_pct_of_annual"].iloc[0])
+    mm_off = float(yd["middle_mile_share_offpeak"].iloc[0])
+    mm_peak = float(yd["middle_mile_share_peak"].iloc[0])
+
+    # Direct injection (O==D) by population share
+    direct = pop_by_dest.rename(columns={"facility_name_assigned": "dest"}).copy()
+    direct["year"] = year_val
+    direct["dir_pkgs_offpeak_day"] = annual_total * off_pct * (1.0 - mm_off) * direct["dest_pop_share"]
+    direct["dir_pkgs_peak_day"] = annual_total * peak_pct * (1.0 - mm_peak) * direct["dest_pop_share"]
+
+    # Injection distribution:
+    #   Use absolute_share; normalize over facilities where is_injection_node == 1.
+    inj = injection_distribution[["facility_name", "absolute_share"]].copy()
+    # Join to facilities to filter to enabled injection nodes (1/0)
+    inj = inj.merge(
+        fac[["facility_name", "is_injection_node"]],
+        on="facility_name",
+        how="left",
+        validate="many_to_one",
+    )
+    if inj["is_injection_node"].isna().any():
+        missing = inj.loc[inj["is_injection_node"].isna(), "facility_name"].unique().tolist()
         raise ValueError(
-            f"build_od_and_direct: demand_year_df missing columns {missing}. "
-            f"Columns present: {list(demand_year_df.columns)}"
+            f"injection_distribution.facility_name not found in facilities: {missing[:10]}{'...' if len(missing) > 10 else ''}"
         )
-    for col in ["offpeak_pct_of_annual", "peak_pct_of_annual",
-                "middle_mile_share_offpeak", "middle_mile_share_peak"]:
-        if demand_year_df[col].isna().any():
-            bad_idx = list(demand_year_df[demand_year_df[col].isna()].index[:5])
-            raise ValueError(f"demand_year_df has NaN in '{col}' for selected year. Example row indices: {bad_idx}")
-        if not demand_year_df[col].between(0, 1, inclusive="both").all():
-            bad = demand_year_df[~demand_year_df[col].between(0, 1, inclusive="both")][[col]].head(5)
-            raise ValueError(f"demand_year_df '{col}' values must be within [0,1]. Offenders (first 5 rows):\n{bad}")
 
-    dest_pop = _facility_population_shares(zips)
-    origins = _origins_enabled(facilities)
-    dests = _dest_facilities(facilities)
-    inj = _enabled_injection_nodes(injection_distribution, facilities)[["facility_name", "norm_share"]]
-    inj = inj.rename(columns={"facility_name": "origin"})
+    inj = inj[inj["is_injection_node"].astype(int) == 1].copy()
+    inj["abs_w"] = pd.to_numeric(inj["absolute_share"], errors="coerce").fillna(0.0)
+    total_w = float(inj["abs_w"].sum())
+    if total_w <= 0:
+        raise ValueError("injection_distribution.absolute_share must sum > 0 across enabled injection nodes")
 
-    # cross join O x D x demand rows (single year upstream)
-    od_nat = origins.assign(key=1).merge(dests.assign(key=1), on="key", how="outer").drop(columns="key")
-    od_nat = od_nat.assign(key=1).merge(demand_year_df.assign(key=1), on="key", how="left").drop(columns="key")
+    inj["inj_share"] = inj["abs_w"] / total_w
+    inj = inj[["facility_name", "inj_share"]].rename(columns={"facility_name": "origin"})
 
-    # Attach shares
-    od_nat = (
-        od_nat.merge(inj, on="origin", how="left")
-              .merge(dest_pop[["dest", "dest_pop_share"]], on="dest", how="left")
-    ).fillna({"norm_share": 0.0, "dest_pop_share": 0.0})
+    # Build O!=D grid: origin inj share x destination pop share
+    dest2 = pop_by_dest.rename(columns={"facility_name_assigned": "dest"})[["dest", "dest_pop_share"]]
+    grid = inj.assign(_k=1).merge(dest2.assign(_k=1), on="_k").drop(columns="_k")
 
-    # Day-type totals
-    od_nat["offpeak_day_total"] = od_nat["annual_pkgs"] * od_nat["offpeak_pct_of_annual"]
-    od_nat["peak_day_total"]    = od_nat["annual_pkgs"] * od_nat["peak_pct_of_annual"]
+    od = grid.copy()
+    od["pkgs_offpeak_day"] = annual_total * off_pct * mm_off * od["inj_share"] * od["dest_pop_share"]
+    od["pkgs_peak_day"] = annual_total * peak_pct * mm_peak * od["inj_share"] * od["dest_pop_share"]
 
-    # Middle-mile day demand per OD (allocate by injection norm_share * destination population share)
-    od_nat["mm_offpeak_day"] = (
-        od_nat["offpeak_day_total"] * od_nat["middle_mile_share_offpeak"] * od_nat["norm_share"] * od_nat["dest_pop_share"]
-    )
-    od_nat["mm_peak_day"] = (
-        od_nat["peak_day_total"] * od_nat["middle_mile_share_peak"] * od_nat["norm_share"] * od_nat["dest_pop_share"]
-    )
+    # Remove O==D; those volumes are handled by direct injection table
+    od = od[od["origin"] != od["dest"]].reset_index(drop=True)
 
-    cols = ["origin", "dest", "year", "annual_pkgs", "offpeak_pct_of_annual", "peak_pct_of_annual"]
-    od = (
-        od_nat.groupby(cols, as_index=False)[["mm_offpeak_day", "mm_peak_day"]].sum()
-              .rename(columns={"mm_offpeak_day": "pkgs_offpeak_day", "mm_peak_day": "pkgs_peak_day"})
-    )
+    return od, direct, pop_by_dest
 
-    # Direct distribution day demand by destination (dest_pop)
-    dir_fac = (
-        dests.assign(key=1).merge(demand_year_df.assign(key=1), on="key", how="left").drop(columns="key")
-             .merge(dest_pop[["dest", "dest_pop_share"]], on="dest", how="left")
-    )
-    dir_fac["dir_pkgs_offpeak_day"] = (
-        dir_fac["annual_pkgs"] * dir_fac["offpeak_pct_of_annual"] * (1.0 - dir_fac["middle_mile_share_offpeak"]) * dir_fac["dest_pop_share"]
-    )
-    dir_fac["dir_pkgs_peak_day"] = (
-        dir_fac["annual_pkgs"] * dir_fac["peak_pct_of_annual"] * (1.0 - dir_fac["middle_mile_share_peak"]) * dir_fac["dest_pop_share"]
-    )
 
-    return od, dir_fac[["dest","year","dir_pkgs_offpeak_day","dir_pkgs_peak_day"]], dest_pop
-
-# --------- Candidate paths (shortest direct / shortest 1-touch / shortest 2-touch) ---------
-
-def candidate_paths(od: pd.DataFrame, facilities: pd.DataFrame, bands: pd.DataFrame,
-                    k1: int = 10, k2: int = 5, k3: int = 5, around_factor: float = 2.0) -> pd.DataFrame:
+def candidate_paths(
+    od: pd.DataFrame,
+    facilities: pd.DataFrame,
+    mileage_bands: pd.DataFrame,
+    around_factor: float = 1.5,
+) -> pd.DataFrame:
     """
-    For each OD, return exactly three candidates:
-      - direct: [O, D]
-      - shortest_1: [O, H, D] minimizing banded miles across a shortlist of hubs
-      - shortest_2: [O, H1, H2, D] minimizing banded miles across pairs from that shortlist
-
-    Shortlist pool = union of:
-      top-k1 by (O->H + H->D) banded miles,
-      top-k2 by O->H banded miles,
-      top-k3 by H->D banded miles,
-      plus parent(D) if available.
+    Policy-first candidates (with parent hub enforcement over a threshold):
+      • Always include DIRECT (O->D).
+      • If raw(O,D) <= enforce_parent_hub_over_miles (default 500):
+          include ONE 1-touch: shorter of (nearest hub to O) vs (nearest hub to D).
+      • If raw(O,D)  > enforce_parent_hub_over_miles:
+          enforce parent hubs:
+            – 1-touch via D's parent (parent_hub_name) if defined
+            – 2-touch via O's parent then D's parent
+      • Prune any candidate whose RAW path miles > around_factor * RAW direct miles.
     """
-    fac = facilities.set_index("facility_name")
-    hubs = facilities[facilities["type"].isin(["hub", "hybrid"])]["facility_name"].tolist()
-    parent = fac["parent_hub_name"].to_dict()
+    enforce_thresh = facilities.attrs.get("enforce_parent_hub_over_miles", 500)
 
-    def raw_m(o, d):
-        return haversine_miles(float(fac.at[o, "lat"]), float(fac.at[o, "lon"]),
-                               float(fac.at[d, "lat"]), float(fac.at[d, "lon"]))
+    fac = facilities.set_index("facility_name").copy()
+    # normalize 'type' to lowercase
+    fac["type"] = fac["type"].astype(str).str.lower()
+
+    # hubs/hybrids are eligible as intermediate touches
+    hubs_enabled = fac.index[fac["type"].isin(["hub", "hybrid"])]
+
+    def raw(o, d):
+        return haversine_miles(
+            float(fac.at[o, "lat"]), float(fac.at[o, "lon"]),
+            float(fac.at[d, "lat"]), float(fac.at[d, "lon"])
+        )
+
+    # Parent hub mapping (exact column name: parent_hub_name)
+    if "parent_hub_name" not in fac.columns:
+        raise ValueError("facilities missing 'parent_hub_name' column")
+
+    parent_map = (
+        fac.reset_index()[["facility_name", "parent_hub_name"]]
+        .set_index("facility_name")["parent_hub_name"]
+        .to_dict()
+    )
 
     rows = []
     for _, r in od.iterrows():
-        o, d = r["origin"], r["dest"]
-        if o not in fac.index or d not in fac.index:
-            continue
+        o = r["origin"]
+        d = r["dest"]
+        direct_raw = raw(o, d)
 
-        # Direct
-        m_dir_raw = raw_m(o, d)
-        m_dir = _banded_miles(m_dir_raw, bands)
-        rows.append({"origin": o, "dest": d, "path_type": "direct", "path_nodes": [o, d], "path_str": f"{o} → {d}"})
+        # Always include direct
+        rows.append(
+            {"origin": o, "dest": d, "path_type": "direct", "path_nodes": [o, d], "path_str": f"{o}->{d}"}
+        )
 
-        # Build hub pool
-        # score all hubs by components
-        scores = []
-        for h in hubs:
-            if h in (o, d):
-                continue
-            m_oh = _banded_miles(raw_m(o, h), bands)
-            m_hd = _banded_miles(raw_m(h, d), bands)
-            scores.append((h, m_oh + m_hd, m_oh, m_hd))
-        if not scores:
-            continue
-        df = pd.DataFrame(scores, columns=["hub", "score_od", "score_o", "score_d"]).sort_values("score_od")
+        if direct_raw <= enforce_thresh:
+            # Local/regional: allow one 1-touch via nearest hub to O or nearest hub to D (pick shorter)
+            if len(hubs_enabled) > 0:
+                nearest_to_o = min(hubs_enabled, key=lambda h: raw(o, h))
+                nearest_to_d = min(hubs_enabled, key=lambda h: raw(h, d))
+                cand1 = [o, nearest_to_o, d]
+                cand2 = [o, nearest_to_d, d]
+                miles1 = raw(o, nearest_to_o) + raw(nearest_to_o, d)
+                miles2 = raw(o, nearest_to_d) + raw(nearest_to_d, d)
+                best = cand1 if miles1 <= miles2 else cand2
+                rows.append(
+                    {
+                        "origin": o,
+                        "dest": d,
+                        "path_type": "1_touch",
+                        "path_nodes": best,
+                        "path_str": "->".join(best),
+                    }
+                )
+        else:
+            # Long-haul: enforce parent hubs
+            o_parent = parent_map.get(o, o)
+            d_parent = parent_map.get(d, d)
 
-        pool = set(df.head(k1)["hub"])
-        pool |= set(df.sort_values("score_o").head(k2)["hub"])
-        pool |= set(df.sort_values("score_d").head(k3)["hub"])
-        ph = parent.get(d, None)
-        if ph and ph not in (o, d):
-            pool.add(ph)
+            # If parent hub is missing or not a known facility, default to self
+            if (o_parent is None) or (o_parent not in fac.index):
+                o_parent = o
+            if (d_parent is None) or (d_parent not in fac.index):
+                d_parent = d
 
-        pool = [h for h in pool if h not in (o, d)]
+            # 1-touch via D's parent if it is different from D
+            if d_parent != d:
+                rows.append(
+                    {
+                        "origin": o,
+                        "dest": d,
+                        "path_type": "1_touch",
+                        "path_nodes": [o, d_parent, d],
+                        "path_str": f"{o}->{d_parent}->{d}",
+                    }
+                )
+            # 2-touch via O's parent then D's parent
+            rows.append(
+                {
+                    "origin": o,
+                    "dest": d,
+                    "path_type": "2_touch",
+                    "path_nodes": [o, o_parent, d_parent, d],
+                    "path_str": f"{o}->{o_parent}->{d_parent}->{d}",
+                }
+            )
 
-        # Shortest 1-touch over pool
-        best1 = None
-        best1_m = np.inf
-        for h in pool:
-            m = _banded_miles(raw_m(o, h), bands) + _banded_miles(raw_m(h, d), bands)
-            if m < best1_m:
-                best1_m = m
-                best1 = [o, h, d]
+        # Prune by RAW detour factor at build time
+        local = [rr for rr in rows if rr["origin"] == o and rr["dest"] == d]
+        pruned = []
+        for rr in local:
+            nodes = rr["path_nodes"]
+            path_raw = sum(raw(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1))
+            if path_raw <= around_factor * direct_raw:
+                pruned.append(rr)
+        rows = [rr for rr in rows if not (rr["origin"] == o and rr["dest"] == d)] + pruned
 
-        # Shortest 2-touch over pairs from pool
-        best2 = None
-        best2_m = np.inf
-        pool_list = list(pool)
-        for i in range(len(pool_list)):
-            h1 = pool_list[i]
-            for j in range(i+1, len(pool_list)):
-                h2 = pool_list[j]
-                if len({o, d, h1, h2}) < 4:
-                    continue
-                m = (_banded_miles(raw_m(o, h1), bands)
-                     + _banded_miles(raw_m(h1, h2), bands)
-                     + _banded_miles(raw_m(h2, d), bands))
-                if m < best2_m:
-                    best2_m = m
-                    best2 = [o, h1, h2, d]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-        # Around-the-world prune
-        if best1 is not None and best1_m <= around_factor * m_dir:
-            rows.append({"origin": o, "dest": d, "path_type": "1_touch",
-                         "path_nodes": best1, "path_str": " → ".join(best1)})
-        if best2 is not None and best2_m <= around_factor * m_dir:
-            rows.append({"origin": o, "dest": d, "path_type": "2_touch",
-                         "path_nodes": best2, "path_str": " → ".join(best2)})
-
-    df_out = pd.DataFrame(rows)
-    return df_out.reset_index(drop=True)
+    # Deduplicate by exact node sequence
+    df["path_nodes_tuple"] = df["path_nodes"].apply(tuple)
+    df = (
+        df.drop_duplicates(subset=["origin", "dest", "path_type", "path_nodes_tuple"])
+        .drop(columns=["path_nodes_tuple"])
+        .reset_index(drop=True)
+    )
+    return df
