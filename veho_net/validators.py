@@ -1,4 +1,4 @@
-# veho_net/validators.py
+# veho_net/validators.py - UPDATED with VA parameters
 
 import pandas as pd
 
@@ -107,8 +107,12 @@ def _check_mileage_bands(df_raw: pd.DataFrame):
 
 def _check_timing_params(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
-    required_keys = {"cpt_hours_local", "delivery_day_cutoff_local", "load_hours", "unload_hours",
-                     "sort_hours_per_touch", "crossdock_hours_per_touch", "departure_cutoff_hours_per_move"}
+    required_keys = {
+        "cpt_hours_local", "delivery_day_cutoff_local", "load_hours", "unload_hours",
+        "sort_hours_per_touch", "crossdock_hours_per_touch", "departure_cutoff_hours_per_move",
+        # ENHANCED: Add new VA parameters
+        "injection_va_hours", "middle_mile_va_hours", "last_mile_va_hours"
+    }
     missing = sorted(required_keys - set(df["key"]))
     if missing:
         raise ValueError(f"timing_params missing required keys: {missing}")

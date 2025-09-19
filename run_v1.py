@@ -1,4 +1,4 @@
-# run_v1.py - COMPLETE FINAL VERSION
+# run_v1.py - COMPLETE FINAL VERSION with Enhanced Throughput
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -201,7 +201,7 @@ def _run_one_strategy(
         .rename(columns={direct_day_col: "dir_pkgs_day"})
     )
 
-    # Enhanced facility rollup with clear lane/truck metrics
+    # Enhanced facility rollup with VA-based throughput (PASS timing parameters)
     facility_rollup = build_facility_rollup(
         facilities=facilities,
         zips=zips,
@@ -210,7 +210,8 @@ def _run_one_strategy(
         direct_day=direct_day,
         arc_summary=arc_summary,
         costs=costs,
-        load_strategy=strategy
+        load_strategy=strategy,
+        timing_kv=timing_local  # IMPORTANT: Pass timing parameters
     )
 
     lane_summary = build_lane_summary(arc_summary)
@@ -254,6 +255,7 @@ def _run_one_strategy(
 def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, out_dir: Path):
     """
     Create executive summary with clear answers to Monday's 4 key questions.
+    Enhanced with VA-based hourly throughput analysis.
     """
     if len(results_by_strategy) < 2:
         return
@@ -271,30 +273,35 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
     optimal_strategy = 'container' if container_cost <= fluid_cost else 'fluid'
     cost_difference = abs(container_cost - fluid_cost)
 
-    # Monday Question 2: Hourly throughput by hub
+    # Monday Question 2: Enhanced Hourly throughput by hub with VA analysis
     container_rollup = container_results['facility_rollup']
     fluid_rollup = fluid_results['facility_rollup']
 
-    # Filter to hub/hybrid facilities only
+    # Filter to hub/hybrid facilities only and get enhanced throughput data
     container_hubs = container_rollup[container_rollup['type'].isin(['hub', 'hybrid'])].copy()
     fluid_hubs = fluid_rollup[fluid_rollup['type'].isin(['hub', 'hybrid'])].copy()
 
-    # Calculate hourly throughput (assuming 16-hour operation)
-    operating_hours = 16
-    peak_hour_factor = 1.3
+    # Enhanced throughput analysis using the new VA-based calculations
+    throughput_cols = ['injection_hourly_throughput', 'intermediate_hourly_throughput', 'lm_hourly_throughput',
+                       'peak_hourly_throughput']
 
-    container_hubs['hourly_throughput_avg'] = container_hubs['origin_pkgs_day'] / operating_hours
-    container_hubs['hourly_throughput_peak'] = container_hubs['hourly_throughput_avg'] * peak_hour_factor
-
-    fluid_hubs['hourly_throughput_avg'] = fluid_hubs['origin_pkgs_day'] / operating_hours
-    fluid_hubs['hourly_throughput_peak'] = fluid_hubs['hourly_throughput_avg'] * peak_hour_factor
+    # Ensure all throughput columns exist
+    for col in throughput_cols:
+        if col not in container_hubs.columns:
+            container_hubs[col] = 0
+        if col not in fluid_hubs.columns:
+            fluid_hubs[col] = 0
 
     # Monday Question 3: Inbound/outbound trailers per facility
     # This is already calculated in the enhanced facility_rollup as outbound_trucks_total and inbound_trucks_total
 
-    # Monday Question 4: Zone mix and paths by origin facility
+    # Monday Question 4: Zone mix and paths by origin facility (FIXED: Add facility column)
     container_od = container_results['od_selected']
-    path_type_summary = container_od.groupby('origin')['path_type'].value_counts().unstack(fill_value=0)
+    path_type_summary = container_od.groupby('origin')['path_type'].value_counts().unstack(fill_value=0).reset_index()
+
+    # Ensure 'origin' is renamed to 'facility' and is the first column
+    if 'origin' in path_type_summary.columns:
+        path_type_summary = path_type_summary.rename(columns={'origin': 'facility'})
 
     # Create executive summary sheets
     summary_data = {}
@@ -321,12 +328,19 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
 
     summary_data['Strategy_Comparison'] = strategy_comparison
 
-    # Sheet 2: Hub Hourly Throughput Requirements
-    hub_throughput = container_hubs[['facility', 'type', 'hub_tier', 'hourly_throughput_peak']].copy()
-    hub_throughput['fluid_hourly_throughput_peak'] = hub_throughput['facility'].map(
-        fluid_hubs.set_index('facility')['hourly_throughput_peak']
-    )
-    hub_throughput = hub_throughput.sort_values('hourly_throughput_peak', ascending=False)
+    # Sheet 2: Enhanced Hub Hourly Throughput Requirements with VA breakdown
+    hub_throughput = container_hubs[['facility', 'type', 'hub_tier'] + throughput_cols].copy()
+
+    # Add fluid strategy throughput for comparison
+    fluid_throughput_data = fluid_hubs.set_index('facility')[throughput_cols].add_suffix('_fluid')
+    hub_throughput = hub_throughput.set_index('facility').join(fluid_throughput_data, how='left').reset_index()
+
+    # Fill missing values
+    for col in hub_throughput.columns:
+        if hub_throughput[col].dtype in ['float64', 'int64']:
+            hub_throughput[col] = hub_throughput[col].fillna(0)
+
+    hub_throughput = hub_throughput.sort_values('peak_hourly_throughput', ascending=False)
     summary_data['Hub_Hourly_Throughput'] = hub_throughput
 
     # Sheet 3: Facility Truck Requirements
@@ -336,16 +350,25 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
     ]].copy()
     summary_data['Facility_Truck_Requirements'] = truck_requirements
 
-    # Sheet 4: Path Type Analysis by Origin
+    # Sheet 4: Path Type Analysis by Origin (FIXED: facility as first column)
     if not path_type_summary.empty:
         path_analysis = path_type_summary.copy()
-        path_analysis['total_paths'] = path_analysis.sum(axis=1)
-        for col in ['direct', '1_touch', '2_touch', '3_touch']:
-            if col in path_analysis.columns:
-                path_analysis[f'pct_{col}'] = (path_analysis[col] / path_analysis['total_paths'] * 100).round(1)
+
+        # Calculate totals and percentages
+        numeric_cols = [col for col in path_analysis.columns if col != 'facility']
+        if numeric_cols:
+            path_analysis['total_paths'] = path_analysis[numeric_cols].sum(axis=1)
+
+            # Calculate percentages for each path type
+            for col in numeric_cols:
+                if col in path_analysis.columns:
+                    path_analysis[f'pct_{col}'] = (path_analysis[col] / path_analysis['total_paths'] * 100).round(1)
+                    # Handle division by zero
+                    path_analysis[f'pct_{col}'] = path_analysis[f'pct_{col}'].fillna(0)
+
         summary_data['Path_Type_Analysis'] = path_analysis
 
-    # Sheet 5: Monday Key Answers Summary
+    # Sheet 5: Monday Key Answers Summary with Enhanced Insights
     monday_answers = pd.DataFrame([
         {
             'question': '1. Optimal Containerization Strategy',
@@ -354,10 +377,10 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
             'packages_per_truck': f"{strategy_comparison[strategy_comparison['strategy'] == optimal_strategy]['avg_packages_per_truck'].iloc[0]:.0f} packages/truck average"
         },
         {
-            'question': '2. Hourly Throughput by Hub',
-            'answer': f'Peak hourly requirements calculated for {len(hub_throughput)} hubs',
-            'detail': f"Range: {hub_throughput['hourly_throughput_peak'].min():.0f} - {hub_throughput['hourly_throughput_peak'].max():.0f} packages/hour",
-            'packages_per_truck': f"Top hub: {hub_throughput.iloc[0]['facility']} at {hub_throughput.iloc[0]['hourly_throughput_peak']:.0f} pkgs/hr"
+            'question': '2. Hourly Throughput by Hub (VA-based)',
+            'answer': f'Enhanced VA-based requirements calculated for {len(hub_throughput)} hubs',
+            'detail': f"Peak range: {hub_throughput['peak_hourly_throughput'].min():.0f} - {hub_throughput['peak_hourly_throughput'].max():.0f} packages/hour",
+            'packages_per_truck': f"Top hub: {hub_throughput.iloc[0]['facility']} at {hub_throughput.iloc[0]['peak_hourly_throughput']:.0f} pkgs/hr peak"
         },
         {
             'question': '3. Inbound/Outbound Trailers per Facility',
@@ -366,7 +389,7 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
             'packages_per_truck': f"Avg outbound: {truck_requirements['outbound_trucks_total'].mean():.1f} trucks/facility"
         },
         {
-            'question': '4. Zone Mix and Touch Patterns',
+            'question': '4. Zone Mix and Touch Patterns by Origin',
             'answer': 'Path analysis by origin facility completed',
             'detail': f"Network average: {container_od['path_type'].value_counts(normalize=True).round(3).to_dict()}",
             'packages_per_truck': f"Total origin facilities: {len(path_type_summary) if not path_type_summary.empty else 0}"
@@ -389,8 +412,9 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
     print(f"Cost Advantage: ${cost_difference:,.0f}/day")
     print(
         f"Hub Count: {len(container_results['primary_hubs'])} primary, {len(container_results['secondary_hubs'])} secondary")
-    print(
-        f"Top Hub Throughput: {hub_throughput.iloc[0]['facility']} at {hub_throughput.iloc[0]['hourly_throughput_peak']:.0f} pkgs/hr")
+    if not hub_throughput.empty:
+        print(
+            f"Top Hub Throughput: {hub_throughput.iloc[0]['facility']} at {hub_throughput.iloc[0]['peak_hourly_throughput']:.0f} pkgs/hr")
     print(f"Network Truck Requirement: {truck_requirements['total_trucks_per_day'].sum():.0f} trucks/day")
 
 
@@ -424,6 +448,19 @@ def main(input_path: str, output_dir: str | None):
     if "sla_penalty_per_touch_per_pkg" not in costs:
         costs["sla_penalty_per_touch_per_pkg"] = 0.25
         print("Added default sla_penalty_per_touch_per_pkg: 0.25")
+
+    # ENHANCED: Add default VA parameters if missing
+    if "injection_va_hours" not in timing:
+        timing["injection_va_hours"] = 8.0
+        print("Added default injection_va_hours: 8.0")
+
+    if "middle_mile_va_hours" not in timing:
+        timing["middle_mile_va_hours"] = 16.0
+        print("Added default middle_mile_va_hours: 16.0")
+
+    if "last_mile_va_hours" not in timing:
+        timing["last_mile_va_hours"] = 4.0
+        print("Added default last_mile_va_hours: 4.0")
 
     compare_mode = str(run_kv.get("compare_mode", "single")).strip().lower()
     if compare_mode not in {"single", "paired"}:
@@ -485,6 +522,9 @@ def _scenario_summary(run_kv, scenario_id, year, day_type, mb, timing, cont):
         {"key": "day_type", "value": day_type},
         {"key": "load_strategy", "value": str(timing.get("load_strategy", "container"))},
         {"key": "hours_per_touch", "value": float(timing.get("hours_per_touch", 6.0))},
+        {"key": "injection_va_hours", "value": float(timing.get("injection_va_hours", 8.0))},
+        {"key": "middle_mile_va_hours", "value": float(timing.get("middle_mile_va_hours", 16.0))},
+        {"key": "last_mile_va_hours", "value": float(timing.get("last_mile_va_hours", 4.0))},
         {"key": "usable_cube_cuft", "value": float(g["usable_cube_cuft"])},
         {"key": "pack_utilization_container", "value": float(g["pack_utilization_container"])},
         {"key": "containers_per_truck", "value": int(g["containers_per_truck"])},

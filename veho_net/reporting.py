@@ -1,4 +1,4 @@
-# veho_net/reporting.py - COMPLETE ENHANCED VERSION
+# veho_net/reporting.py - ENHANCED VERSION with VA-based hourly throughput
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -82,7 +82,110 @@ def build_od_selected_outputs(selected: pd.DataFrame, direct_dist_series: pd.Ser
     return df
 
 
-# ---------------- Enhanced Facility rollup with clear lane/truck tracking ----------------
+# ---------------- Enhanced Volume Identification ----------------
+
+def _identify_volume_types(od_selected: pd.DataFrame, path_steps_selected: pd.DataFrame,
+                           direct_day: pd.DataFrame) -> pd.DataFrame:
+    """
+    Identify injection, intermediate, and last mile volumes by facility.
+
+    Returns DataFrame with columns:
+    - facility
+    - injection_pkgs_day: Packages originating at facility
+    - intermediate_pkgs_day: Packages passing through facility
+    - last_mile_pkgs_day: Packages ending at facility
+    """
+    volume_data = []
+
+    # Get all facilities from various sources
+    all_facilities = set()
+    if not od_selected.empty:
+        all_facilities.update(od_selected['origin'].unique())
+        all_facilities.update(od_selected['dest'].unique())
+    if not direct_day.empty:
+        all_facilities.update(direct_day['dest'].unique())
+    if not path_steps_selected.empty and 'from_facility' in path_steps_selected.columns:
+        all_facilities.update(path_steps_selected['from_facility'].unique())
+        all_facilities.update(path_steps_selected['to_facility'].unique())
+
+    for facility in all_facilities:
+        # 1. Injection volume: packages originating at facility (middle-mile origins)
+        injection_pkgs = od_selected[od_selected['origin'] == facility]['pkgs_day'].sum()
+
+        # 2. Last mile volume: direct injection packages ending at facility
+        last_mile_pkgs = direct_day[direct_day['dest'] == facility]['dir_pkgs_day'].sum() if not direct_day.empty else 0
+
+        # 3. Intermediate volume: packages passing through facility (not origin, not final dest)
+        intermediate_pkgs = 0
+
+        if not path_steps_selected.empty and 'to_facility' in path_steps_selected.columns:
+            # Find all path steps where this facility is the destination
+            facility_steps = path_steps_selected[path_steps_selected['to_facility'] == facility].copy()
+
+            if not facility_steps.empty:
+                # For each OD pair, check if this facility is intermediate (not the final destination)
+                for _, step in facility_steps.iterrows():
+                    origin_od = step.get('origin', '')
+                    dest_od = step.get('dest', '')
+
+                    # If this facility is not the final OD destination, it's intermediate
+                    if facility != dest_od and origin_od and dest_od:
+                        # Find the package volume for this OD pair
+                        od_volume = od_selected[
+                            (od_selected['origin'] == origin_od) &
+                            (od_selected['dest'] == dest_od)
+                            ]['pkgs_day'].sum()
+
+                        intermediate_pkgs += od_volume
+
+        volume_data.append({
+            'facility': facility,
+            'injection_pkgs_day': injection_pkgs,
+            'intermediate_pkgs_day': intermediate_pkgs,
+            'last_mile_pkgs_day': last_mile_pkgs
+        })
+
+    return pd.DataFrame(volume_data)
+
+
+def _calculate_hourly_throughput(volume_df: pd.DataFrame, timing_kv: dict, load_strategy: str) -> pd.DataFrame:
+    """
+    Calculate hourly throughput requirements based on volume availability windows.
+    """
+    df = volume_df.copy()
+
+    # Get VA hours from timing parameters
+    injection_va_hours = float(timing_kv.get('injection_va_hours', 8.0))
+    middle_mile_va_hours = float(timing_kv.get('middle_mile_va_hours', 16.0))
+    last_mile_va_hours = float(timing_kv.get('last_mile_va_hours', 4.0))
+
+    # Calculate hourly throughputs
+    df['injection_hourly_throughput'] = df['injection_pkgs_day'] / injection_va_hours
+
+    # Intermediate throughput depends on load strategy
+    if load_strategy.lower() == 'container':
+        # Container strategy: intermediate volume just crossdocked, minimal sorting
+        df['intermediate_hourly_throughput'] = 0.0
+    else:
+        # Fluid strategy: intermediate volume needs full sorting
+        df['intermediate_hourly_throughput'] = df['intermediate_pkgs_day'] / middle_mile_va_hours
+
+    df['lm_hourly_throughput'] = df['last_mile_pkgs_day'] / last_mile_va_hours
+
+    # Peak hourly throughput is the maximum of all types
+    df['peak_hourly_throughput'] = df[
+        ['injection_hourly_throughput', 'intermediate_hourly_throughput', 'lm_hourly_throughput']].max(axis=1)
+
+    # Round for presentation
+    throughput_cols = ['injection_hourly_throughput', 'intermediate_hourly_throughput', 'lm_hourly_throughput',
+                       'peak_hourly_throughput']
+    for col in throughput_cols:
+        df[col] = df[col].round(0).astype(int)
+
+    return df
+
+
+# ---------------- Enhanced Facility rollup with VA-based throughput ----------------
 
 def _per_touch_cost(load_strategy: str, costs: dict) -> float:
     return float(costs.get("crossdock_touch_cost_per_pkg", 0.0)) if load_strategy == "container" else float(
@@ -247,23 +350,40 @@ def build_facility_rollup(facilities: pd.DataFrame,
                           direct_day: pd.DataFrame,
                           arc_summary: pd.DataFrame,
                           costs: dict,
-                          load_strategy: str) -> pd.DataFrame:
+                          load_strategy: str,
+                          timing_kv: dict = None) -> pd.DataFrame:
     """
-    Enhanced facility rollup with clear outbound/inbound lane and truck tracking.
+    Enhanced facility rollup with VA-based hourly throughput calculations.
     """
+    if timing_kv is None:
+        timing_kv = {}
+
     fac_meta = facilities[["facility_name", "market", "region", "type", "parent_hub_name"]].rename(
         columns={"facility_name": "facility"})
 
-    # Volume calculations (origin lens)
-    origin_mm = od_selected.groupby("origin", as_index=False)["pkgs_day"].sum() \
-        .rename(columns={"origin": "facility", "pkgs_day": "origin_mm_pkgs"})
-    direct_origin = direct_day.rename(columns={"dest": "facility", "dir_pkgs_day": "direct_injection_pkgs"})
+    # Enhanced volume identification and hourly throughput calculation
+    volume_types = _identify_volume_types(od_selected, path_steps_selected, direct_day)
+    hourly_throughput = _calculate_hourly_throughput(volume_types, timing_kv, load_strategy)
 
-    vols = fac_meta.merge(origin_mm, on="facility", how="left").merge(direct_origin, on="facility", how="left")
-    vols[["origin_mm_pkgs", "direct_injection_pkgs"]] = vols[["origin_mm_pkgs", "direct_injection_pkgs"]].fillna(0.0)
-    vols["origin_pkgs_day"] = vols["origin_mm_pkgs"] + vols["direct_injection_pkgs"]
+    # Merge facility metadata with volume data
+    vols = fac_meta.merge(volume_types, on="facility", how="left")
+    vols = vols.merge(hourly_throughput[['facility', 'injection_hourly_throughput', 'intermediate_hourly_throughput',
+                                         'lm_hourly_throughput', 'peak_hourly_throughput']], on="facility", how="left")
 
-    # Zone distribution
+    # Fill missing values
+    volume_cols = ['injection_pkgs_day', 'intermediate_pkgs_day', 'last_mile_pkgs_day']
+    throughput_cols = ['injection_hourly_throughput', 'intermediate_hourly_throughput', 'lm_hourly_throughput',
+                       'peak_hourly_throughput']
+
+    for col in volume_cols + throughput_cols:
+        if col not in vols.columns:
+            vols[col] = 0
+        vols[col] = vols[col].fillna(0)
+
+    # Legacy compatibility: calculate origin_pkgs_day for existing logic
+    vols["origin_pkgs_day"] = vols["injection_pkgs_day"] + vols["last_mile_pkgs_day"]
+
+    # Zone distribution (keep existing logic)
     zwide = _zones_wide_origin(od_selected)
     vols = vols.merge(zwide, on="facility", how="left")
     for c in ["zone_0_pkgs", "zone_1-2_pkgs", "zone_3_pkgs", "zone_4_pkgs", "zone_5_pkgs", "zone_6_pkgs", "zone_7_pkgs",
@@ -271,7 +391,7 @@ def build_facility_rollup(facilities: pd.DataFrame,
         if c not in vols.columns: vols[c] = 0.0
         vols[c] = vols[c].fillna(0.0)
 
-    # Cost per package calculations
+    # Cost per package calculations (keep existing logic)
     sort_cost = float(costs.get("sort_cost_per_pkg", 0.0))
     lm_cpp = float(costs.get("last_mile_cpp", 0.0))
     per_touch = _per_touch_cost(load_strategy, costs)
@@ -299,7 +419,7 @@ def build_facility_rollup(facilities: pd.DataFrame,
     vols["total_variable_cpp"] = vols["injection_sort_cpp"] + vols["mm_processing_cpp"] + vols["mm_linehaul_cpp"] + \
                                  vols["last_mile_cpp"]
 
-    # ENHANCED: Detailed lane and truck analysis
+    # ENHANCED: Detailed lane and truck analysis (keep existing logic)
     outbound_lanes_df, inbound_lanes_df = _reconstruct_lanes_from_paths(od_selected)
 
     # Outbound lane metrics
@@ -375,12 +495,16 @@ def build_facility_rollup(facilities: pd.DataFrame,
     vols["total_trucks_per_day"] = vols["outbound_trucks_total"] + vols["inbound_trucks_total"]
     vols["total_lane_count"] = vols["outbound_lane_count"] + vols["inbound_lane_count"]
 
-    # Final column ordering for clear Monday presentation
+    # Enhanced column ordering with new throughput metrics
     ordered = [
         "facility", "market", "region", "type", "hub_tier", "parent_hub_name",
 
-        # Volume metrics
-        "direct_injection_pkgs", "origin_mm_pkgs", "origin_pkgs_day",
+        # Enhanced volume metrics
+        "injection_pkgs_day", "intermediate_pkgs_day", "last_mile_pkgs_day", "origin_pkgs_day",
+
+        # NEW: VA-based hourly throughput metrics
+        "injection_hourly_throughput", "intermediate_hourly_throughput", "lm_hourly_throughput",
+        "peak_hourly_throughput",
 
         # Zone distribution
         "zone_0_pkgs", "zone_1-2_pkgs", "zone_3_pkgs", "zone_4_pkgs",
@@ -405,7 +529,7 @@ def build_facility_rollup(facilities: pd.DataFrame,
         if c not in vols.columns:
             vols[c] = np.nan
 
-    return vols[ordered].sort_values(["hub_tier", "outbound_trucks_total"], ascending=[True, False])
+    return vols[ordered].sort_values(["hub_tier", "peak_hourly_throughput"], ascending=[True, False])
 
 
 # ---------------- Enhanced Lane summary ----------------
