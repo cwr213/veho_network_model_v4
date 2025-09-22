@@ -1,4 +1,4 @@
-# veho_net/reporting.py - ENHANCED VERSION with VA-based hourly throughput
+# veho_net/reporting.py - COMPLETE with Proper Cost Weighting by Volume Type
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -91,9 +91,9 @@ def _identify_volume_types(od_selected: pd.DataFrame, path_steps_selected: pd.Da
 
     Returns DataFrame with columns:
     - facility
-    - injection_pkgs_day: Packages originating at facility
+    - injection_pkgs_day: Packages originating at facility (middle-mile)
     - intermediate_pkgs_day: Packages passing through facility
-    - last_mile_pkgs_day: Packages ending at facility
+    - last_mile_pkgs_day: Packages ending at facility (direct injection)
     """
     volume_data = []
 
@@ -197,12 +197,17 @@ def _touches_for_path(path_type: str) -> int:
     return touch_map.get(path_type, 0)
 
 
-def _zones_wide_origin(od_selected: pd.DataFrame) -> pd.DataFrame:
+def _zones_wide_origin(od_selected: pd.DataFrame, direct_day: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Create wide-format zone distribution by origin facility.
+    Zone 0 = direct injection (O=D), which comes from direct_day, not od_selected.
+    """
     zcols = ["zone_0_pkgs", "zone_1-2_pkgs", "zone_3_pkgs", "zone_4_pkgs", "zone_5_pkgs", "zone_6_pkgs", "zone_7_pkgs",
              "zone_8_pkgs"]
     out = od_selected.copy()
 
-    def zcol(z): return "zone_0_pkgs" if z == 0 else ("zone_1-2_pkgs" if z == "1-2" else f"zone_{z}_pkgs")
+    def zcol(z):
+        return "zone_0_pkgs" if z == 0 else ("zone_1-2_pkgs" if z == "1-2" else f"zone_{z}_pkgs")
 
     out["zone_col"] = out["zone"].apply(zcol)
     ztab = (out.groupby(["origin", "zone_col"])["pkgs_day"].sum()
@@ -210,7 +215,24 @@ def _zones_wide_origin(od_selected: pd.DataFrame) -> pd.DataFrame:
             .reindex(columns=zcols, fill_value=0.0)
             .reset_index()
             .rename(columns={"origin": "facility"}))
-    return ztab
+
+    # FIXED: Add Zone 0 (direct injection) from direct_day
+    if direct_day is not None and not direct_day.empty:
+        direct_zone_0 = direct_day.rename(columns={"dest": "facility", "dir_pkgs_day": "zone_0_pkgs"})[
+            ["facility", "zone_0_pkgs"]]
+        # Merge and combine zone_0_pkgs (should replace the 0.0 default)
+        ztab = ztab.merge(direct_zone_0, on="facility", how="outer", suffixes=("_old", ""))
+        if "zone_0_pkgs_old" in ztab.columns:
+            ztab = ztab.drop(columns=["zone_0_pkgs_old"])
+        ztab["zone_0_pkgs"] = ztab["zone_0_pkgs"].fillna(0.0)
+
+    # Ensure all zone columns exist and are filled
+    for col in zcols:
+        if col not in ztab.columns:
+            ztab[col] = 0.0
+        ztab[col] = ztab[col].fillna(0.0)
+
+    return ztab[["facility"] + zcols]
 
 
 def _reconstruct_lanes_from_paths(od_selected: pd.DataFrame):
@@ -353,7 +375,11 @@ def build_facility_rollup(facilities: pd.DataFrame,
                           load_strategy: str,
                           timing_kv: dict = None) -> pd.DataFrame:
     """
-    Enhanced facility rollup with VA-based hourly throughput calculations.
+    Enhanced facility rollup with VA-based hourly throughput and proper cost weighting by volume type.
+
+    Cost Structure:
+    1. Direct Injection: last_mile_cpp ONLY (bypass sorting, straight to routes)
+    2. Middle-Mile Injection: injection_sort + mm_processing + mm_linehaul + last_mile (at destination)
     """
     if timing_kv is None:
         timing_kv = {}
@@ -380,44 +406,77 @@ def build_facility_rollup(facilities: pd.DataFrame,
             vols[col] = 0
         vols[col] = vols[col].fillna(0)
 
-    # Legacy compatibility: calculate origin_pkgs_day for existing logic
+    # Total packages handled at facility (origin = injection + direct injection last mile)
     vols["origin_pkgs_day"] = vols["injection_pkgs_day"] + vols["last_mile_pkgs_day"]
 
-    # Zone distribution (keep existing logic)
-    zwide = _zones_wide_origin(od_selected)
+    # FIXED: Zone distribution with direct injection as zone 0
+    zwide = _zones_wide_origin(od_selected, direct_day)
     vols = vols.merge(zwide, on="facility", how="left")
     for c in ["zone_0_pkgs", "zone_1-2_pkgs", "zone_3_pkgs", "zone_4_pkgs", "zone_5_pkgs", "zone_6_pkgs", "zone_7_pkgs",
               "zone_8_pkgs"]:
         if c not in vols.columns: vols[c] = 0.0
         vols[c] = vols[c].fillna(0.0)
 
-    # Cost per package calculations (keep existing logic)
+    # Cost per package calculations using PROPERLY ALLOCATED costs
     sort_cost = float(costs.get("sort_cost_per_pkg", 0.0))
     lm_cpp = float(costs.get("last_mile_cpp", 0.0))
-    per_touch = _per_touch_cost(load_strategy, costs)
 
+    # CRITICAL FIX: Use the already-calculated CPP columns from cost allocation
+    # These come from _allocate_lane_costs_to_ods() which properly pools costs
     tmp = od_selected.copy()
-    tmp["touches"] = tmp["path_type"].map(_touches_for_path).astype(int)
-    tmp["mm_processing_cpp_od"] = tmp["touches"] * per_touch
-    tmp["mm_linehaul_cpp_od"] = (tmp["cost_candidate_path"] / tmp["pkgs_day"]) - tmp["mm_processing_cpp_od"]
-    tmp.loc[~np.isfinite(tmp["mm_linehaul_cpp_od"]), "mm_linehaul_cpp_od"] = 0.0
 
-    def _weighted_cpp(group: pd.DataFrame) -> pd.Series:
-        w = group["pkgs_day"].sum()
-        if w <= 0:
-            return pd.Series({"mm_processing_cpp": 0.0, "mm_linehaul_cpp": 0.0})
-        return pd.Series({
-            "mm_processing_cpp": float(np.average(group["mm_processing_cpp_od"], weights=group["pkgs_day"])),
-            "mm_linehaul_cpp": float(np.average(group["mm_linehaul_cpp_od"], weights=group["pkgs_day"])),
-        })
+    if 'linehaul_cpp' in tmp.columns and 'touch_cpp' in tmp.columns:
+        # Use pre-calculated values (already properly allocated)
+        def _weighted_cpp(group: pd.DataFrame) -> pd.Series:
+            w = group["pkgs_day"].sum()
+            if w <= 0:
+                return pd.Series({"mm_processing_cpp": 0.0, "mm_linehaul_cpp": 0.0})
+            return pd.Series({
+                "mm_processing_cpp": float(np.average(group["touch_cpp"], weights=group["pkgs_day"])),
+                "mm_linehaul_cpp": float(np.average(group["linehaul_cpp"], weights=group["pkgs_day"])),
+            })
+    else:
+        # Fallback to old calculation (shouldn't happen with new cost allocation)
+        per_touch = _per_touch_cost(load_strategy, costs)
+        tmp["touches"] = tmp["path_type"].map(_touches_for_path).astype(int)
+        tmp["mm_processing_cpp_od"] = tmp["touches"] * per_touch
+        tmp["mm_linehaul_cpp_od"] = (tmp.get("cost_candidate_path", 0) / tmp["pkgs_day"]) - tmp["mm_processing_cpp_od"]
+        tmp.loc[~np.isfinite(tmp["mm_linehaul_cpp_od"]), "mm_linehaul_cpp_od"] = 0.0
+
+        def _weighted_cpp(group: pd.DataFrame) -> pd.Series:
+            w = group["pkgs_day"].sum()
+            if w <= 0:
+                return pd.Series({"mm_processing_cpp": 0.0, "mm_linehaul_cpp": 0.0})
+            return pd.Series({
+                "mm_processing_cpp": float(np.average(group["mm_processing_cpp_od"], weights=group["pkgs_day"])),
+                "mm_linehaul_cpp": float(np.average(group["mm_linehaul_cpp_od"], weights=group["pkgs_day"])),
+            })
 
     cpp = tmp.groupby("origin", as_index=False).apply(_weighted_cpp, include_groups=False).rename(
         columns={"origin": "facility"})
     vols = vols.merge(cpp, on="facility", how="left").fillna({"mm_processing_cpp": 0.0, "mm_linehaul_cpp": 0.0})
+
+    # Base costs
     vols["injection_sort_cpp"] = sort_cost
     vols["last_mile_cpp"] = lm_cpp
-    vols["total_variable_cpp"] = vols["injection_sort_cpp"] + vols["mm_processing_cpp"] + vols["mm_linehaul_cpp"] + \
-                                 vols["last_mile_cpp"]
+
+    # CRITICAL FIX: Properly weight total variable CPP by volume type
+    # ALL packages need: injection_sort + last_mile (at minimum)
+    # MM packages ALSO need: mm_processing + mm_linehaul
+    #
+    # Direct injection: injection_sort + last_mile
+    # MM injection: injection_sort + mm_processing + mm_linehaul + last_mile
+    vols["total_variable_cpp"] = np.where(
+        vols["origin_pkgs_day"] > 0,
+        (
+            # Direct injection packages
+                ((vols["injection_sort_cpp"] + vols["last_mile_cpp"]) * vols["last_mile_pkgs_day"]) +
+                # MM injection packages
+                ((vols["injection_sort_cpp"] + vols["mm_processing_cpp"] + vols["mm_linehaul_cpp"] + vols[
+                    "last_mile_cpp"]) * vols["injection_pkgs_day"])
+        ) / vols["origin_pkgs_day"],
+        0.0
+    )
 
     # ENHANCED: Detailed lane and truck analysis (keep existing logic)
     outbound_lanes_df, inbound_lanes_df = _reconstruct_lanes_from_paths(od_selected)
@@ -502,7 +561,7 @@ def build_facility_rollup(facilities: pd.DataFrame,
         # Enhanced volume metrics
         "injection_pkgs_day", "intermediate_pkgs_day", "last_mile_pkgs_day", "origin_pkgs_day",
 
-        # NEW: VA-based hourly throughput metrics
+        # VA-based hourly throughput metrics
         "injection_hourly_throughput", "intermediate_hourly_throughput", "lm_hourly_throughput",
         "peak_hourly_throughput",
 
@@ -510,18 +569,18 @@ def build_facility_rollup(facilities: pd.DataFrame,
         "zone_0_pkgs", "zone_1-2_pkgs", "zone_3_pkgs", "zone_4_pkgs",
         "zone_5_pkgs", "zone_6_pkgs", "zone_7_pkgs", "zone_8_pkgs",
 
-        # CLEAR OUTBOUND METRICS (for Monday question #3)
+        # CLEAR OUTBOUND METRICS
         "outbound_lane_count", "outbound_trucks_total", "outbound_packages_total",
         "outbound_containers_total", "outbound_packages_per_truck", "outbound_od_pairs_served",
 
-        # CLEAR INBOUND METRICS (for Monday question #3)
+        # CLEAR INBOUND METRICS
         "inbound_lane_count", "inbound_trucks_total", "inbound_packages_total",
         "inbound_containers_total", "inbound_packages_per_truck", "inbound_od_pairs_served",
 
         # Summary metrics
         "total_lane_count", "total_trucks_per_day",
 
-        # Cost metrics
+        # Cost metrics (properly weighted)
         "injection_sort_cpp", "mm_processing_cpp", "mm_linehaul_cpp", "last_mile_cpp", "total_variable_cpp",
     ]
 

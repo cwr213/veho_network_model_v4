@@ -1,4 +1,4 @@
-# veho_net/build_structures.py - WITH YOUR HUB RULES
+# veho_net/build_structures.py - WITH CIRCULAR ROUTING FIX
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -122,14 +122,14 @@ def candidate_paths(
         around_factor: float = 1.5,
 ) -> pd.DataFrame:
     """
-    Path generation with your specific hub rules:
+    Path generation with hub rules and circular routing prevention:
 
     RULE 1: Secondary hubs (parent_hub != facility_name) must route ALL OUTBOUND
-            volume through their parent hub. Inbound volume is flexible.
+            volume through their parent hub, UNLESS it creates circular routing.
 
     RULE 2: Launch facilities must have their parent hub as the second-to-last touch.
 
-    This creates realistic routing while maintaining operational control.
+    CRITICAL FIX: Prevent circular routing where origin appears in destination's parent chain.
     """
     enforce_thresh = facilities.attrs.get("enforce_parent_hub_over_miles", 500)
 
@@ -186,23 +186,12 @@ def candidate_paths(
         Build valid paths respecting your two rules:
         1. Secondary hub outbound constraint
         2. Launch facility parent as second-to-last
+
+        CRITICAL: Prevent circular routing where origin appears in destination's parent chain
         """
         paths = []
 
-        # Determine origin constraint (RULE 1)
-        if is_secondary_hub(origin):
-            # Secondary hub: MUST route outbound through parent
-            origin_parent = parent_map[origin]
-            if origin_parent == origin:
-                # Shouldn't happen, but handle gracefully
-                required_start = [origin]
-            else:
-                required_start = [origin, origin_parent]
-        else:
-            # Primary hub or launch: flexible outbound (but launch can't be origin anyway)
-            required_start = [origin]
-
-        # Determine destination constraint (RULE 2)
+        # Determine destination constraint first (RULE 2)
         if dest in launch_facilities:
             # Launch facility: parent hub must be second-to-last
             dest_parent = get_launch_parent(dest)
@@ -215,19 +204,53 @@ def candidate_paths(
             # Hub/hybrid destination: flexible inbound
             required_end = [dest]
 
+        # CRITICAL FIX: Check for circular routing
+        # If origin is in the destination's required path, we have a circular route
+        if origin in required_end:
+            # Circular route detected: origin is the parent hub for destination
+            # Just go direct: origin -> dest
+            paths.append([origin, dest])
+            return paths
+
+        # Determine origin constraint (RULE 1)
+        if is_secondary_hub(origin):
+            # Secondary hub: MUST route outbound through parent
+            origin_parent = parent_map[origin]
+            if origin_parent == origin:
+                # Shouldn't happen, but handle gracefully
+                required_start = [origin]
+            else:
+                # ADDITIONAL CHECK: Don't route through parent if it creates a circle back
+                # Example: Seattle (parent=Sacramento) -> Portland (parent=Seattle)
+                # Should NOT be: Seattle -> Sacramento -> ... -> Seattle -> Portland
+                if origin_parent in required_end or origin in required_end:
+                    # This would create circular routing, skip parent requirement
+                    required_start = [origin]
+                else:
+                    required_start = [origin, origin_parent]
+        else:
+            # Primary hub or launch: flexible outbound (but launch can't be origin anyway)
+            required_start = [origin]
+
         # Build paths connecting required start and end segments
         start_node = required_start[-1]  # Last node of required start
         end_node = required_end[0]  # First node of required end
 
         if start_node == end_node:
             # Direct connection possible
-            paths.append(required_start + required_end[1:])
+            combined_path = required_start + required_end[1:]
+            # Final check: ensure no duplicates in path
+            if len(combined_path) == len(set(combined_path)):
+                paths.append(combined_path)
         else:
             # Need intermediate connection(s)
             direct_distance = raw_distance(start_node, end_node)
 
             # Option 1: Direct intermediate connection
-            paths.append(required_start + required_end)
+            combined_path = required_start + required_end
+            # Check for circular routing in combined path
+            if len(combined_path) == len(set(combined_path)):
+                paths.append(combined_path)
 
             # Option 2: One intermediate hub (for consolidation)
             if od_volume < 1500 and len(hubs_enabled) > 0:  # Only for smaller volumes
@@ -245,8 +268,8 @@ def candidate_paths(
 
                     if intermediate_distance <= around_factor * direct_distance:
                         intermediate_path = required_start + [best_intermediate] + required_end
-                        # Avoid duplicates
-                        if intermediate_path not in paths:
+                        # Avoid duplicates and circular routes
+                        if len(intermediate_path) == len(set(intermediate_path)) and intermediate_path not in paths:
                             paths.append(intermediate_path)
 
         return paths
