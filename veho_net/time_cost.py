@@ -1,4 +1,4 @@
-# veho_net/time_cost.py - ENHANCED with improved container/truck fill logic
+# veho_net/time_cost.py - ENHANCED with realistic fill rate calculations
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
@@ -80,7 +80,13 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
                                          container_params: pd.DataFrame, cost_kv: dict,
                                          strategy: str = "container") -> dict:
     """
-    Enhanced container/truck calculation with proper partial container handling.
+    Enhanced container/truck calculation with REALISTIC fill rates based on total cubic capacity.
+
+    UPDATED: Fill rates now show actual physical utilization:
+    - Container fill = actual packages / raw container cubic capacity
+    - Truck fill = actual packages / raw truck cubic capacity
+
+    This gives real-world operational metrics instead of theoretical maximums.
 
     Args:
         lane_od_pairs: List of (od_dict, pkgs_day) for this lane
@@ -90,7 +96,7 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
         strategy: 'container' or 'fluid'
 
     Returns:
-        dict with truck calculation results including fill rates
+        dict with truck calculation results including realistic fill rates
     """
 
     # Calculate total volume for this lane
@@ -110,15 +116,14 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
 
     if strategy.lower() == "container":
         # Container strategy calculations
-        eff_g_cube = effective_gaylord_cube(container_params, {})
+        eff_g_cube = effective_gaylord_cube(container_params, {})  # Usable space after pack factor
         cpt = containers_per_truck(container_params)
 
-        # Step 1: Calculate exact containers needed (no rounding)
+        # Step 1: Calculate exact containers needed (based on usable space)
         exact_containers = total_cube / max(eff_g_cube, 1e-9)
 
         # Step 2: Build actual containers (always round UP for physical containers)
         physical_containers = max(1, int(np.ceil(exact_containers)))
-        container_fill_rate = exact_containers / physical_containers
 
         # Step 3: Calculate trucks with dwell logic
         raw_trucks = physical_containers / cpt
@@ -135,15 +140,35 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
             final_trucks = max(1, int(np.ceil(raw_trucks)))  # Round up, send partial truck
             packages_dwelled = 0
 
-        # Calculate truck fill rate
-        truck_fill_rate = physical_containers / max(final_trucks * cpt, 1e-9)
-        truck_fill_rate = min(1.0, truck_fill_rate)  # Cap at 100%
+        # UPDATED: Calculate REALISTIC fill rates based on raw cubic capacity
+
+        # Container fill rate: actual packages vs RAW container cubic capacity
+        gaylord_row = container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0]
+        raw_container_cube = float(gaylord_row["usable_cube_cuft"])  # This is raw, not "effective"
+        container_fill_rate_realistic = (
+                                                    total_cube / physical_containers) / raw_container_cube if physical_containers > 0 else 0
+        container_fill_rate_realistic = min(1.0, container_fill_rate_realistic)  # Cap at 100%
+
+        # Truck fill rate: actual packages vs RAW truck cubic capacity
+        raw_truck_cube = raw_container_cube * cpt  # Total raw cubic capacity of truck
+        truck_fill_rate_realistic = total_cube / max(final_trucks * raw_truck_cube, 1e-9)
+        truck_fill_rate_realistic = min(1.0, truck_fill_rate_realistic)  # Cap at 100%
 
     else:
         # Fluid strategy calculations
-        trailer_eff = trailer_effective_cube(container_params)
 
-        # Direct truck calculation
+        # Get raw truck cubic capacity (before pack utilization factor)
+        if "trailer_air_cube_cuft" in container_params.columns:
+            raw_truck_cube = float(container_params["trailer_air_cube_cuft"].iloc[0])
+        else:
+            raw_truck_cube = 4060.0
+
+        # Calculate usable space for operational decisions
+        util_col = container_params.get("pack_utilization_fluid", pd.Series([0.85]))
+        pack_util = float(util_col.iloc[0] if len(util_col) > 0 else 0.85)
+        trailer_eff = raw_truck_cube * pack_util
+
+        # Direct truck calculation (based on usable space)
         raw_trucks = total_cube / max(trailer_eff, 1e-9)
 
         # Get dwell parameters (same as container)
@@ -157,21 +182,156 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
             final_trucks = max(1, int(np.ceil(raw_trucks)))
             packages_dwelled = 0
 
+        # UPDATED: Calculate REALISTIC fill rates based on raw cubic capacity
+
         # Fluid doesn't use physical containers
         physical_containers = 0
-        container_fill_rate = total_cube / max(final_trucks * trailer_eff, 1e-9)
-        container_fill_rate = min(1.0, container_fill_rate)  # This is actually trailer fill rate
-        truck_fill_rate = container_fill_rate  # Same thing for fluid
+        container_fill_rate_realistic = 0.0  # Not applicable for fluid
+
+        # Truck fill rate: actual packages vs RAW truck cubic capacity
+        truck_fill_rate_realistic = total_cube / max(final_trucks * raw_truck_cube, 1e-9)
+        truck_fill_rate_realistic = min(1.0, truck_fill_rate_realistic)  # Cap at 100%
 
     return {
         'physical_containers': physical_containers,
         'trucks_needed': final_trucks,
-        'container_fill_rate': container_fill_rate,
-        'truck_fill_rate': truck_fill_rate,
+        'container_fill_rate': container_fill_rate_realistic,  # REALISTIC: vs raw cubic capacity
+        'truck_fill_rate': truck_fill_rate_realistic,  # REALISTIC: vs raw cubic capacity
         'packages_dwelled': packages_dwelled,
         'total_cube': total_cube,
-        'total_packages': total_pkgs
+        'total_packages': total_pkgs,
+        # Add debugging info
+        'raw_container_cube': raw_container_cube if strategy.lower() == "container" else 0,
+        'raw_truck_cube': raw_truck_cube,
+        'effective_utilization_factor': pack_util if strategy.lower() == "fluid" else float(
+            gaylord_row.get("pack_utilization_container", 0.85))
     }
+
+
+def calculate_fill_rate_comparison(total_cube: float, containers: int, trucks: int,
+                                   container_params: pd.DataFrame, strategy: str) -> dict:
+    """
+    Calculate both realistic and theoretical fill rates for comparison.
+
+    Args:
+        total_cube: Total cubic feet of packages
+        containers: Number of physical containers
+        trucks: Number of trucks
+        container_params: Container parameters DataFrame
+        strategy: 'container' or 'fluid'
+
+    Returns:
+        dict with both 'realistic' (vs raw capacity) and 'theoretical' (vs usable capacity) fill rates
+    """
+
+    if strategy.lower() == "container":
+        gaylord_row = container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0]
+        raw_container_cube = float(gaylord_row["usable_cube_cuft"])
+        pack_util_container = float(gaylord_row["pack_utilization_container"])
+        effective_container_cube = raw_container_cube * pack_util_container
+        cpt = int(gaylord_row["containers_per_truck"])
+
+        # Container fill rates
+        container_fill_realistic = (total_cube / containers) / raw_container_cube if containers > 0 else 0
+        container_fill_theoretical = (total_cube / containers) / effective_container_cube if containers > 0 else 0
+
+        # Truck fill rates
+        raw_truck_cube = raw_container_cube * cpt
+        effective_truck_cube = effective_container_cube * cpt
+
+        truck_fill_realistic = total_cube / (trucks * raw_truck_cube) if trucks > 0 else 0
+        truck_fill_theoretical = containers / (trucks * cpt) if trucks > 0 else 0
+
+        return {
+            'container_fill_realistic': min(1.0, container_fill_realistic),
+            'container_fill_theoretical': min(1.0, container_fill_theoretical),
+            'truck_fill_realistic': min(1.0, truck_fill_realistic),
+            'truck_fill_theoretical': min(1.0, truck_fill_theoretical),
+            'raw_container_cube': raw_container_cube,
+            'effective_container_cube': effective_container_cube,
+            'pack_utilization_factor': pack_util_container
+        }
+    else:
+        # Fluid strategy
+        raw_truck_cube = float(container_params.get("trailer_air_cube_cuft", pd.Series([4060.0])).iloc[0])
+        pack_util_fluid = float(container_params.get("pack_utilization_fluid", pd.Series([0.85])).iloc[0])
+        effective_truck_cube = raw_truck_cube * pack_util_fluid
+
+        truck_fill_realistic = total_cube / (trucks * raw_truck_cube) if trucks > 0 else 0
+        truck_fill_theoretical = total_cube / (trucks * effective_truck_cube) if trucks > 0 else 0
+
+        return {
+            'container_fill_realistic': 0.0,  # Not applicable for fluid
+            'container_fill_theoretical': 0.0,
+            'truck_fill_realistic': min(1.0, truck_fill_realistic),
+            'truck_fill_theoretical': min(1.0, truck_fill_theoretical),
+            'raw_truck_cube': raw_truck_cube,
+            'effective_truck_cube': effective_truck_cube,
+            'pack_utilization_factor': pack_util_fluid
+        }
+
+
+def format_realistic_fill_summary(od_selected: pd.DataFrame, strategy: str, container_params: pd.DataFrame) -> str:
+    """
+    Format fill rate summary showing REALISTIC vs theoretical fill rates.
+
+    Example output:
+    "Fill rates: 56.9% actual truck fill (75.9% of usable space after 75% pack factor)"
+    """
+    if od_selected.empty:
+        return "Fill rates: No data available"
+
+    avg_truck_fill = od_selected.get('truck_fill_rate', pd.Series([0])).mean()
+    avg_container_fill = od_selected.get('container_fill_rate', pd.Series([0])).mean()
+
+    if strategy.lower() == "container":
+        gaylord_row = container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0]
+        pack_util_container = float(gaylord_row.get("pack_utilization_container", 0.85))
+
+        # Calculate what the theoretical fill rates would be
+        theoretical_truck_fill = avg_truck_fill / pack_util_container if pack_util_container > 0 else 0
+        theoretical_container_fill = avg_container_fill / pack_util_container if pack_util_container > 0 else 0
+
+        return (f"Fill rates: {avg_container_fill:.1%} actual container fill "
+                f"({theoretical_container_fill:.1%} of usable space after {pack_util_container:.0%} pack factor), "
+                f"{avg_truck_fill:.1%} actual truck fill "
+                f"({theoretical_truck_fill:.1%} of usable space)")
+    else:
+        # Fluid strategy
+        pack_util_fluid = float(container_params.get("pack_utilization_fluid", pd.Series([0.85])).iloc[0])
+        theoretical_truck_fill = avg_truck_fill / pack_util_fluid if pack_util_fluid > 0 else 0
+
+        return (f"Fill rates: {avg_truck_fill:.1%} actual truck fill "
+                f"({theoretical_truck_fill:.1%} of usable space after {pack_util_fluid:.0%} pack factor)")
+
+
+def print_enhanced_fill_summary(scenario_id: str, od_selected: pd.DataFrame, lane_summary: pd.DataFrame,
+                                strategy: str, container_params: pd.DataFrame):
+    """
+    Print enhanced terminal summary with realistic fill rate metrics.
+    """
+    print(f"[{scenario_id}] Volume check: enhanced metrics")
+    print(f"[{scenario_id}] Hub hierarchy: network analysis complete")
+    print(f"[{scenario_id}] Lane summary: {len(lane_summary)} active lanes")
+
+    if not lane_summary.empty and not od_selected.empty:
+        # Show realistic fill rates
+        fill_summary = format_realistic_fill_summary(od_selected, strategy, container_params)
+        print(f"[{scenario_id}]   {fill_summary}")
+
+        # Add comparison for clarity
+        avg_truck_fill = od_selected.get('truck_fill_rate', pd.Series([0])).mean()
+
+        if strategy.lower() == "container":
+            pack_util = float(container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0]
+                              .get("pack_utilization_container", 0.85))
+        else:
+            pack_util = float(container_params.get("pack_utilization_fluid", pd.Series([0.85])).iloc[0])
+
+        theoretical_fill = avg_truck_fill / pack_util if pack_util > 0 else 0
+
+        print(f"[{scenario_id}]   → This means {avg_truck_fill:.1%} of total truck space used "
+              f"(vs {theoretical_fill:.1%} if measured against usable space only)")
 
 
 def smart_truck_rounding(volume_or_cube: float, truck_capacity: float,
@@ -239,8 +399,8 @@ def path_cost_and_time(
         day_pkgs: float,
 ) -> Tuple[float, float, dict, list]:
     """
-    Enhanced cost/time calculation with improved container/truck logic:
-    1. Uses enhanced container/truck calculations with proper fill rates
+    Enhanced cost/time calculation with realistic fill rate calculations:
+    1. Uses enhanced container/truck calculations with realistic fill rates
     2. Configurable dwell thresholds
     3. Proper cost allocation based on actual truck utilization
     4. Improved SLA calculation using hours per touch
@@ -276,15 +436,15 @@ def path_cost_and_time(
         leg_metrics.append(m)
         total_distance += m["distance_miles"]
 
-    # Enhanced truck calculation using new logic
+    # Enhanced truck calculation using new logic with realistic fill rates
     lane_od_pairs = [(row.to_dict(), day_pkgs)]  # Single OD for this path
     truck_calc = enhanced_container_truck_calculation(
         lane_od_pairs, pkg_mix, cont_params, cost_kv, strategy
     )
 
     trucks_per_leg = truck_calc['trucks_needed']
-    container_fill = truck_calc['container_fill_rate']
-    truck_fill = truck_calc['truck_fill_rate']
+    container_fill = truck_calc['container_fill_rate']  # Now realistic
+    truck_fill = truck_calc['truck_fill_rate']  # Now realistic
     packages_dwelled = truck_calc['packages_dwelled']
 
     # Transportation cost with actual truck utilization
@@ -347,11 +507,11 @@ def path_cost_and_time(
             "facility_type": facL.get(to, {}).get("type", "unknown"),
             "leg_cost": (m["fixed"] + m["var"] * m["distance_miles"]) * trucks_per_leg,
             "trucks_on_leg": trucks_per_leg,
-            "container_fill_rate": container_fill,
-            "truck_fill_rate": truck_fill,
+            "container_fill_rate": container_fill,  # Realistic fill rate
+            "truck_fill_rate": truck_fill,  # Realistic fill rate
         })
 
-    # Enhanced summary metrics
+    # Enhanced summary metrics with realistic fill rates
     sums = {
         "distance_miles_total": total_distance,
         "linehaul_hours_total": total_drive_hours,
@@ -361,10 +521,14 @@ def path_cost_and_time(
         "sla_days": sla_days,
         "total_trucks": trucks_per_leg * len(legs),
         "total_facilities_touched": total_facilities,
-        "container_fill_rate": container_fill,
-        "truck_fill_rate": truck_fill,
+        "container_fill_rate": container_fill,  # Realistic fill rate
+        "truck_fill_rate": truck_fill,  # Realistic fill rate
         "packages_dwelled": packages_dwelled,
         "physical_containers": truck_calc['physical_containers'],
+        # Add debugging info for fill rate validation
+        "raw_container_cube": truck_calc.get('raw_container_cube', 0),
+        "raw_truck_cube": truck_calc.get('raw_truck_cube', 0),
+        "effective_utilization_factor": truck_calc.get('effective_utilization_factor', 0.85),
     }
 
     return total_cost, total_hours, sums, steps

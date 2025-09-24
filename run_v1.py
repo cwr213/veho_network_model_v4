@@ -1,13 +1,15 @@
-# run_v1.py - ENHANCED with Sort Point Optimization and Improved Fill Logic
+# run_v1.py - ENHANCED with Sort Point Optimization, Realistic Fill Rates, and Updated File Naming
 import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from datetime import datetime
 
 from veho_net.io_loader import load_workbook, params_to_dict
 from veho_net.validators import validate_inputs
 from veho_net.build_structures import build_od_and_direct, candidate_paths
-from veho_net.time_cost import path_cost_and_time, containers_for_pkgs_day
+from veho_net.time_cost import path_cost_and_time, containers_for_pkgs_day, format_realistic_fill_summary, \
+    print_enhanced_fill_summary
 from veho_net.milp import solve_arc_pooled_path_selection
 from veho_net.reporting import (
     build_od_selected_outputs,
@@ -27,11 +29,48 @@ from veho_net.sort_optimization import (
     summarize_sort_allocation
 )
 
-# Output naming control
-OUTPUT_FILE_TEMPLATE = "{scenario_id}_results_v1.xlsx"
-COMPARE_FILE_TEMPLATE = "{base_id}_compare.xlsx"
-EXECUTIVE_SUMMARY_TEMPLATE = "{base_id}_executive_summary.xlsx"
-CONSOLIDATED_OUTPUT = "Network_Analysis_All_Scenarios.xlsx"
+# UPDATED: Shorter output naming templates with scenario_id preservation
+OUTPUT_FILE_TEMPLATE = "{scenario_id}_results.xlsx"  # Removed "_v1"
+COMPARE_FILE_TEMPLATE = "{base_id}_compare.xlsx"  # Kept as-is
+EXECUTIVE_SUMMARY_TEMPLATE = "{base_id}_summary.xlsx"  # "executive_summary" → "summary"
+CONSOLIDATED_OUTPUT = "Network_Analysis_Consolidated.xlsx"  # "All_Scenarios" → "Consolidated"
+
+
+def safe_scenario_filename(scenario_id: str, suffix: str = "results") -> str:
+    """
+    Create safe filenames that preserve scenario_id but prevent length issues.
+
+    Examples:
+      safe_scenario_filename("2025_peak_container", "results")
+      → "2025_peak_container_results.xlsx"
+
+      safe_scenario_filename("Very_Long_Scenario_Name_2025_peak_container", "results")
+      → "VeryLong2025_peak_container_results.xlsx"  # Abbreviated but preserves key info
+    """
+    # Windows filename limit is ~255 chars, but let's keep under 50 for safety
+    max_length = 45  # Leave room for suffix + ".xlsx"
+
+    if len(f"{scenario_id}_{suffix}.xlsx") <= max_length:
+        return f"{scenario_id}_{suffix}.xlsx"
+
+    # If too long, intelligently abbreviate while preserving year_daytype_strategy
+    parts = scenario_id.split('_')
+
+    if len(parts) >= 3:
+        # Try to preserve last 3 parts (likely year_daytype_strategy)
+        abbreviated = ''.join([p[:4] for p in parts[:-3]]) + '_' + '_'.join(parts[-3:])
+        if len(f"{abbreviated}_{suffix}.xlsx") <= max_length:
+            return f"{abbreviated}_{suffix}.xlsx"
+
+    # Last resort: truncate but ensure scenario_id is still recognizable
+    truncated = scenario_id[:max_length - len(suffix) - 6]  # -6 for "_{suffix}.xlsx"
+    return f"{truncated}_{suffix}.xlsx"
+
+
+def get_consolidated_filename() -> str:
+    """Generate timestamped consolidated filename to avoid overwrites."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    return f"Network_Analysis_{timestamp}.xlsx"
 
 
 def _add_default_parameters(timing: dict, costs: dict) -> tuple[dict, dict]:
@@ -179,14 +218,14 @@ def _run_one_strategy(
         out_dir: Path,
 ):
     """
-    Enhanced strategy execution with sort point optimization and improved fill logic.
+    UPDATED: Enhanced strategy execution with realistic fill rate reporting and updated file naming.
     """
     # Scenario setup
     year = int(scenario_row["year"]) if "year" in scenario_row else int(scenario_row["demand_year"])
     day_type = str(scenario_row["day_type"]).strip().lower()
     scenario_id = f"{base_id}_{strategy}"
 
-    print(f"\n=== Running {scenario_id} with Enhanced Sort Optimization ===")
+    print(f"\n=== Running {scenario_id} with Enhanced Sort Optimization & Realistic Fill Rates ===")
 
     # Inject load strategy into timing
     timing_local = dict(timing)
@@ -251,7 +290,7 @@ def _run_one_strategy(
 
     print(f"[{scenario_id}] Generated {len(cands)} candidate paths")
 
-    # Enhanced path costing with containerization awareness
+    # Enhanced path costing with containerization awareness and realistic fill rates
     cand_rows, detail_rows, direct_dist = [], [], {}
 
     for _, r in cands.iterrows():
@@ -266,7 +305,7 @@ def _run_one_strategy(
             )
             conts = containers_for_pkgs_day(pkgs_day, pkgmix, cont)
 
-            # Enhanced candidate data with fill rates
+            # Enhanced candidate data with realistic fill rates
             cand_data = {
                 "scenario_id": scenario_id,
                 "origin": r["origin"],
@@ -287,10 +326,14 @@ def _run_one_strategy(
                 "sla_days": sums["sla_days"],
                 "cost_candidate_path": cost,
                 "total_facilities_touched": sums.get("total_facilities_touched", len(r.get("path_nodes", []))),
-                # NEW: Enhanced fill rate metrics
-                "container_fill_rate": sums.get("container_fill_rate", 0.8),
-                "truck_fill_rate": sums.get("truck_fill_rate", 0.8),
+                # UPDATED: Enhanced realistic fill rate metrics
+                "container_fill_rate": sums.get("container_fill_rate", 0.0),  # Now realistic
+                "truck_fill_rate": sums.get("truck_fill_rate", 0.0),  # Now realistic
                 "packages_dwelled": sums.get("packages_dwelled", 0),
+                # NEW: Add debugging info for fill rate validation
+                "raw_container_cube": sums.get("raw_container_cube", 0),
+                "raw_truck_cube": sums.get("raw_truck_cube", 0),
+                "effective_utilization_factor": sums.get("effective_utilization_factor", 0.85),
             }
 
             # Add containerization level if available
@@ -328,7 +371,7 @@ def _run_one_strategy(
         print(f"[{scenario_id}] No valid candidate paths for {day_type}. Skipping.")
         return scenario_id, None, pd.Series(dtype=float), None
 
-    print(f"[{scenario_id}] Processed {len(cand_tbl)} valid paths with enhanced metrics")
+    print(f"[{scenario_id}] Processed {len(cand_tbl)} valid paths with realistic fill rate metrics")
 
     # Enhanced MILP path selection
     selected_basic, arc_summary = solve_arc_pooled_path_selection(
@@ -352,10 +395,14 @@ def _run_one_strategy(
         "sla_days_cand": "sla_days",
         "time_hours_cand": "time_hours",
         "pkgs_day_cand": "pkgs_day_ref",
-        "container_fill_rate_cand": "container_fill_rate",
-        "truck_fill_rate_cand": "truck_fill_rate",
+        "container_fill_rate_cand": "container_fill_rate",  # Realistic fill rate
+        "truck_fill_rate_cand": "truck_fill_rate",  # Realistic fill rate
         "packages_dwelled_cand": "packages_dwelled",
         "containerization_level_cand": "containerization_level",
+        # NEW: Debugging columns for fill rate validation
+        "raw_container_cube_cand": "raw_container_cube",
+        "raw_truck_cube_cand": "raw_truck_cube",
+        "effective_utilization_factor_cand": "effective_utilization_factor",
     }
 
     for old, new in cand_rename.items():
@@ -444,23 +491,28 @@ def _run_one_strategy(
     dwell_hotspots = build_dwell_hotspots(detail_sel)
     kpis = _network_kpis(od_out)
 
-    # Add enhanced KPIs
+    # Add enhanced KPIs with realistic fill rates
     enhanced_kpis = pd.Series({
-        "avg_container_fill_rate": od_out.get('container_fill_rate', pd.Series([0])).mean(),
-        "avg_truck_fill_rate": od_out.get('truck_fill_rate', pd.Series([0])).mean(),
+        "avg_container_fill_rate": od_out.get('container_fill_rate', pd.Series([0])).mean(),  # Realistic
+        "avg_truck_fill_rate": od_out.get('truck_fill_rate', pd.Series([0])).mean(),  # Realistic
         "total_packages_dwelled": od_out.get('packages_dwelled', pd.Series([0])).sum(),
         "sort_optimization_savings": allocation_summary[
             'daily_cost_savings'].sum() if not allocation_summary.empty else 0,
+        # NEW: Add theoretical fill rates for comparison
+        "theoretical_container_fill_rate": od_out.get('container_fill_rate', pd.Series([0])).mean() /
+                                           od_out.get('effective_utilization_factor', pd.Series([0.85])).mean()
+        if strategy.lower() == "container" else 0,
+        "theoretical_truck_fill_rate": od_out.get('truck_fill_rate', pd.Series([0])).mean() /
+                                       od_out.get('effective_utilization_factor', pd.Series([0.85])).mean(),
     })
     kpis = pd.concat([kpis, enhanced_kpis])
 
-    # Write individual scenario results
-    out_path = out_dir / OUTPUT_FILE_TEMPLATE.format(scenario_id=scenario_id)
+    # UPDATED: Write individual scenario results with safe filename
+    out_filename = safe_scenario_filename(scenario_id, "results")
+    out_path = out_dir / out_filename
 
-    # Enhanced write with sort allocation summary
-    enhanced_outputs = {
-        'sort_allocation_summary': allocation_summary,
-    }
+    # Always log the filename mapping for traceability
+    print(f"[{scenario_id}] Writing to: {out_filename}")
 
     write_workbook(out_path, scen_sum, od_out, detail_sel, dwell_hotspots, facility_rollup, lane_summary, kpis)
 
@@ -469,7 +521,7 @@ def _run_one_strategy(
         with pd.ExcelWriter(out_path, mode='a', engine="openpyxl") as writer:
             allocation_summary.to_excel(writer, sheet_name='sort_allocation_summary', index=False)
 
-    # Enhanced validation output
+    # UPDATED: Enhanced validation output with realistic fill rate reporting
     annual_total = float(demand.query("year == @year")["annual_pkgs"].sum())
     daily_off = float(demand.query("year == @year")["offpeak_pct_of_annual"].iloc[0])
     daily_peak = float(demand.query("year == @year")["peak_pct_of_annual"].iloc[0])
@@ -480,9 +532,39 @@ def _run_one_strategy(
     print(
         f"[{scenario_id}] Hub hierarchy: {(facility_rollup['hub_tier'] == 'primary').sum()} primary, {(facility_rollup['hub_tier'] == 'secondary').sum()} secondary hubs")
     print(f"[{scenario_id}] Lane summary: {len(lane_summary)} active lanes")
-    if not lane_summary.empty:
-        print(
-            f"[{scenario_id}]   Avg fill: containers {od_out.get('container_fill_rate', pd.Series([0])).mean():.1%}, trucks {od_out.get('truck_fill_rate', pd.Series([0])).mean():.1%}")
+
+    # UPDATED: Realistic fill rate reporting
+    if not lane_summary.empty and not od_out.empty:
+        avg_truck_fill_realistic = od_out.get('truck_fill_rate', pd.Series([0])).mean()
+        avg_container_fill_realistic = od_out.get('container_fill_rate', pd.Series([0])).mean()
+
+        # Get pack utilization factors for comparison
+        if strategy.lower() == "container":
+            gaylord_row = cont[cont["container_type"].str.lower() == "gaylord"].iloc[0]
+            pack_util_container = float(gaylord_row.get("pack_utilization_container", 0.85))
+            pack_util_truck = pack_util_container  # Same factor for container truck capacity
+
+            # Calculate what these would be as theoretical fill rates
+            theoretical_container_fill = avg_container_fill_realistic / pack_util_container if pack_util_container > 0 else 0
+            theoretical_truck_fill = avg_truck_fill_realistic / pack_util_truck if pack_util_truck > 0 else 0
+
+            print(f"[{scenario_id}]   Realistic fill rates:")
+            print(
+                f"[{scenario_id}]     Container: {avg_container_fill_realistic:.1%} actual ({theoretical_container_fill:.1%} usable)")
+            print(
+                f"[{scenario_id}]     Truck: {avg_truck_fill_realistic:.1%} actual ({theoretical_truck_fill:.1%} usable)")
+            print(f"[{scenario_id}]     → Based on {pack_util_container:.0%} container pack factor")
+
+        else:
+            # Fluid strategy
+            pack_util_fluid = float(cont.get("pack_utilization_fluid", pd.Series([0.85])).iloc[0])
+            theoretical_truck_fill = avg_truck_fill_realistic / pack_util_fluid if pack_util_fluid > 0 else 0
+
+            print(f"[{scenario_id}]   Realistic fill rates:")
+            print(
+                f"[{scenario_id}]     Truck: {avg_truck_fill_realistic:.1%} actual ({theoretical_truck_fill:.1%} usable)")
+            print(f"[{scenario_id}]     → Based on {pack_util_fluid:.0%} fluid pack factor")
+
     print(f"[{scenario_id}] Cost allocation: Total=${od_out['total_cost'].sum():,.0f}")
     if not allocation_summary.empty:
         print(f"[{scenario_id}] Sort optimization: ${allocation_summary['daily_cost_savings'].sum():,.0f}/day savings")
@@ -496,8 +578,10 @@ def _run_one_strategy(
         'total_cost': kpis.get('total_cost', 0),
         'cost_per_package': kpis.get('cost_per_pkg', 0),
         'sort_optimization_savings': enhanced_kpis.get('sort_optimization_savings', 0),
-        'avg_container_fill_rate': enhanced_kpis.get('avg_container_fill_rate', 0),
-        'avg_truck_fill_rate': enhanced_kpis.get('avg_truck_fill_rate', 0),
+        'avg_container_fill_rate': enhanced_kpis.get('avg_container_fill_rate', 0),  # Realistic
+        'avg_truck_fill_rate': enhanced_kpis.get('avg_truck_fill_rate', 0),  # Realistic
+        'theoretical_container_fill_rate': enhanced_kpis.get('theoretical_container_fill_rate', 0),
+        'theoretical_truck_fill_rate': enhanced_kpis.get('theoretical_truck_fill_rate', 0),
         'arc_summary': arc_summary,
         'kpis': kpis,
         'primary_hubs': facility_rollup[facility_rollup['hub_tier'] == 'primary']['facility'].tolist(),
@@ -513,7 +597,7 @@ def _run_one_strategy(
 
 def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, out_dir: Path):
     """
-    Enhanced executive summary with sort optimization insights.
+    UPDATED: Enhanced executive summary with realistic fill rate insights and updated file naming.
     """
     if len(results_by_strategy) < 2:
         return
@@ -533,18 +617,30 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
     # Sort optimization impact
     sort_savings = container_results.get('sort_optimization_savings', 0)
 
+    # UPDATED: Realistic fill rate analysis
+    container_truck_fill = container_results.get('avg_truck_fill_rate', 0)
+    container_container_fill = container_results.get('avg_container_fill_rate', 0)
+    fluid_truck_fill = fluid_results.get('avg_truck_fill_rate', 0)
+
+    # Get theoretical fill rates for comparison
+    container_truck_theoretical = container_results.get('theoretical_truck_fill_rate', 0)
+    container_container_theoretical = container_results.get('theoretical_container_fill_rate', 0)
+    fluid_truck_theoretical = fluid_results.get('theoretical_truck_fill_rate', 0)
+
     # Create enhanced summary data
     summary_data = {}
 
-    # Sheet 1: Enhanced Strategy Comparison
+    # Sheet 1: Enhanced Strategy Comparison with realistic fill rates
     strategy_comparison = pd.DataFrame([
         {
             'strategy': 'container',
             'total_daily_cost': container_cost,
             'sort_optimization_savings': container_results.get('sort_optimization_savings', 0),
             'net_daily_cost': container_cost - container_results.get('sort_optimization_savings', 0),
-            'avg_container_fill_rate': container_results.get('avg_container_fill_rate', 0),
-            'avg_truck_fill_rate': container_results.get('avg_truck_fill_rate', 0),
+            'realistic_container_fill_rate': container_container_fill,  # Realistic
+            'realistic_truck_fill_rate': container_truck_fill,  # Realistic
+            'theoretical_container_fill_rate': container_container_theoretical,  # Theoretical
+            'theoretical_truck_fill_rate': container_truck_theoretical,  # Theoretical
             'primary_hubs': len(container_results['primary_hubs']),
             'secondary_hubs': len(container_results['secondary_hubs']),
         },
@@ -553,8 +649,10 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
             'total_daily_cost': fluid_cost,
             'sort_optimization_savings': 0,  # Fluid doesn't have sort optimization
             'net_daily_cost': fluid_cost,
-            'avg_container_fill_rate': 0,  # Fluid doesn't use containers
-            'avg_truck_fill_rate': fluid_results.get('avg_truck_fill_rate', 0),
+            'realistic_container_fill_rate': 0,  # Fluid doesn't use containers
+            'realistic_truck_fill_rate': fluid_truck_fill,  # Realistic
+            'theoretical_container_fill_rate': 0,
+            'theoretical_truck_fill_rate': fluid_truck_theoretical,  # Theoretical
             'primary_hubs': len(fluid_results['primary_hubs']),
             'secondary_hubs': len(fluid_results['secondary_hubs']),
         }
@@ -589,31 +687,31 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
     hub_throughput = hub_throughput.sort_values('peak_hourly_throughput', ascending=False)
     summary_data['Hub_Hourly_Throughput'] = hub_throughput
 
-    # Enhanced Monday answers with sort optimization insights
+    # UPDATED: Enhanced Monday answers with realistic fill rate insights
     monday_answers = pd.DataFrame([
         {
             'question': '1. Optimal Containerization Strategy',
             'answer': f'{optimal_strategy.upper()} strategy',
             'detail': f'Base cost difference: ${cost_difference:,.0f}/day. Sort optimization saves additional ${sort_savings:,.0f}/day',
-            'fill_rates': f"Container: {container_results.get('avg_container_fill_rate', 0):.1%}, Truck: {container_results.get('avg_truck_fill_rate', 0):.1%}"
+            'realistic_metrics': f"Realistic fill rates - Container: {container_container_fill:.1%}, Truck: {container_truck_fill:.1%} of total cubic capacity"
         },
         {
-            'question': '2. Sort Point Optimization Impact',
+            'question': '2. Realistic vs Theoretical Fill Rate Analysis',
+            'answer': f'Container strategy uses {container_truck_fill:.1%} of total truck cubic capacity (vs {container_truck_theoretical:.1%} theoretical)',
+            'detail': f'This is actual physical space utilization, not theoretical maximum after pack factors',
+            'realistic_metrics': f'Compare to fluid: {fluid_truck_fill:.1%} actual vs {fluid_truck_theoretical:.1%} theoretical truck fill rate'
+        },
+        {
+            'question': '3. Sort Point Optimization Impact',
             'answer': f'${sort_savings:,.0f}/day potential savings from optimal containerization',
             'detail': f'Hybrid allocation optimizes {len(container_results.get("sort_allocation_summary", pd.DataFrame()))} OD pairs',
-            'fill_rates': f'Improved consolidation efficiency through targeted deeper containerization'
+            'realistic_metrics': f'Improved consolidation efficiency through targeted deeper containerization'
         },
         {
-            'question': '3. Enhanced Fill Rate Analysis',
-            'answer': f'Container strategy: {container_results.get("avg_container_fill_rate", 0):.1%} container, {container_results.get("avg_truck_fill_rate", 0):.1%} truck fill',
-            'detail': f'Premium economy dwell optimization balances service vs efficiency',
-            'fill_rates': f'Enhanced truck calculation prevents over-optimistic utilization estimates'
-        },
-        {
-            'question': '4. Facility Requirements',
-            'answer': f'Enhanced VA-based throughput calculated for {len(hub_throughput)} facilities',
-            'detail': f"Sort capacity validation ensures operational feasibility",
-            'fill_rates': f"Top facility: {hub_throughput.iloc[0]['facility'] if not hub_throughput.empty else 'N/A'}"
+            'question': '4. Operational Reality Check',
+            'answer': f'Realistic fill rates provide true operational picture vs misleading theoretical rates',
+            'detail': f'Previous "high fill rates" were inflated due to pack factor calculations',
+            'realistic_metrics': f"Container: {container_container_fill:.1%} real vs {container_container_theoretical:.1%} theoretical, Truck: {container_truck_fill:.1%} real vs {container_truck_theoretical:.1%} theoretical"
         }
     ])
 
@@ -623,24 +721,32 @@ def _create_monday_executive_summary(base_id: str, results_by_strategy: dict, ou
     if 'sort_allocation_summary' in container_results and not container_results['sort_allocation_summary'].empty:
         summary_data['Sort_Allocation_Details'] = container_results['sort_allocation_summary']
 
-    # Write enhanced executive summary
-    exec_summary_path = out_dir / EXECUTIVE_SUMMARY_TEMPLATE.format(base_id=base_id)
+    # UPDATED: Write enhanced executive summary with updated filename template
+    exec_summary_filename = safe_scenario_filename(base_id, "summary")
+    exec_summary_path = out_dir / exec_summary_filename
+
     with pd.ExcelWriter(exec_summary_path, engine="xlsxwriter") as writer:
         for sheet_name, df in summary_data.items():
             df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    print(f"[{base_id}] Enhanced executive summary written: {exec_summary_path}")
+    print(f"[{base_id}] Enhanced executive summary written: {exec_summary_filename}")
     print(f"\n=== ENHANCED MONDAY EXECUTIVE SUMMARY ===")
     print(f"Optimal Strategy: {optimal_strategy.upper()}")
     print(f"Base Cost Advantage: ${cost_difference:,.0f}/day")
     print(f"Sort Optimization Bonus: ${sort_savings:,.0f}/day")
     print(f"Combined Daily Savings: ${cost_difference + sort_savings:,.0f}/day")
+    print(f"REALISTIC Fill Rates:")
     print(
-        f"Enhanced Fill Rates: Container {container_results.get('avg_container_fill_rate', 0):.1%}, Truck {container_results.get('avg_truck_fill_rate', 0):.1%}")
+        f"  Container: {container_container_fill:.1%} of total container space ({container_container_theoretical:.1%} theoretical)")
+    print(
+        f"  Truck: {container_truck_fill:.1%} of total truck space (container strategy) ({container_truck_theoretical:.1%} theoretical)")
+    print(
+        f"  Truck: {fluid_truck_fill:.1%} of total truck space (fluid strategy) ({fluid_truck_theoretical:.1%} theoretical)")
+    print(f"  → These are actual physical space utilization rates vs theoretical usable space rates")
 
 
 def _create_consolidated_output(all_results: list, out_dir: Path):
-    """Enhanced consolidated output with sort optimization metrics."""
+    """UPDATED: Enhanced consolidated output with realistic fill rate metrics and updated filename."""
     print(f"\n=== Creating Enhanced Consolidated Multi-Year Analysis ===")
 
     all_facility_rollups = []
@@ -672,6 +778,7 @@ def _create_consolidated_output(all_results: list, out_dir: Path):
             sort_alloc['strategy'] = result['strategy']
             all_sort_allocations.append(sort_alloc)
 
+        # UPDATED: Enhanced strategy comparison with realistic fill rates
         all_strategy_comparisons.append({
             'year': result['year'],
             'day_type': result['day_type'],
@@ -680,8 +787,10 @@ def _create_consolidated_output(all_results: list, out_dir: Path):
             'total_cost': result.get('total_cost', 0),
             'cost_per_pkg': result.get('cost_per_package', 0),
             'sort_optimization_savings': result.get('sort_optimization_savings', 0),
-            'avg_container_fill_rate': result.get('avg_container_fill_rate', 0),
-            'avg_truck_fill_rate': result.get('avg_truck_fill_rate', 0),
+            'realistic_container_fill_rate': result.get('avg_container_fill_rate', 0),  # Realistic
+            'realistic_truck_fill_rate': result.get('avg_truck_fill_rate', 0),  # Realistic
+            'theoretical_container_fill_rate': result.get('theoretical_container_fill_rate', 0),  # Theoretical
+            'theoretical_truck_fill_rate': result.get('theoretical_truck_fill_rate', 0),  # Theoretical
             'primary_hubs': len(result.get('primary_hubs', [])),
             'secondary_hubs': len(result.get('secondary_hubs', [])),
         })
@@ -704,13 +813,14 @@ def _create_consolidated_output(all_results: list, out_dir: Path):
     if all_strategy_comparisons:
         consolidated_data['Enhanced_Strategy_Comparison'] = pd.DataFrame(all_strategy_comparisons)
 
+    # UPDATED: Use updated consolidated filename
     consolidated_path = out_dir / CONSOLIDATED_OUTPUT
     with pd.ExcelWriter(consolidated_path, engine="xlsxwriter") as writer:
         for sheet_name, df in consolidated_data.items():
             df.to_excel(writer, sheet_name=sheet_name, index=False)
             print(f"  ✓ {sheet_name}: {len(df):,} rows")
 
-    print(f"✅ Enhanced consolidated analysis written: {consolidated_path}")
+    print(f"✅ Enhanced consolidated analysis written: {CONSOLIDATED_OUTPUT}")
     print(f"   Total sheets: {len(consolidated_data)}")
 
 
@@ -742,7 +852,8 @@ def main(input_path: str, output_dir: str | None):
     if compare_mode not in {"single", "paired"}:
         raise ValueError(f"run_settings.compare_mode must be 'single' or 'paired', got '{compare_mode}'")
 
-    print(f"Running in {compare_mode} mode with enhanced sort optimization")
+    print(
+        f"Running in {compare_mode} mode with enhanced sort optimization, realistic fill rate reporting, and updated file naming")
 
     all_results = []
 
@@ -755,7 +866,7 @@ def main(input_path: str, output_dir: str | None):
                 base_id, strategy, facilities, zips, demand, inj, mb, timing, costs, cont, pkgmix, run_kv, s, out_dir
             )
             if out_path:
-                print(f"✅ Enhanced results written: {out_path}")
+                print(f"✅ Enhanced results written: {out_path.name}")
                 all_results.append(results_data)
         else:
             results_by_strategy = {}
@@ -775,23 +886,25 @@ def main(input_path: str, output_dir: str | None):
                         "base_id": base_id,
                         "scenario_id": scenario_id,
                         "strategy": strategy,
-                        "output_file": str(out_path),
+                        "output_file": str(out_path.name),  # Just filename, not full path
                     })
                     per_base.append(rec)
                     print(f"✅ Enhanced {scenario_id} completed")
 
             if per_base:
                 compare_df = pd.DataFrame(per_base)
-                compare_path = out_dir / COMPARE_FILE_TEMPLATE.format(base_id=base_id)
+                compare_filename = safe_scenario_filename(base_id, "compare")
+                compare_path = out_dir / compare_filename
                 write_compare_workbook(compare_path, compare_df, run_kv)
-                print(f"✅ Enhanced comparison written: {compare_path}")
+                print(f"✅ Enhanced comparison written: {compare_filename}")
 
                 _create_monday_executive_summary(base_id, results_by_strategy, out_dir)
 
     if all_results:
         _create_consolidated_output(all_results, out_dir)
 
-    print(f"\n🎉 Enhanced analysis complete with sort optimization! Results in: {out_dir.resolve()}")
+    print(
+        f"\n🎉 Enhanced analysis complete with realistic fill rates, sort optimization, and updated file naming! Results in: {out_dir.resolve()}")
 
 
 def _scenario_summary(run_kv, scenario_id, year, day_type, mb, timing, cont):
@@ -833,9 +946,9 @@ def _network_kpis(od_selected: pd.DataFrame) -> pd.Series:
         "pct_1_touch": round(100 * (od_selected["path_type"] == "1_touch").mean(), 2),
         "pct_2_touch": round(100 * (od_selected["path_type"] == "2_touch").mean(), 2),
         "pct_3_touch": round(100 * (od_selected["path_type"] == "3_touch").mean(), 2),
-        # Enhanced metrics
-        "avg_container_fill_rate": od_selected.get('container_fill_rate', pd.Series([0])).mean(),
-        "avg_truck_fill_rate": od_selected.get('truck_fill_rate', pd.Series([0])).mean(),
+        # UPDATED: Enhanced metrics with realistic fill rates
+        "avg_container_fill_rate": od_selected.get('container_fill_rate', pd.Series([0])).mean(),  # Realistic
+        "avg_truck_fill_rate": od_selected.get('truck_fill_rate', pd.Series([0])).mean(),  # Realistic
         "total_packages_dwelled": od_selected.get('packages_dwelled', pd.Series([0])).sum(),
     })
 
