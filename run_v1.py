@@ -229,8 +229,8 @@ def _run_one_strategy(
         print("🎯 Optimizing sort allocation...")
         sort_allocation = optimize_sort_allocation(cost_analysis, facilities, timing_local)
 
-        # Apply sort allocation to OD data
-        od = apply_sort_allocation(od, sort_allocation)
+        # Apply sort allocation to OD data with all required parameters
+        od = apply_sort_allocation(od, sort_allocation, cost_analysis, facilities)
 
         # Create allocation summary
         allocation_summary = summarize_sort_allocation(od, cost_analysis, sort_allocation)
