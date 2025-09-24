@@ -1,4 +1,4 @@
-# veho_net/time_cost.py - COMPLETE FIXED VERSION
+# veho_net/time_cost.py - ENHANCED with improved container/truck fill logic
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
@@ -76,10 +76,109 @@ def compute_leg_metrics(fr: str, to: str, facL: dict, bands: pd.DataFrame) -> di
     return {"distance_miles": dist, "fixed": fixed, "var": var, "mph": mph}
 
 
-def smart_truck_rounding(volume_or_cube: float, truck_capacity: float, threshold: float = 0.10) -> int:
+def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix: pd.DataFrame,
+                                         container_params: pd.DataFrame, cost_kv: dict,
+                                         strategy: str = "container") -> dict:
     """
-    Smart truck rounding - if <10% of new truck is used, round down.
-    Reflects operational reality where some packages can be delayed for better fill.
+    Enhanced container/truck calculation with proper partial container handling.
+
+    Args:
+        lane_od_pairs: List of (od_dict, pkgs_day) for this lane
+        package_mix: Package mix DataFrame
+        container_params: Container parameters DataFrame
+        cost_kv: Cost parameters dictionary
+        strategy: 'container' or 'fluid'
+
+    Returns:
+        dict with truck calculation results including fill rates
+    """
+
+    # Calculate total volume for this lane
+    total_pkgs = sum(pkgs for _, pkgs in lane_od_pairs)
+    if total_pkgs <= 0:
+        return {
+            'physical_containers': 0,
+            'trucks_needed': 0,
+            'container_fill_rate': 0.0,
+            'truck_fill_rate': 0.0,
+            'packages_dwelled': 0,
+            'total_cube': 0.0
+        }
+
+    w_cube = weighted_pkg_cube(package_mix)
+    total_cube = total_pkgs * w_cube
+
+    if strategy.lower() == "container":
+        # Container strategy calculations
+        eff_g_cube = effective_gaylord_cube(container_params, {})
+        cpt = containers_per_truck(container_params)
+
+        # Step 1: Calculate exact containers needed (no rounding)
+        exact_containers = total_cube / max(eff_g_cube, 1e-9)
+
+        # Step 2: Build actual containers (always round UP for physical containers)
+        physical_containers = max(1, int(np.ceil(exact_containers)))
+        container_fill_rate = exact_containers / physical_containers
+
+        # Step 3: Calculate trucks with dwell logic
+        raw_trucks = physical_containers / cpt
+
+        # Get dwell parameters
+        dwell_threshold = float(cost_kv.get('premium_economy_dwell_threshold', 0.10))
+        allow_dwell = bool(cost_kv.get('allow_premium_economy_dwell', True))
+
+        # Apply dwell logic
+        if allow_dwell and (raw_trucks - int(raw_trucks)) < dwell_threshold:
+            final_trucks = max(1, int(raw_trucks))  # Round down, packages dwell
+            packages_dwelled = total_pkgs * max(0, (raw_trucks - final_trucks) / raw_trucks)
+        else:
+            final_trucks = max(1, int(np.ceil(raw_trucks)))  # Round up, send partial truck
+            packages_dwelled = 0
+
+        # Calculate truck fill rate
+        truck_fill_rate = physical_containers / max(final_trucks * cpt, 1e-9)
+        truck_fill_rate = min(1.0, truck_fill_rate)  # Cap at 100%
+
+    else:
+        # Fluid strategy calculations
+        trailer_eff = trailer_effective_cube(container_params)
+
+        # Direct truck calculation
+        raw_trucks = total_cube / max(trailer_eff, 1e-9)
+
+        # Get dwell parameters (same as container)
+        dwell_threshold = float(cost_kv.get('premium_economy_dwell_threshold', 0.10))
+        allow_dwell = bool(cost_kv.get('allow_premium_economy_dwell', True))
+
+        if allow_dwell and (raw_trucks - int(raw_trucks)) < dwell_threshold:
+            final_trucks = max(1, int(raw_trucks))
+            packages_dwelled = total_pkgs * max(0, (raw_trucks - final_trucks) / raw_trucks)
+        else:
+            final_trucks = max(1, int(np.ceil(raw_trucks)))
+            packages_dwelled = 0
+
+        # Fluid doesn't use physical containers
+        physical_containers = 0
+        container_fill_rate = total_cube / max(final_trucks * trailer_eff, 1e-9)
+        container_fill_rate = min(1.0, container_fill_rate)  # This is actually trailer fill rate
+        truck_fill_rate = container_fill_rate  # Same thing for fluid
+
+    return {
+        'physical_containers': physical_containers,
+        'trucks_needed': final_trucks,
+        'container_fill_rate': container_fill_rate,
+        'truck_fill_rate': truck_fill_rate,
+        'packages_dwelled': packages_dwelled,
+        'total_cube': total_cube,
+        'total_packages': total_pkgs
+    }
+
+
+def smart_truck_rounding(volume_or_cube: float, truck_capacity: float,
+                         dwell_threshold: float = 0.10) -> int:
+    """
+    DEPRECATED: Use enhanced_container_truck_calculation instead.
+    Kept for backwards compatibility.
     """
     if truck_capacity <= 0:
         return 1  # Minimum 1 truck
@@ -89,14 +188,14 @@ def smart_truck_rounding(volume_or_cube: float, truck_capacity: float, threshold
         return 1  # Always need at least 1 truck
 
     fractional_part = raw_trucks - int(raw_trucks)
-    if fractional_part < threshold:
+    if fractional_part < dwell_threshold:
         return int(raw_trucks)  # Round down if under threshold
     else:
         return int(raw_trucks) + 1  # Round up
 
 
 def resolve_legs_for_path(origin: str, dest: str, path_type: str, facilities: pd.DataFrame, bands: pd.DataFrame) -> \
-List[Tup[str, str, float]]:
+        List[Tup[str, str, float]]:
     facL = _facility_lookup(facilities)
     o, d = origin, dest
 
@@ -140,25 +239,19 @@ def path_cost_and_time(
         day_pkgs: float,
 ) -> Tuple[float, float, dict, list]:
     """
-    Enhanced cost/time calculation with all fixes:
-    1. Simplified SLA calculation using hours per touch
-    2. Smart truck rounding to avoid marginal consolidation
-    3. Launch facility constraints enforced
-    4. SLA penalty for extra touches
+    Enhanced cost/time calculation with improved container/truck logic:
+    1. Uses enhanced container/truck calculations with proper fill rates
+    2. Configurable dwell thresholds
+    3. Proper cost allocation based on actual truck utilization
+    4. Improved SLA calculation using hours per touch
     """
     facL = _facility_lookup(facilities)
 
-    # Simplified timing parameters
+    # Enhanced timing parameters
     hours_per_touch = float(timing_kv.get("hours_per_touch", 6.0))
     load_h = float(timing_kv.get("load_hours", 0.5))
     unload_h = float(timing_kv.get("unload_hours", 0.5))
     strategy = str(timing_kv.get("load_strategy", "container")).lower()
-
-    # Container/cube calculations
-    w_cube = weighted_pkg_cube(pkg_mix)
-    eff_g_cube = effective_gaylord_cube(cont_params, timing_kv)
-    cpt = containers_per_truck(cont_params)
-    trailer_eff = trailer_effective_cube(cont_params)
 
     o = row["origin"]
     d = row["dest"]
@@ -183,24 +276,40 @@ def path_cost_and_time(
         leg_metrics.append(m)
         total_distance += m["distance_miles"]
 
-    # Smart truck calculation with rounding
-    total_cube = max(day_pkgs, 0.0) * w_cube
-    if strategy == "container":
-        gaylords = max(1, total_cube / max(eff_g_cube, 1e-9))
-        trucks_per_leg = smart_truck_rounding(gaylords, cpt)
-    else:
-        trucks_per_leg = smart_truck_rounding(total_cube, trailer_eff)
+    # Enhanced truck calculation using new logic
+    lane_od_pairs = [(row.to_dict(), day_pkgs)]  # Single OD for this path
+    truck_calc = enhanced_container_truck_calculation(
+        lane_od_pairs, pkg_mix, cont_params, cost_kv, strategy
+    )
 
-    # Transportation cost
-    trucking_cost = sum([m["fixed"] + m["var"] * m["distance_miles"] for m in leg_metrics]) * trucks_per_leg
+    trucks_per_leg = truck_calc['trucks_needed']
+    container_fill = truck_calc['container_fill_rate']
+    truck_fill = truck_calc['truck_fill_rate']
+    packages_dwelled = truck_calc['packages_dwelled']
 
-    # Processing costs
+    # Transportation cost with actual truck utilization
+    base_trucking_cost = sum([m["fixed"] + m["var"] * m["distance_miles"] for m in leg_metrics])
+    trucking_cost = base_trucking_cost * trucks_per_leg
+
+    # Processing costs with containerization awareness
     num_intermediate = max(len(legs) - 1, 0)
-    crossdock_touches = num_intermediate if strategy == "container" else 0
-    sort_touches = 1 + (num_intermediate if strategy == "fluid" else 0) + 1  # origin + intermediate + destination
 
-    crossdock_cost = float(cost_kv.get("crossdock_touch_cost_per_pkg", 0.0)) * crossdock_touches * day_pkgs
-    sort_cost = float(cost_kv.get("sort_cost_per_pkg", 0.0)) * sort_touches * day_pkgs
+    if strategy == "container":
+        # Container strategy: crossdock touches for intermediate, sort at origin/dest
+        crossdock_touches = num_intermediate
+        sort_touches = 2  # Origin sort + destination sort
+
+        crossdock_cost = float(cost_kv.get("crossdock_touch_cost_per_pkg", 0.0)) * crossdock_touches * day_pkgs
+        sort_cost = float(cost_kv.get("sort_cost_per_pkg", 0.0)) * sort_touches * day_pkgs
+
+    else:
+        # Fluid strategy: sort at every touch point
+        sort_touches = len(legs) + 1  # Origin + each intermediate + destination
+        crossdock_cost = 0.0
+        sort_cost = float(cost_kv.get("sort_cost_per_pkg", 0.0)) * sort_touches * day_pkgs
+
+    # Dwell cost for packages that wait
+    dwell_cost = packages_dwelled * float(cost_kv.get("dwell_cost_per_pkg_per_day", 0.0))
 
     # SLA penalty for extra touches (discourages over-consolidation)
     sla_penalty_per_touch = float(cost_kv.get("sla_penalty_per_touch_per_pkg", 0.25))
@@ -209,18 +318,21 @@ def path_cost_and_time(
     else:
         sla_penalty_cost = 0.0
 
-    total_cost = trucking_cost + crossdock_cost + sort_cost + sla_penalty_cost
+    total_cost = trucking_cost + crossdock_cost + sort_cost + dwell_cost + sla_penalty_cost
 
-    # Simplified timing calculation
+    # Enhanced timing calculation
     total_drive_hours = sum(m["distance_miles"] / max(m["mph"], 1e-6) for m in leg_metrics)
     total_facilities = len(legs) + 1  # Number of facilities touched
     total_processing_hours = total_facilities * hours_per_touch
-    total_hours = total_drive_hours + total_processing_hours
+
+    # Add dwell time impact on SLA
+    dwell_hours = packages_dwelled / max(day_pkgs, 1e-9) * 24.0  # Proportional dwell impact
+    total_hours = total_drive_hours + total_processing_hours + dwell_hours
 
     # Simple SLA calculation in days
     sla_days = max(1, int(np.ceil(total_hours / 24.0)))
 
-    # Generate step details
+    # Generate enhanced step details
     steps = []
     for idx, ((fr, to), m) in enumerate(zip(legs, leg_metrics)):
         drive_h = m["distance_miles"] / max(m["mph"], 1e-6)
@@ -235,18 +347,24 @@ def path_cost_and_time(
             "facility_type": facL.get(to, {}).get("type", "unknown"),
             "leg_cost": (m["fixed"] + m["var"] * m["distance_miles"]) * trucks_per_leg,
             "trucks_on_leg": trucks_per_leg,
+            "container_fill_rate": container_fill,
+            "truck_fill_rate": truck_fill,
         })
 
-    # Summary metrics
+    # Enhanced summary metrics
     sums = {
         "distance_miles_total": total_distance,
         "linehaul_hours_total": total_drive_hours,
         "handling_hours_total": total_processing_hours,
-        "dwell_hours_total": 0.0,
-        "destination_dwell_hours": 0.0,
+        "dwell_hours_total": dwell_hours,
+        "destination_dwell_hours": 0.0,  # Could be enhanced later
         "sla_days": sla_days,
         "total_trucks": trucks_per_leg * len(legs),
         "total_facilities_touched": total_facilities,
+        "container_fill_rate": container_fill,
+        "truck_fill_rate": truck_fill,
+        "packages_dwelled": packages_dwelled,
+        "physical_containers": truck_calc['physical_containers'],
     }
 
     return total_cost, total_hours, sums, steps
