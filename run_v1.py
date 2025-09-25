@@ -1,4 +1,4 @@
-# run_v1.py - CORE WORKING MODEL (Before Sort Level Optimization)
+# run_v1.py - Network optimization with corrected fill rates and no hardcoded values
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -15,7 +15,8 @@ from veho_net.reporting import (
     build_od_selected_outputs,
     build_dwell_hotspots,
     build_lane_summary,
-    add_zone
+    add_zone,
+    validate_network_aggregations
 )
 from veho_net.write_outputs import (
     write_workbook,
@@ -31,56 +32,57 @@ EXECUTIVE_SUMMARY_TEMPLATE = "{scenario_id}_exec_sum.xlsx"
 
 def _allocate_lane_costs_to_ods(od_selected: pd.DataFrame, arc_summary: pd.DataFrame, costs: dict,
                                 strategy: str) -> pd.DataFrame:
-    """Enhanced cost allocation with container handling logic."""
+    """Allocate lane-level costs back to individual OD pairs based on volume share."""
     od = od_selected.copy()
 
-    # Basic touch costs per OD based on path type
+    # Map path types to number of intermediate touches
     touch_map = {"direct": 0, "1_touch": 1, "2_touch": 2, "3_touch": 3, "4_touch": 4}
     od['num_touches'] = od['path_type'].map(touch_map).fillna(0)
 
-    # Get cost parameters - NO HARDCODED VALUES
+    # Get required cost parameters from inputs
     sort_pp = float(costs.get("sort_cost_per_pkg", 0.0))
     container_handling_cost = float(costs.get("container_handling_cost", 0.0))
     last_mile_sort_pp = float(costs.get("last_mile_sort_cost_per_pkg", 0.0))
     last_mile_delivery_pp = float(costs.get("last_mile_delivery_cost_per_pkg", 0.0))
 
-    # Validate parameters exist
-    if sort_pp == 0.0:
-        print("WARNING: sort_cost_per_pkg not found in cost parameters")
-    if container_handling_cost == 0.0 and strategy.lower() == "container":
-        print("WARNING: container_handling_cost not found in cost parameters")
+    # Validate required parameters exist
+    required_params = {
+        "sort_cost_per_pkg": sort_pp,
+        "last_mile_sort_cost_per_pkg": last_mile_sort_pp,
+        "last_mile_delivery_cost_per_pkg": last_mile_delivery_pp
+    }
 
-    # Cost calculation based on strategy
+    missing_params = [name for name, value in required_params.items() if value == 0.0]
+    if missing_params:
+        raise ValueError(f"Required cost parameters missing or zero: {missing_params}")
+
+    if strategy.lower() == "container" and container_handling_cost == 0.0:
+        raise ValueError("container_handling_cost required for container strategy")
+
+    # Cost calculation based on strategy - CORRECTED touch_cost calculation
     if strategy.lower() == "container":
-        # Container strategy: sort at origin, container handling at intermediate touches, last mile at destination
-
-        # Origin sort cost
+        # Container strategy: sort at origin, container handling at intermediate touches, last mile sort at destination
         od['injection_sort_cost'] = sort_pp * od['pkgs_day']
-
-        # Last mile costs (same for both strategies)
         od['last_mile_sort_cost'] = last_mile_sort_pp * od['pkgs_day']
         od['last_mile_delivery_cost'] = last_mile_delivery_pp * od['pkgs_day']
         od['last_mile_cost'] = od['last_mile_sort_cost'] + od['last_mile_delivery_cost']
-
-        # Container handling costs - will be calculated per lane from arc_summary
         od['container_handling_cost'] = 0.0  # Will be filled from lane data
 
-        od['touch_cost'] = od['injection_sort_cost'] + od['last_mile_cost']
-        od['touch_cpp'] = sort_pp + last_mile_sort_pp + last_mile_delivery_pp
+        # Touch cost = ONLY sort and crossdock costs (no linehaul or delivery)
+        od['touch_cost'] = od['injection_sort_cost'] + od['last_mile_sort_cost']  # Container handling added separately
+        od['touch_cpp'] = sort_pp + last_mile_sort_pp
 
     else:
         # Fluid strategy: sort at every facility
-        total_sort_touches = od['num_touches'] + 2  # intermediate + injection + last mile
-
-        # All sort costs
         od['injection_sort_cost'] = sort_pp * od['pkgs_day']
         od['intermediate_sort_cost'] = sort_pp * od['num_touches'] * od['pkgs_day']
         od['last_mile_sort_cost'] = last_mile_sort_pp * od['pkgs_day']
         od['last_mile_delivery_cost'] = last_mile_delivery_pp * od['pkgs_day']
         od['last_mile_cost'] = od['last_mile_sort_cost'] + od['last_mile_delivery_cost']
 
-        od['touch_cost'] = od['injection_sort_cost'] + od['intermediate_sort_cost'] + od['last_mile_cost']
-        od['touch_cpp'] = sort_pp + (sort_pp * od['num_touches']) + last_mile_sort_pp + last_mile_delivery_pp
+        # Touch cost = ONLY sort costs (no linehaul or delivery)
+        od['touch_cost'] = od['injection_sort_cost'] + od['intermediate_sort_cost'] + od['last_mile_sort_cost']
+        od['touch_cpp'] = sort_pp + (sort_pp * od['num_touches']) + last_mile_sort_pp
 
     # Initialize linehaul costs
     od['linehaul_cost'] = 0.0
@@ -117,9 +119,8 @@ def _allocate_lane_costs_to_ods(od_selected: pd.DataFrame, arc_summary: pd.DataF
                         allocated_cost = lane_total_cost * od_share
                         od_linehaul_cost += allocated_cost
 
-                        # CRITICAL: Container handling cost allocation for intermediate touches
+                        # Container handling cost allocation for intermediate touches
                         if strategy.lower() == "container" and i > 0:  # Skip first leg (origin)
-                            # Get total containers on this lane and allocate proportionally
                             lane_containers = float(lane_row.get('physical_containers', 0))
                             lane_container_cost = lane_containers * container_handling_cost
                             allocated_container_cost = lane_container_cost * od_share
@@ -133,13 +134,17 @@ def _allocate_lane_costs_to_ods(od_selected: pd.DataFrame, arc_summary: pd.DataF
 
     # Calculate totals
     if strategy.lower() == "container":
-        od['total_cost'] = od['linehaul_cost'] + od['touch_cost'] + od['container_handling_cost']
+        od['total_cost'] = od['linehaul_cost'] + od['touch_cost'] + od['container_handling_cost'] + od[
+            'last_mile_delivery_cost']
+        # Add container handling to touch_cost (only sort and crossdock costs)
+        od['touch_cost'] = od['touch_cost'] + od['container_handling_cost']
+        od['touch_cpp'] = od['touch_cost'] / od['pkgs_day'].replace(0, 1)
     else:
-        od['total_cost'] = od['linehaul_cost'] + od['touch_cost']
+        od['total_cost'] = od['linehaul_cost'] + od['touch_cost'] + od['last_mile_delivery_cost']
 
     od['cost_per_pkg'] = od['total_cost'] / od['pkgs_day'].replace(0, 1)
 
-    # FIXED: Always add output columns for compatibility
+    # Add output columns for compatibility
     od['injection_sort_cpp'] = od['injection_sort_cost'] / od['pkgs_day'].replace(0, 1)
     od['last_mile_destination_cpp'] = od['last_mile_cost'] / od['pkgs_day'].replace(0, 1)
 
@@ -148,20 +153,20 @@ def _allocate_lane_costs_to_ods(od_selected: pd.DataFrame, arc_summary: pd.DataF
 
 def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.DataFrame) -> pd.DataFrame:
     """
-    FIX ISSUE 1: Calculate OD-level fill rates based on their actual lane usage.
-    Multiple ODs share lanes, so we need to get fill rates from the lane level.
+    Calculate OD-level fill rates based on actual lane usage.
+    Multiple ODs share lanes, so aggregate fill rates from lane level data.
     """
     od = od_selected.copy()
 
-    # Initialize with defaults
-    od['container_fill_rate'] = 0.8
-    od['truck_fill_rate'] = 0.8
+    # Initialize with zero (no hardcoded defaults)
+    od['container_fill_rate'] = 0.0
+    od['truck_fill_rate'] = 0.0
     od['packages_dwelled'] = 0.0
 
     if arc_summary.empty:
         return od
 
-    # For each OD, get weighted fill rates based on their lane usage
+    # Calculate weighted fill rates based on lane usage for each OD
     for idx, row in od.iterrows():
         path_str = str(row.get('path_str', ''))
         if not path_str or '->' not in path_str:
@@ -170,7 +175,7 @@ def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.Dat
         nodes = path_str.split('->')
         od_pkgs = float(row['pkgs_day'])
 
-        # Collect fill rates from each lane this OD uses
+        # Collect fill rates from lanes this OD uses
         lane_fill_rates = []
         lane_container_rates = []
         lane_dwelled = []
@@ -192,8 +197,8 @@ def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.Dat
                 # Weight by this OD's share of the lane
                 weight = od_pkgs / max(lane_pkgs, 1)
 
-                lane_fill_rates.append(float(lane_row.get('truck_fill_rate', 0.8)))
-                lane_container_rates.append(float(lane_row.get('container_fill_rate', 0.8)))
+                lane_fill_rates.append(float(lane_row.get('truck_fill_rate', 0.0)))
+                lane_container_rates.append(float(lane_row.get('container_fill_rate', 0.0)))
                 lane_dwelled.append(float(lane_row.get('packages_dwelled', 0)) * weight)
                 lane_weights.append(weight)
 
@@ -211,21 +216,21 @@ def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.Dat
 
 def _fix_facility_rollup_last_mile_costs(facility_rollup: pd.DataFrame, od_selected: pd.DataFrame) -> pd.DataFrame:
     """
-    FIX ISSUE 2: Add proper last mile cost calculations to facility rollup.
+    Add last mile cost calculations to facility rollup by destination.
     """
     if facility_rollup.empty:
         return facility_rollup
 
     facility_rollup = facility_rollup.copy()
 
-    # Initialize columns with defaults
+    # Initialize columns
     facility_rollup['last_mile_cost'] = 0.0
     facility_rollup['last_mile_cpp'] = 0.0
 
     if od_selected.empty:
         return facility_rollup
 
-    # FIXED: Check if last_mile_cost column exists in od_selected, if not create it
+    # Check if last_mile_cost column exists in od_selected
     if 'last_mile_cost' not in od_selected.columns:
         print("  Warning: last_mile_cost column missing from od_selected, skipping last mile cost calculation")
         return facility_rollup
@@ -256,42 +261,46 @@ def _fix_facility_rollup_last_mile_costs(facility_rollup: pd.DataFrame, od_selec
 
 def _fix_network_kpis(od_selected: pd.DataFrame, arc_summary: pd.DataFrame) -> dict:
     """
-    FIX ISSUE 3: Calculate proper network-average fill rates weighted by volume.
+    Calculate network-level KPIs using package-cube to truck-cube ratios.
+    This inherently provides package-weighted averages.
     """
     if od_selected.empty:
         return {
-            "avg_container_fill_rate": 0.8,
-            "avg_truck_fill_rate": 0.8,
+            "avg_container_fill_rate": 0.0,
+            "avg_truck_fill_rate": 0.0,
             "total_packages_dwelled": 0
         }
 
-    # Volume-weighted fill rates from lane level (more accurate)
-    if not arc_summary.empty and 'truck_fill_rate' in arc_summary.columns:
-        total_lane_volume = arc_summary['pkgs_day'].sum()
+    # Use arc-level data for accurate truck fill calculation
+    if not arc_summary.empty:
+        # Total package cube across all arcs
+        total_pkg_cube = arc_summary['pkg_cube_cuft'].sum() if 'pkg_cube_cuft' in arc_summary.columns else 0
 
-        if total_lane_volume > 0:
-            # Volume-weighted average fill rates
-            avg_truck_fill = (arc_summary['truck_fill_rate'] * arc_summary['pkgs_day']).sum() / total_lane_volume
-            avg_container_fill = (arc_summary.get('container_fill_rate', 0) * arc_summary[
-                'pkgs_day']).sum() / total_lane_volume
-            total_dwelled = arc_summary.get('packages_dwelled', 0).sum()
+        # Total truck cube capacity across all arcs
+        if 'trucks' in arc_summary.columns and 'cube_per_truck' in arc_summary.columns:
+            total_truck_cube = (arc_summary['trucks'] * arc_summary['cube_per_truck']).sum()
         else:
-            avg_truck_fill = 0.8
-            avg_container_fill = 0.8
-            total_dwelled = 0
+            total_truck_cube = 1  # Avoid division by zero
+
+        # Calculate fill rates using cube ratios (inherently package-weighted)
+        avg_truck_fill = total_pkg_cube / total_truck_cube if total_truck_cube > 0 else 0.0
+
+        # Container fill rate (volume-weighted if available)
+        if 'container_fill_rate' in arc_summary.columns and 'pkgs_day' in arc_summary.columns:
+            total_volume = arc_summary['pkgs_day'].sum()
+            if total_volume > 0:
+                avg_container_fill = (arc_summary['container_fill_rate'] * arc_summary['pkgs_day']).sum() / total_volume
+            else:
+                avg_container_fill = 0.0
+        else:
+            avg_container_fill = 0.0
+
+        total_dwelled = arc_summary.get('packages_dwelled', 0).sum()
     else:
-        # Fallback to OD level if arc summary not available
-        total_od_volume = od_selected['pkgs_day'].sum()
-
-        if total_od_volume > 0:
-            avg_truck_fill = (od_selected.get('truck_fill_rate', 0.8) * od_selected['pkgs_day']).sum() / total_od_volume
-            avg_container_fill = (od_selected.get('container_fill_rate', 0.8) * od_selected[
-                'pkgs_day']).sum() / total_od_volume
-            total_dwelled = od_selected.get('packages_dwelled', 0).sum()
-        else:
-            avg_truck_fill = 0.8
-            avg_container_fill = 0.8
-            total_dwelled = 0
+        # Fallback to basic calculation
+        avg_truck_fill = 0.0
+        avg_container_fill = 0.0
+        total_dwelled = od_selected.get('packages_dwelled', 0).sum()
 
     return {
         "avg_container_fill_rate": max(0, min(1, avg_container_fill)),
@@ -316,7 +325,12 @@ def _run_one_strategy(
         scenario_row: pd.Series,
         out_dir: Path,
 ):
-    """Core network optimization without sort level complexity."""
+    """
+    Execute network optimization for a single strategy.
+
+    Builds OD matrix, generates candidate paths, calculates costs,
+    solves optimization, and generates output reports.
+    """
 
     # Extract scenario information
     scenario_id_from_input = scenario_row.get("scenario_id",
@@ -330,7 +344,7 @@ def _run_one_strategy(
     timing_local = dict(timing)
     timing_local["load_strategy"] = strategy
 
-    # CRITICAL FIX: Add strategy to costs dict for MILP solver
+    # Add strategy to costs dict for MILP solver
     costs_local = dict(costs)
     costs_local["load_strategy"] = strategy
 
@@ -388,7 +402,7 @@ def _run_one_strategy(
     paths["scenario_id"] = scenario_id
     paths["day_type"] = day_type
 
-    # Cost and time calculation with explicit strategy
+    # Cost and time calculation with validated parameters
     print(f"  Calculating costs for {len(paths)} paths using {strategy} strategy...")
     cost_time_results = []
 
@@ -407,19 +421,9 @@ def _run_one_strategy(
             cost_time_results.append(result)
 
         except Exception as e:
-            # Fallback with basic values
-            print(f"    Warning: Cost calculation failed for path {idx}: {e}")
-            cost_time_results.append({
-                'index': idx,
-                'total_cost': row["pkgs_day"] * 2.0,  # $2 per package fallback
-                'total_hours': 24,
-                'distance_miles_total': 500,
-                'sla_days': 1,
-                'total_trucks': 1,
-                'container_fill_rate': 0.8,
-                'truck_fill_rate': 0.8,
-                'packages_dwelled': 0
-            })
+            print(f"    Error: Cost calculation failed for path {idx}: {e}")
+            # Re-raise error instead of using fallback values
+            raise ValueError(f"Cost calculation failed for path {idx}: {e}. Check input parameters.")
 
     print(f"  Cost calculation completed for {len(cost_time_results)} paths")
 
@@ -445,32 +449,47 @@ def _run_one_strategy(
 
     print(f"  Optimization selected {len(od_selected)} optimal paths")
 
-    # Cost allocation with FIXES
+    # Cost allocation and fill rate calculations
     od_selected = _allocate_lane_costs_to_ods(od_selected, arc_summary, costs_local, strategy)
 
-    # FIX ISSUE 1: Update OD fill rates from actual lane aggregation
+    # Update OD fill rates from actual lane aggregation
     od_selected = _fix_od_fill_rates_from_lanes(od_selected, arc_summary)
 
-    # Generate output data
+    # Generate output data with validation
     try:
         direct_day = dir_fac.copy()
         direct_day["dir_pkgs_day"] = direct_day[direct_day_col]
     except:
         direct_day = pd.DataFrame()
 
-    # Build output datasets
-    od_out = build_od_selected_outputs(od_selected, facilities, direct_day)
+    # Build output datasets with correct zone calculation
+    od_out = build_od_selected_outputs(od_selected, facilities, direct_day, mb)
     dwell_hotspots = build_dwell_hotspots(od_selected)
 
-    # Facility analysis with FIXES
+    # Facility analysis with validated calculations
     facility_rollup = _identify_volume_types_with_costs(
         od_selected, pd.DataFrame(), direct_day, arc_summary
     )
     facility_rollup = _calculate_hourly_throughput_with_costs(
         facility_rollup, timing_local, strategy
     )
-    # FIX ISSUE 2: Add last mile costs to facility rollup
     facility_rollup = _fix_facility_rollup_last_mile_costs(facility_rollup, od_selected)
+
+    # Validate aggregate calculations
+    validation_results = validate_network_aggregations(od_selected, arc_summary, facility_rollup)
+
+    if not validation_results.get('package_consistency', True):
+        print(f"  Warning: Package volume inconsistency detected")
+        print(f"    OD total: {validation_results.get('total_od_packages', 0):,.0f}")
+        print(f"    Facility injection total: {validation_results.get('total_facility_injection', 0):,.0f}")
+
+    if not validation_results.get('cost_consistency', True):
+        print(f"  Warning: Cost aggregation inconsistency detected")
+        print(f"    OD total cost: ${validation_results.get('total_od_cost', 0):,.0f}")
+        print(f"    Arc total cost: ${validation_results.get('total_arc_cost', 0):,.0f}")
+
+    print(f"  Network avg truck fill rate: {validation_results.get('network_avg_truck_fill', 0):.1%}")
+    print(f"  Network avg container fill rate: {validation_results.get('network_avg_container_fill', 0):.1%}")
 
     # Generate path steps for output
     path_steps = []
@@ -494,12 +513,12 @@ def _run_one_strategy(
     path_steps_df = pd.DataFrame(path_steps)
     lane_summary = build_lane_summary(arc_summary)
 
-    # Calculate KPIs with FIXES
+    # Calculate KPIs with volume-weighted averages
     total_cost = od_selected["total_cost"].sum()
     total_pkgs = od_selected["pkgs_day"].sum()
     cost_per_pkg = total_cost / max(total_pkgs, 1)
 
-    # FIX ISSUE 3: Proper network-level fill rate calculation
+    # Network-level fill rate calculation using validated logic
     network_fill_rates = _fix_network_kpis(od_selected, arc_summary)
 
     kpis = pd.Series({
@@ -563,12 +582,17 @@ def _run_one_strategy(
 
 
 def main(input_path: str, output_dir: str):
-    """Main execution focused on core network optimization."""
+    """
+    Main execution function for network optimization.
+
+    Loads input data, validates parameters, runs optimization for both
+    container and fluid strategies, and generates comparison reports.
+    """
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
-    print(f"🚀 Starting Core Network Optimization")
+    print(f"🚀 Starting Network Optimization with Validated Parameters")
     print(f"📁 Input: {input_path.name}")
     print(f"📁 Output: {output_dir}")
 
@@ -649,7 +673,7 @@ def main(input_path: str, output_dir: str):
             created_files.append(exec_summary_path.name)
             print(f"  ✓ Created executive summary: {exec_summary_path.name}")
 
-    print("\n🎉 Core Network Optimization Complete!")
+    print("\n🎉 Network Optimization Complete!")
 
     if created_files:
         print(f"📋 Created {len(created_files)} files:")
@@ -660,7 +684,7 @@ def main(input_path: str, output_dir: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Veho Core Network Optimization")
+    parser = argparse.ArgumentParser(description="Veho Network Optimization with Validated Parameters")
     parser.add_argument("--input", required=True, help="Path to input Excel file")
     parser.add_argument("--output_dir", required=True, help="Output directory path")
     args = parser.parse_args()
