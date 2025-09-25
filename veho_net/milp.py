@@ -1,4 +1,4 @@
-# veho_net/milp.py - ENHANCED with lane-level truck optimization and improved fill logic
+# veho_net/milp.py - FIXED with proper cubic metrics and enhanced arc summary
 from ortools.sat.python import cp_model
 import pandas as pd
 from typing import Dict, Tuple, List
@@ -41,19 +41,7 @@ def solve_arc_pooled_path_selection(
         cost_kv: Dict[str, float],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Enhanced MILP solver with lane-level truck optimization and improved fill logic.
-
-    Key improvements:
-    1. Lane-level truck calculations with proper consolidation
-    2. Enhanced container/truck fill rate modeling
-    3. Dwell cost integration
-    4. Support for all path types including 3_touch and 4_touch
-
-    Inputs:
-      candidates: rows with [scenario_id, origin, dest, day_type, path_type, pkgs_day, path_nodes, path_str, containers_cont]
-    Returns:
-      selected_paths: chosen one per (scenario_id,origin,dest,day_type) with the same cols as input
-      arc_summary: per-arc totals with enhanced metrics including fill rates
+    FIXED: Enhanced MILP solver with proper cubic metrics and lane-level calculations.
     """
     cand = candidates.reset_index(drop=True).copy()
 
@@ -129,31 +117,17 @@ def solve_arc_pooled_path_selection(
         if terms:
             # Use the enhanced truck calculation for this lane
             if lane_key in lane_truck_calc:
-                # Calculate truck capacity based on strategy and fill rates
+                # Use the truck requirement directly from the enhanced calculation
                 truck_calc = lane_truck_calc[lane_key]
-
-                if strategy == "container":
-                    cpt = int(container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0][
-                                  "containers_per_truck"])
-                    eff_cube = float(
-                        container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0][
-                            "usable_cube_cuft"])
-                    util = float(container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0][
-                                     "pack_utilization_container"])
-                    capacity_per_truck = (eff_cube * util * cpt) / weighted_pkg_cube(package_mix)
-                else:
-                    trailer_cube = float(container_params.get("trailer_air_cube_cuft", pd.Series([4060.0])).iloc[0])
-                    util = float(container_params.get("pack_utilization_fluid", pd.Series([0.85])).iloc[0])
-                    capacity_per_truck = (trailer_cube * util) / weighted_pkg_cube(package_mix)
-
-                model.Add(y[a_idx] * int(capacity_per_truck * SCALE) >= sum(terms))
+                required_trucks_scaled = int(round(truck_calc['trucks_needed'] * SCALE))
+                model.Add(y[a_idx] >= required_trucks_scaled)
             else:
-                # Fallback to simple capacity constraint
+                # Fallback constraint
                 model.Add(y[a_idx] * 2000 * SCALE >= sum(terms))  # 2000 pkgs per truck default
         else:
             model.Add(y[a_idx] == 0)
 
-    # Enhanced objective function with dwell and fill rate considerations
+    # Enhanced objective function
     crossdock_pp = float(cost_kv.get("crossdock_touch_cost_per_pkg", 0.0))
     sort_pp = float(cost_kv.get("sort_cost_per_pkg", 0.0))
     dwell_cost_pp = float(cost_kv.get("dwell_cost_per_pkg_per_day", 0.0))
@@ -238,9 +212,8 @@ def solve_arc_pooled_path_selection(
 
     print(f"Selected {len(selected_paths)} paths from {len(cand)} candidates")
 
-    # Enhanced arc aggregation with fill rate metrics
+    # FIXED: Enhanced arc aggregation with proper cubic metrics and fill rates
     w_cube = weighted_pkg_cube(package_mix)
-    trailer_air_cube = float(container_params.get("trailer_air_cube_cuft", pd.Series([4060.0])).iloc[0])
 
     agg = {}  # (u,v,scen,day) -> metrics
     for i, r in selected_paths.iterrows():
@@ -262,7 +235,9 @@ def solve_arc_pooled_path_selection(
                     'container_fill_rate': 0.8,
                     'truck_fill_rate': 0.8,
                     'physical_containers': 1,
-                    'packages_dwelled': 0
+                    'packages_dwelled': 0,
+                    'total_cube_cuft': 0,
+                    'cube_per_truck': 0
                 })
 
                 agg[key] = {
@@ -275,12 +250,14 @@ def solve_arc_pooled_path_selection(
                     "truck_fill_rate": truck_calc['truck_fill_rate'],
                     "physical_containers": truck_calc['physical_containers'],
                     "packages_dwelled": truck_calc['packages_dwelled'],
+                    "total_cube_cuft": truck_calc['total_cube_cuft'],
+                    "cube_per_truck": truck_calc['cube_per_truck'],
                 }
 
             agg[key]["pkgs_day"] += pkgs
             agg[key]["pkg_cube_cuft"] += cube
 
-    # Build enhanced arc summary
+    # Build enhanced arc summary with cubic metrics
     rows = []
     for (u, v, scen, day), val in agg.items():
         trucks = val["trucks_needed"]
@@ -290,6 +267,9 @@ def solve_arc_pooled_path_selection(
         # Enhanced metrics
         packages_per_truck = val["pkgs_day"] / max(trucks, 1e-9)
 
+        # FIXED: Recalculate cube per truck based on actual lane volume
+        actual_cube_per_truck = val["pkg_cube_cuft"] / max(trucks, 1e-9)
+
         rows.append({
             "scenario_id": scen,
             "day_type": day,
@@ -297,10 +277,11 @@ def solve_arc_pooled_path_selection(
             "to_facility": v,
             "distance_miles": val["distance_miles"],
             "pkgs_day": val["pkgs_day"],
-            "pkg_cube_cuft": val["pkg_cube_cuft"],
+            "pkg_cube_cuft": val["pkg_cube_cuft"],  # Total cubic feet for this lane
             "trucks": trucks,
             "physical_containers": val["physical_containers"],
             "packages_per_truck": packages_per_truck,
+            "cube_per_truck": actual_cube_per_truck,  # FIXED: Actual cubic feet per truck
             "container_fill_rate": val["container_fill_rate"],
             "truck_fill_rate": val["truck_fill_rate"],
             "packages_dwelled": val["packages_dwelled"],
@@ -325,9 +306,13 @@ def solve_arc_pooled_path_selection(
         avg_container_fill = arc_summary["container_fill_rate"].mean()
         avg_truck_fill = arc_summary["truck_fill_rate"].mean()
         total_dwelled = arc_summary["packages_dwelled"].sum()
+        total_cube = arc_summary["pkg_cube_cuft"].sum()
+        avg_cube_per_truck = arc_summary["cube_per_truck"].mean()
 
         print(f"Enhanced arc summary: {len(arc_summary)} arcs")
         print(f"  Total trucks: {total_trucks:.1f}")
+        print(f"  Total cubic feet: {total_cube:,.0f}")
+        print(f"  Avg cubic feet per truck: {avg_cube_per_truck:.0f}")
         print(f"  Avg container fill: {avg_container_fill:.1%}")
         print(f"  Avg truck fill: {avg_truck_fill:.1%}")
         print(f"  Total packages dwelled: {total_dwelled:,.0f}")
