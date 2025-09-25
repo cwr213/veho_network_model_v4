@@ -29,17 +29,12 @@ def safe_sheet_name(name: str) -> str:
 
 def write_workbook(path, scen_sum, od_out, path_detail, dwell_hotspots, facility_rollup, arc_summary, kpis,
                    sort_allocation_summary=None):
-    """
-    COMPLETE REBUILT: Write comprehensive workbook with all sheets from recent conversations.
-    """
+    """Write comprehensive workbook with all sheets."""
     try:
-        print(f"Writing results to: {path.name}")
-
         with pd.ExcelWriter(path, engine="xlsxwriter") as xw:
 
-            # ========= CORE SHEETS (Always Created) =========
+            # Core sheets
             try:
-                # Core sheets - no individual messages
                 if not scen_sum.empty:
                     scen_sum.to_excel(xw, sheet_name=safe_sheet_name("scenario_summary"), index=False)
                 else:
@@ -84,10 +79,9 @@ def write_workbook(path, scen_sum, od_out, path_detail, dwell_hotspots, facility
                                                                                     sheet_name=safe_sheet_name("kpis"))
 
             except Exception as e:
-                print(f"❌ Error creating core sheets: {e}")
-                raise
+                raise e
 
-            # ========= ENHANCED SORT OPTIMIZATION SHEETS =========
+            # Enhanced sort optimization sheets
             try:
                 if sort_allocation_summary is not None and not sort_allocation_summary.empty:
                     sort_allocation_summary.to_excel(xw, sheet_name=safe_sheet_name("sort_allocation_summary"),
@@ -100,43 +94,36 @@ def write_workbook(path, scen_sum, od_out, path_detail, dwell_hotspots, facility
                     pd.DataFrame([{"note": "No sort optimization data"}]).to_excel(xw, sheet_name=safe_sheet_name(
                         "sort_allocation_summary"), index=False)
 
-            except Exception as e:
-                print(f"⚠️  Warning: Sort optimization sheets failed")
+            except Exception:
+                pass
 
-            # ========= FILL RATE & UTILIZATION ANALYSIS =========
+            # Fill rate & utilization analysis
             try:
                 if not od_out.empty:
                     create_fill_rate_analysis_sheet(xw, od_out)
                     create_lane_utilization_analysis_sheet(xw, arc_summary)
+            except Exception:
+                pass
 
-            except Exception as e:
-                print(f"⚠️  Warning: Fill rate analysis failed")
-
-            # ========= ADVANCED ANALYSIS SHEETS =========
+            # Advanced analysis sheets
             try:
                 if not od_out.empty and 'containerization_level' in od_out.columns:
                     create_fill_spill_analysis_sheet(xw, od_out)
                     create_zone_strategy_analysis_sheet(xw, od_out)
                     create_network_strategy_summary_sheet(xw, od_out)
+            except Exception:
+                pass
 
-            except Exception as e:
-                print(f"⚠️  Warning: Advanced analysis sheets failed")
-
-            # ========= SORT CAPACITY ANALYSIS =========
+            # Sort capacity analysis
             try:
                 if not facility_rollup.empty:
                     create_sort_capacity_analysis_sheet(xw, facility_rollup)
+            except Exception:
+                pass
 
-            except Exception as e:
-                print(f"⚠️  Warning: Sort capacity analysis failed")
-
-        print(f"✅ Successfully created: {path.name}")
         return True
 
     except Exception as e:
-        print(f"❌ CRITICAL ERROR writing workbook {path}: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 
@@ -154,7 +141,6 @@ def create_containerization_summary_sheet(writer, od_out, sort_allocation_summar
             level_summary.columns = ['containerization_level', 'total_packages', 'total_cost',
                                      'avg_cost_per_pkg', 'unique_origins']
 
-            # Add efficiency scores if available
             if not sort_allocation_summary.empty and 'efficiency_score' in sort_allocation_summary.columns:
                 efficiency_by_level = sort_allocation_summary.groupby('optimal_containerization_level')[
                     'efficiency_score'].mean()
@@ -162,7 +148,6 @@ def create_containerization_summary_sheet(writer, od_out, sort_allocation_summar
                     efficiency_by_level).reset_index()
                 level_summary = level_summary.rename(columns={'efficiency_score': 'avg_efficiency_score'})
 
-            # Add cost savings estimate
             if 'daily_cost_savings' in sort_allocation_summary.columns:
                 savings_by_level = sort_allocation_summary.groupby('optimal_containerization_level')[
                     'daily_cost_savings'].sum()
@@ -171,11 +156,10 @@ def create_containerization_summary_sheet(writer, od_out, sort_allocation_summar
 
             level_summary.to_excel(writer, sheet_name=safe_sheet_name("containerization_summary"), index=False)
 
-    except Exception as e:
-        pass  # Silent failure
+    except Exception:
+        pass
 
 
-# Remove all the print statements from helper functions - make them silent
 def create_origin_strategy_analysis_sheet(writer, od_out, sort_allocation_summary):
     """Create origin-level strategy analysis."""
     try:
@@ -191,7 +175,6 @@ def create_origin_strategy_analysis_sheet(writer, od_out, sort_allocation_summar
             origin_strategy['cost_per_pkg'] = origin_strategy['total_daily_cost'] / origin_strategy[
                 'total_packages_day']
 
-            # Add containerization strategy mix if available
             if 'containerization_level' in od_out.columns:
                 strategy_mix = od_out.groupby('origin')['containerization_level'].apply(
                     lambda x: x.value_counts().to_dict()
@@ -200,7 +183,6 @@ def create_origin_strategy_analysis_sheet(writer, od_out, sort_allocation_summar
 
                 origin_strategy = origin_strategy.merge(strategy_mix, on='origin_facility', how='left')
 
-            # Add sort optimization metrics if available
             if not sort_allocation_summary.empty and 'origin' in sort_allocation_summary.columns:
                 sort_metrics = sort_allocation_summary.groupby('origin').agg({
                     'daily_cost_savings': 'sum',
@@ -215,8 +197,8 @@ def create_origin_strategy_analysis_sheet(writer, od_out, sort_allocation_summar
             origin_strategy = origin_strategy.sort_values('total_daily_cost', ascending=False)
             origin_strategy.to_excel(writer, sheet_name=safe_sheet_name("origin_strategy_analysis"), index=False)
 
-    except Exception as e:
-        pass  # Silent failure
+    except Exception:
+        pass
 
 
 def create_route_efficiency_analysis_sheet(writer, sort_allocation_summary):
@@ -225,7 +207,6 @@ def create_route_efficiency_analysis_sheet(writer, sort_allocation_summary):
         if not sort_allocation_summary.empty:
             efficiency_analysis = sort_allocation_summary.copy()
 
-            # Calculate efficiency metrics
             if 'daily_cost_savings' in efficiency_analysis.columns and 'pkgs_day' in efficiency_analysis.columns:
                 efficiency_analysis['savings_per_package'] = (
                         efficiency_analysis['daily_cost_savings'] / efficiency_analysis['pkgs_day'].replace(0, 1)
@@ -237,7 +218,6 @@ def create_route_efficiency_analysis_sheet(writer, sort_allocation_summary):
                                                                                                                     1)
                 ).round(2)
 
-                # Add implementation priority based on efficiency score
                 efficiency_analysis['implementation_priority'] = pd.cut(
                     efficiency_analysis['efficiency_score'],
                     bins=[-float('inf'), 25, 75, 150, float('inf')],
@@ -250,10 +230,9 @@ def create_route_efficiency_analysis_sheet(writer, sort_allocation_summary):
             )
 
             efficiency_analysis.to_excel(writer, sheet_name=safe_sheet_name("route_efficiency_analysis"), index=False)
-            print("✅ Created route_efficiency_analysis sheet")
 
-    except Exception as e:
-        print(f"Warning: Route efficiency analysis creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_actionable_insights_sheet(writer, sort_allocation_summary, od_out):
@@ -261,7 +240,6 @@ def create_actionable_insights_sheet(writer, sort_allocation_summary, od_out):
     try:
         insights = []
 
-        # High-priority route optimizations
         if not sort_allocation_summary.empty and 'efficiency_score' in sort_allocation_summary.columns:
             high_priority_routes = sort_allocation_summary[sort_allocation_summary['efficiency_score'] > 100]
             if not high_priority_routes.empty:
@@ -277,7 +255,6 @@ def create_actionable_insights_sheet(writer, sort_allocation_summary, od_out):
                         'See route_efficiency_analysis'])
                 })
 
-        # Fill rate optimization opportunities
         if not od_out.empty and 'truck_fill_rate' in od_out.columns:
             low_fill_routes = od_out[od_out['truck_fill_rate'] < 0.60]
             if not low_fill_routes.empty:
@@ -291,7 +268,6 @@ def create_actionable_insights_sheet(writer, sort_allocation_summary, od_out):
                     'affected_volume': f"{low_fill_routes['pkgs_day'].sum():,.0f} pkgs/day"
                 })
 
-        # Containerization level optimization
         if not od_out.empty and 'containerization_level' in od_out.columns:
             region_level_routes = od_out[od_out['containerization_level'] == 'region']
             if len(region_level_routes) > 0:
@@ -306,37 +282,32 @@ def create_actionable_insights_sheet(writer, sort_allocation_summary, od_out):
 
         insights_df = pd.DataFrame(insights)
         if not insights_df.empty:
-            # Add implementation difficulty scoring
             priority_scores = {'Low': 1, 'Medium': 2, 'High': 3, 'Critical': 4}
             if 'implementation_effort' in insights_df.columns:
                 effort_scores = {'Low': 1, 'Medium': 2, 'High': 3}
                 insights_df['effort_score'] = insights_df['implementation_effort'].map(effort_scores).fillna(2)
 
             insights_df.to_excel(writer, sheet_name=safe_sheet_name("actionable_insights"), index=False)
-            print("✅ Created actionable_insights sheet")
 
-    except Exception as e:
-        print(f"Warning: Actionable insights creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_fill_rate_analysis_sheet(writer, od_out):
     """Create comprehensive fill rate and utilization analysis."""
     try:
         if 'truck_fill_rate' in od_out.columns and not od_out.empty:
-            # OD-level fill rate analysis
             fill_analysis = od_out.groupby(['origin', 'path_type']).agg({
                 'truck_fill_rate': 'mean',
                 'pkgs_day': 'sum',
                 'total_cost': 'sum'
             }).reset_index()
 
-            # Add container fill rate if available
             if 'container_fill_rate' in od_out.columns:
                 container_fill = od_out.groupby(['origin', 'path_type'])['container_fill_rate'].mean()
                 fill_analysis['container_fill_rate'] = fill_analysis.set_index(['origin', 'path_type']).index.map(
                     container_fill).fillna(0)
 
-            # Add efficiency categories
             fill_analysis['truck_efficiency_category'] = pd.cut(
                 fill_analysis['truck_fill_rate'],
                 bins=[0, 0.6, 0.8, 1.0],
@@ -352,10 +323,9 @@ def create_fill_rate_analysis_sheet(writer, od_out):
 
             fill_analysis = fill_analysis.round(3)
             fill_analysis.to_excel(writer, sheet_name=safe_sheet_name("fill_rate_analysis"), index=False)
-            print("✅ Created fill_rate_analysis sheet")
 
-    except Exception as e:
-        print(f"Warning: Fill rate analysis creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_lane_utilization_analysis_sheet(writer, arc_summary):
@@ -367,13 +337,11 @@ def create_lane_utilization_analysis_sheet(writer, arc_summary):
 
                 lane_utilization = arc_summary[required_cols].copy()
 
-                # Add optional columns if available
                 optional_cols = ['truck_fill_rate', 'container_fill_rate', 'packages_per_truck', 'total_cost', 'CPP']
                 for col in optional_cols:
                     if col in arc_summary.columns:
                         lane_utilization[col] = arc_summary[col]
 
-                # Add utilization categories
                 if 'truck_fill_rate' in lane_utilization.columns:
                     lane_utilization['utilization_category'] = pd.cut(
                         lane_utilization['truck_fill_rate'],
@@ -381,14 +349,12 @@ def create_lane_utilization_analysis_sheet(writer, arc_summary):
                         labels=['Low (<60%)', 'Medium (60-80%)', 'High (80%+)']
                     ).astype(str)
 
-                    # Calculate improvement potential
                     lane_utilization['fill_improvement_potential'] = np.where(
                         lane_utilization['truck_fill_rate'] < 0.85,
                         (0.85 - lane_utilization['truck_fill_rate']) * lane_utilization['pkgs_day'],
                         0
                     ).round(0)
 
-                # Add volume categories
                 lane_utilization['volume_category'] = pd.cut(
                     lane_utilization['pkgs_day'],
                     bins=[0, 500, 2000, 10000, float('inf')],
@@ -397,10 +363,9 @@ def create_lane_utilization_analysis_sheet(writer, arc_summary):
 
                 lane_utilization = lane_utilization.sort_values('pkgs_day', ascending=False)
                 lane_utilization.to_excel(writer, sheet_name=safe_sheet_name("lane_utilization_analysis"), index=False)
-                print("✅ Created lane_utilization_analysis sheet")
 
-    except Exception as e:
-        print(f"Warning: Lane utilization analysis creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_fill_spill_analysis_sheet(writer, od_out):
@@ -419,7 +384,6 @@ def create_fill_spill_analysis_sheet(writer, od_out):
                 spill_summary.columns = ['origin_facility', 'spill_parent_hub', 'spillable_packages_day',
                                          'affected_destinations', 'total_affected_cost']
 
-                # Add operational flexibility scoring
                 spill_summary['operational_flexibility'] = pd.cut(
                     spill_summary['spillable_packages_day'],
                     bins=[0, 500, 2000, 10000, float('inf')],
@@ -427,14 +391,12 @@ def create_fill_spill_analysis_sheet(writer, od_out):
                 ).astype(str)
 
                 spill_summary.to_excel(writer, sheet_name=safe_sheet_name("fill_spill_analysis"), index=False)
-                print("✅ Created fill_spill_analysis sheet")
         else:
-            # Create placeholder if no spill data
             pd.DataFrame([{"note": "No spill opportunity data available"}]).to_excel(
                 writer, sheet_name=safe_sheet_name("fill_spill_analysis"), index=False)
 
-    except Exception as e:
-        print(f"Warning: Fill spill analysis creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_zone_strategy_analysis_sheet(writer, od_out):
@@ -450,7 +412,6 @@ def create_zone_strategy_analysis_sheet(writer, od_out):
 
             zone_strategy['volume_share'] = zone_strategy.groupby('zone')['pkgs_day'].transform(lambda x: x / x.sum())
 
-            # Create pivot table
             zone_strategy_pivot = zone_strategy.pivot_table(
                 index='zone',
                 columns='containerization_level',
@@ -459,13 +420,12 @@ def create_zone_strategy_analysis_sheet(writer, od_out):
             )
 
             zone_strategy_pivot.to_excel(writer, sheet_name=safe_sheet_name("zone_strategy_analysis"))
-            print("✅ Created zone_strategy_analysis sheet")
         else:
             pd.DataFrame([{"note": "No zone or containerization data available"}]).to_excel(
                 writer, sheet_name=safe_sheet_name("zone_strategy_analysis"), index=False)
 
-    except Exception as e:
-        print(f"Warning: Zone strategy analysis creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_network_strategy_summary_sheet(writer, od_out):
@@ -487,29 +447,26 @@ def create_network_strategy_summary_sheet(writer, od_out):
 
             network_summary_df = pd.DataFrame(network_summary)
 
-            # Add percentages
             total_volume = network_summary_df['daily_volume'].sum()
             if total_volume > 0:
                 network_summary_df['volume_percentage'] = (
-                            network_summary_df['daily_volume'] / total_volume * 100).round(1)
+                        network_summary_df['daily_volume'] / total_volume * 100).round(1)
             else:
                 network_summary_df['volume_percentage'] = 0.0
 
             network_summary_df.to_excel(writer, sheet_name=safe_sheet_name("network_strategy_summary"), index=False)
-            print("✅ Created network_strategy_summary sheet")
         else:
             pd.DataFrame([{"note": "No containerization level data available"}]).to_excel(
                 writer, sheet_name=safe_sheet_name("network_strategy_summary"), index=False)
 
-    except Exception as e:
-        print(f"Warning: Network strategy summary creation failed: {e}")
+    except Exception:
+        pass
 
 
 def create_sort_capacity_analysis_sheet(writer, facility_rollup):
     """Create sort capacity analysis."""
     try:
         if not facility_rollup.empty:
-            # Filter to facilities with sort capacity data
             sort_facilities = facility_rollup[
                 (facility_rollup.get('type', '').isin(['hub', 'hybrid'])) |
                 (facility_rollup.get('max_sort_points_capacity', 0) > 0)
@@ -523,7 +480,6 @@ def create_sort_capacity_analysis_sheet(writer, facility_rollup):
                 available_cols = capacity_cols + [col for col in optional_cols if col in sort_facilities.columns]
                 sort_utilization = sort_facilities[available_cols].copy()
 
-                # Calculate utilization metrics if data is available
                 if 'max_sort_points_capacity' in sort_utilization.columns and 'sort_points_allocated' in sort_utilization.columns:
                     sort_utilization['capacity_utilization_pct'] = (
                             sort_utilization['sort_points_allocated'] / sort_utilization[
@@ -531,7 +487,6 @@ def create_sort_capacity_analysis_sheet(writer, facility_rollup):
                     ).round(1)
 
                 sort_utilization.to_excel(writer, sheet_name=safe_sheet_name("sort_capacity_analysis"), index=False)
-                print("✅ Created sort_capacity_analysis sheet")
             else:
                 pd.DataFrame([{"note": "No sort capacity data available"}]).to_excel(
                     writer, sheet_name=safe_sheet_name("sort_capacity_analysis"), index=False)
@@ -539,17 +494,13 @@ def create_sort_capacity_analysis_sheet(writer, facility_rollup):
             pd.DataFrame([{"note": "No facility data available"}]).to_excel(
                 writer, sheet_name=safe_sheet_name("sort_capacity_analysis"), index=False)
 
-    except Exception as e:
-        print(f"Warning: Sort capacity analysis creation failed: {e}")
+    except Exception:
+        pass
 
 
 def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):
-    """
-    REBUILT: Enhanced comparison workbook with all sheets from recent conversations.
-    """
+    """Enhanced comparison workbook with clean output."""
     try:
-        print(f"📊 Writing comparison workbook to: {path}")
-
         # Enhanced column ordering
         front = ["base_id", "strategy", "scenario_id", "output_file"]
         kpi_cols = [
@@ -562,7 +513,7 @@ def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):
         cols = front + [c for c in kpi_cols if c in compare_df.columns]
         df = compare_df[cols].copy()
 
-        # Enhanced wide views with safe sheet names
+        # Enhanced wide views
         metrics_to_pivot = ['cost_per_pkg', 'sort_optimization_savings', 'avg_truck_fill_rate',
                             'avg_container_fill_rate']
         wide_views = {}
@@ -572,11 +523,10 @@ def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):
                 wide = df.pivot(index="base_id", columns="strategy", values=metric)
                 wide = wide.rename_axis(None, axis=1).reset_index()
 
-                # Add comparison calculations
                 if 'container' in wide.columns and 'fluid' in wide.columns:
                     wide[f'{metric}_advantage'] = wide['container'] - wide['fluid']
                     wide[f'{metric}_advantage_pct'] = (
-                                wide[f'{metric}_advantage'] / wide['fluid'].replace(0, 1) * 100).round(1)
+                            wide[f'{metric}_advantage'] / wide['fluid'].replace(0, 1) * 100).round(1)
 
                 safe_name = safe_sheet_name(f"{metric}_comparison")
                 wide_views[safe_name] = wide
@@ -590,21 +540,15 @@ def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):
                 0
             )
 
-        # Settings snapshot
         settings = pd.DataFrame([{"key": k, "value": v} for k, v in run_kv.items()])
 
         with pd.ExcelWriter(path, engine="xlsxwriter") as xw:
-            # Main comparison
             df.to_excel(xw, sheet_name=safe_sheet_name("enhanced_kpi_compare"), index=False)
-            print("✅ Created enhanced_kpi_compare sheet")
 
-            # Write multiple comparison views
             for sheet_name, wide_df in wide_views.items():
                 wide_df.to_excel(xw, sheet_name=sheet_name, index=False)
-                print(f"✅ Created {sheet_name} sheet")
 
             settings.to_excel(xw, sheet_name=safe_sheet_name("run_settings"), index=False)
-            print("✅ Created run_settings sheet")
 
             # Enhanced fill rate comparison
             if 'avg_truck_fill_rate' in df.columns:
@@ -616,7 +560,6 @@ def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):
                     fill_value=0
                 ).round(3)
                 fill_comparison.to_excel(xw, sheet_name=safe_sheet_name("fill_rate_comparison"))
-                print("✅ Created fill_rate_comparison sheet")
 
             # Optimization impact summary
             if 'sort_optimization_savings' in df.columns:
@@ -626,19 +569,14 @@ def write_compare_workbook(path, compare_df: pd.DataFrame, run_kv: dict):
                     'total_cost': 'sum'
                 }).round(2)
                 opt_summary.to_excel(xw, sheet_name=safe_sheet_name("optimization_impact"))
-                print("✅ Created optimization_impact sheet")
 
             # Strategic recommendations
             if len(df) >= 2:
                 create_strategic_recommendations_sheet(xw, df)
 
-        print(f"🎉 Successfully wrote comparison workbook: {path}")
         return True
 
-    except Exception as e:
-        print(f"❌ CRITICAL ERROR writing comparison workbook {path}: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return False
 
 
@@ -647,7 +585,6 @@ def create_strategic_recommendations_sheet(writer, compare_df):
     try:
         recommendations = []
 
-        # Determine optimal strategy
         container_data = compare_df[compare_df['strategy'] == 'container']
         fluid_data = compare_df[compare_df['strategy'] == 'fluid']
 
@@ -665,7 +602,6 @@ def create_strategic_recommendations_sheet(writer, compare_df):
                 'implementation_timeline': '6-12 months'
             })
 
-            # Sort optimization impact
             if 'sort_optimization_savings' in container_data.columns:
                 sort_savings = container_data['sort_optimization_savings'].mean()
                 if sort_savings > 1000:
@@ -677,7 +613,6 @@ def create_strategic_recommendations_sheet(writer, compare_df):
                         'implementation_timeline': '3-6 months'
                     })
 
-            # Fill rate improvement opportunities
             avg_fill = container_data.get('avg_truck_fill_rate', pd.Series([0])).mean()
             if avg_fill < 0.75:
                 potential_improvement = (0.85 - avg_fill) * 100
@@ -692,22 +627,16 @@ def create_strategic_recommendations_sheet(writer, compare_df):
         recommendations_df = pd.DataFrame(recommendations)
         if not recommendations_df.empty:
             recommendations_df.to_excel(writer, sheet_name=safe_sheet_name("strategic_recommendations"), index=False)
-            print("✅ Created strategic_recommendations sheet")
 
-    except Exception as e:
-        print(f"Warning: Strategic recommendations creation failed: {e}")
+    except Exception:
+        pass
 
 
 def write_executive_summary_workbook(path, results_by_strategy: dict, run_kv: dict, base_id: str):
-    """
-    REBUILT: Write executive summary workbook with Monday deliverables.
-    """
+    """Write executive summary workbook with key business deliverables."""
     try:
-        print(f"📊 Writing executive summary to: {path}")
-
         summary_data = {}
 
-        # Prepare strategy comparison data
         container_results = results_by_strategy.get('container', {})
         fluid_results = results_by_strategy.get('fluid', {})
 
@@ -746,15 +675,10 @@ def write_executive_summary_workbook(path, results_by_strategy: dict, run_kv: di
             for sheet_name, df in summary_data.items():
                 safe_name = safe_sheet_name(sheet_name)
                 df.to_excel(writer, sheet_name=safe_name, index=False)
-                print(f"✅ Created {safe_name} sheet")
 
-        print(f"🎉 Successfully wrote executive summary: {path}")
         return True
 
-    except Exception as e:
-        print(f"❌ CRITICAL ERROR writing executive summary {path}: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return False
 
 
@@ -803,7 +727,6 @@ def create_monday_key_answers(container_results: dict, fluid_results: dict) -> p
         return monday_answers
 
     except Exception as e:
-        print(f"Warning: Monday key answers creation failed: {e}")
         return pd.DataFrame([{"question": "Error", "answer": "Could not generate answers", "detail": str(e)}])
 
 
@@ -836,8 +759,7 @@ def create_containerization_strategy_comparison(container_results: dict, fluid_r
 
         return comparison
 
-    except Exception as e:
-        print(f"Warning: Containerization strategy comparison creation failed: {e}")
+    except Exception:
         return pd.DataFrame()
 
 
@@ -845,12 +767,10 @@ def create_hub_hourly_throughput_analysis(container_results: dict, fluid_results
     """Create hub hourly throughput analysis."""
     try:
         container_facilities = container_results.get('facility_rollup', pd.DataFrame())
-        fluid_facilities = fluid_results.get('facility_rollup', pd.DataFrame())
 
         if container_facilities.empty:
             return pd.DataFrame([{"note": "No facility data available"}])
 
-        # Filter to hubs only
         container_hubs = container_facilities[
             container_facilities.get('type', '').isin(['hub', 'hybrid'])
         ].copy()
@@ -858,14 +778,13 @@ def create_hub_hourly_throughput_analysis(container_results: dict, fluid_results
         if container_hubs.empty:
             return pd.DataFrame([{"note": "No hub data available"}])
 
-        # Select key throughput columns
         throughput_cols = ['peak_hourly_throughput', 'injection_hourly_throughput', 'intermediate_hourly_throughput']
         base_cols = ['facility', 'type']
 
         available_cols = base_cols + [col for col in throughput_cols if col in container_hubs.columns]
         hub_throughput = container_hubs[available_cols].copy()
 
-        # Add fluid data if available
+        fluid_facilities = fluid_results.get('facility_rollup', pd.DataFrame())
         if not fluid_facilities.empty:
             fluid_hubs = fluid_facilities[fluid_facilities.get('type', '').isin(['hub', 'hybrid'])].copy()
             if not fluid_hubs.empty:
@@ -883,9 +802,8 @@ def create_hub_hourly_throughput_analysis(container_results: dict, fluid_results
 
         return hub_throughput
 
-    except Exception as e:
-        print(f"Warning: Hub hourly throughput analysis creation failed: {e}")
-        return pd.DataFrame([{"note": f"Error creating hub analysis: {str(e)}"}])
+    except Exception:
+        return pd.DataFrame([{"note": "Error creating hub analysis"}])
 
 
 def create_all_facilities_comparison(container_results: dict, fluid_results: dict) -> pd.DataFrame:
@@ -896,11 +814,9 @@ def create_all_facilities_comparison(container_results: dict, fluid_results: dic
         if container_facilities.empty:
             return pd.DataFrame([{"note": "No facility data available"}])
 
-        # Basic facility comparison with strategy tag
         facility_comparison = container_facilities.copy()
         facility_comparison['strategy'] = 'container'
 
-        # Add fluid data if available
         fluid_facilities = fluid_results.get('facility_rollup', pd.DataFrame())
         if not fluid_facilities.empty:
             fluid_comparison = fluid_facilities.copy()
@@ -909,9 +825,8 @@ def create_all_facilities_comparison(container_results: dict, fluid_results: dic
 
         return facility_comparison
 
-    except Exception as e:
-        print(f"Warning: All facilities comparison creation failed: {e}")
-        return pd.DataFrame([{"note": f"Error creating facilities comparison: {str(e)}"}])
+    except Exception:
+        return pd.DataFrame([{"note": "Error creating facilities comparison"}])
 
 
 def create_zone_flow_analysis(container_results: dict, fluid_results: dict) -> pd.DataFrame:
@@ -934,8 +849,7 @@ def create_zone_flow_analysis(container_results: dict, fluid_results: dict) -> p
 
         return zone_flow
 
-    except Exception as e:
-        print(f"Warning: Zone flow analysis creation failed: {e}")
+    except Exception:
         return pd.DataFrame()
 
 
@@ -954,25 +868,19 @@ def create_path_type_summary(container_results: dict, fluid_results: dict) -> pd
 
         path_summary.columns = ['origin_facility', 'path_type', 'total_packages', 'route_count']
 
-        # Calculate percentages by origin
         path_summary['pct_of_origin_volume'] = path_summary.groupby('origin_facility')['total_packages'].transform(
             lambda x: (path_summary.loc[x.index, 'total_packages'] / x.sum() * 100).round(1)
         )
 
         return path_summary
 
-    except Exception as e:
-        print(f"Warning: Path type summary creation failed: {e}")
+    except Exception:
         return pd.DataFrame()
 
 
 def write_consolidated_multi_year_workbook(path: Path, all_results: list, run_kv: dict):
-    """
-    Write consolidated workbook with stacked data across all years and strategies.
-    """
+    """Write consolidated workbook with stacked data across all years and strategies."""
     try:
-        print(f"📊 Writing consolidated multi-year analysis to: {path}")
-
         consolidated_data = {}
 
         # Stack facility rollup data
@@ -988,21 +896,13 @@ def write_consolidated_multi_year_workbook(path: Path, all_results: list, run_kv
         if facility_data:
             consolidated_data['Facility_Rollup'] = pd.concat(facility_data, ignore_index=True)
 
-        # Stack other data types similarly...
-        # (Add more stacked data as needed)
-
         # Write consolidated file
         with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
             for sheet_name, df in consolidated_data.items():
                 safe_name = safe_sheet_name(sheet_name)
                 df.to_excel(writer, sheet_name=safe_name, index=False)
-                print(f"✅ Created consolidated {safe_name} sheet with {len(df)} rows")
 
-        print(f"🎉 Successfully wrote consolidated workbook: {path}")
         return True
 
-    except Exception as e:
-        print(f"❌ CRITICAL ERROR writing consolidated workbook {path}: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return False

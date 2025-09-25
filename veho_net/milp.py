@@ -1,4 +1,4 @@
-# veho_net/milp.py - FIXED with proper cubic metrics and enhanced arc summary
+# veho_net/milp.py - CLEANED VERSION with minimal debug output
 from ortools.sat.python import cp_model
 import pandas as pd
 from typing import Dict, Tuple, List
@@ -18,7 +18,7 @@ def _arc_cost_per_truck(u: str, v: str, facilities: pd.DataFrame, mileage_bands:
 
 
 def _legs_for_candidate(row: pd.Series, facilities: pd.DataFrame, mileage_bands: pd.DataFrame):
-    """Yield (u,v,dist_miles) legs for a candidate. Honor path_nodes if provided; otherwise resolve by path_type."""
+    """Yield (u,v,dist_miles) legs for a candidate."""
     nodes = row.get("path_nodes", None)
     if isinstance(nodes, list) and len(nodes) >= 2:
         pairs = list(zip(nodes[:-1], nodes[1:]))
@@ -27,7 +27,7 @@ def _legs_for_candidate(row: pd.Series, facilities: pd.DataFrame, mileage_bands:
             dist, _ = _arc_cost_per_truck(u, v, facilities, mileage_bands)
             legs.append((u, v, dist))
         return legs
-    # fallback: compute from path_type using enhanced logic
+
     from .time_cost import resolve_legs_for_path
     return resolve_legs_for_path(row["origin"], row["dest"], row["path_type"], facilities, mileage_bands)
 
@@ -41,24 +41,23 @@ def solve_arc_pooled_path_selection(
         cost_kv: Dict[str, float],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    FIXED: Enhanced MILP solver with proper cubic metrics and lane-level calculations.
+    Enhanced MILP solver with proper cubic metrics and lane-level calculations.
     """
     cand = candidates.reset_index(drop=True).copy()
 
-    # ensure containers_cont exists (backwards compatibility)
+    # Ensure containers_cont exists
     if "containers_cont" not in cand.columns:
         from .time_cost import containers_for_pkgs_day
         cand["containers_cont"] = cand["pkgs_day"].apply(
             lambda x: containers_for_pkgs_day(x, package_mix, container_params))
 
-    # index of paths
     path_keys = list(cand.index)
 
-    # enumerate arcs per path and build lane-level data
+    # Enumerate arcs per path and build lane-level data
     arc_index_map: Dict[Tuple[str, str], int] = {}
-    arc_meta: List[Dict] = []  # idx -> {from,to,distance_miles,cost_per_truck}
-    path_arcs: Dict[int, List[int]] = {}  # path_idx -> [arc_idx,...]
-    lane_od_data: Dict[Tuple[str, str], List[Tuple]] = {}  # (u,v) -> [(od_dict, pkgs_day), ...]
+    arc_meta: List[Dict] = []
+    path_arcs: Dict[int, List[int]] = {}
+    lane_od_data: Dict[Tuple[str, str], List[Tuple]] = {}
 
     for i in path_keys:
         r = cand.loc[i]
@@ -73,7 +72,6 @@ def solve_arc_pooled_path_selection(
                 arc_meta.append({"from": u, "to": v, "distance_miles": d_mi, "cost_per_truck": cpt})
                 lane_od_data[key] = []
 
-            # Add this OD to the lane data for proper consolidation calculations
             lane_od_data[key].append((r.to_dict(), float(r["pkgs_day"])))
             ids.append(arc_index_map[key])
 
@@ -92,13 +90,13 @@ def solve_arc_pooled_path_selection(
     # CP-SAT model
     model = cp_model.CpModel()
 
-    # choose exactly one path per OD group
+    # Choose exactly one path per OD group
     groups = cand.groupby(["scenario_id", "origin", "dest", "day_type"]).indices
     x = {i: model.NewBoolVar(f"x_{i}") for i in path_keys}
     for _, idxs in groups.items():
         model.Add(sum(x[i] for i in idxs) == 1)
 
-    # Enhanced truck variables per arc (continuous approximation scaled to integers)
+    # Enhanced truck variables per arc
     SCALE = 1000
     y = {a_idx: model.NewIntVar(0, 10 ** 9, f"y_{a_idx}") for a_idx in range(len(arc_meta))}
 
@@ -107,7 +105,6 @@ def solve_arc_pooled_path_selection(
         arc = arc_meta[a_idx]
         lane_key = (arc["from"], arc["to"])
 
-        # Get all OD pairs that could use this lane
         terms = []
         for i in path_keys:
             if a_idx in path_arcs[i]:
@@ -115,15 +112,12 @@ def solve_arc_pooled_path_selection(
                 terms.append(pkgs_scaled * x[i])
 
         if terms:
-            # Use the enhanced truck calculation for this lane
             if lane_key in lane_truck_calc:
-                # Use the truck requirement directly from the enhanced calculation
                 truck_calc = lane_truck_calc[lane_key]
                 required_trucks_scaled = int(round(truck_calc['trucks_needed'] * SCALE))
                 model.Add(y[a_idx] >= required_trucks_scaled)
             else:
-                # Fallback constraint
-                model.Add(y[a_idx] * 2000 * SCALE >= sum(terms))  # 2000 pkgs per truck default
+                model.Add(y[a_idx] * 2000 * SCALE >= sum(terms))
         else:
             model.Add(y[a_idx] == 0)
 
@@ -132,7 +126,6 @@ def solve_arc_pooled_path_selection(
     sort_pp = float(cost_kv.get("sort_cost_per_pkg", 0.0))
     dwell_cost_pp = float(cost_kv.get("dwell_cost_per_pkg_per_day", 0.0))
 
-    # Enhanced touch mapping to handle all path types
     touch_map = {
         "direct": 0,
         "1_touch": 1,
@@ -147,30 +140,25 @@ def solve_arc_pooled_path_selection(
         path_type = str(cand.at[i, "path_type"])
         pkgs_day = float(cand.at[i, "pkgs_day"])
 
-        # Get number of touches with fallback for unknown path types
         if path_type in touch_map:
             num_touches = touch_map[path_type]
         else:
-            # Fallback: estimate touches from path_nodes if available
             path_nodes = cand.at[i, "path_nodes"]
             if isinstance(path_nodes, list) and len(path_nodes) >= 2:
-                num_touches = len(path_nodes) - 2  # Intermediate facilities
+                num_touches = len(path_nodes) - 2
             else:
-                print(f"Warning: Unknown path type '{path_type}', assuming 0 touches")
                 num_touches = 0
 
         if strategy == "container":
-            # Container: crossdock at intermediate, sort at origin/dest
             touch_cost = crossdock_pp * pkgs_day * num_touches
-            sort_cost = sort_pp * pkgs_day * 2  # Origin + destination sort
+            sort_cost = sort_pp * pkgs_day * 2
         else:
-            # Fluid: sort at every touch point
-            sort_cost = sort_pp * pkgs_day * (num_touches + 2)  # Intermediate + origin + dest
+            sort_cost = sort_pp * pkgs_day * (num_touches + 2)
             touch_cost = 0.0
 
         processing_cost[i] = touch_cost + sort_cost
 
-    # Add dwell costs based on truck calculations
+    # Add dwell costs
     dwell_cost_total = 0
     for lane_key, truck_calc in lane_truck_calc.items():
         dwell_cost_total += truck_calc['packages_dwelled'] * dwell_cost_pp
@@ -181,21 +169,18 @@ def solve_arc_pooled_path_selection(
     model.Minimize(
         sum(y[a_idx] * arc_cost[a_idx] for a_idx in range(len(arc_meta)))
         + sum(x[i] * processing_cost[i] for i in path_keys)
-        + int(dwell_cost_total * SCALE)  # Add dwell cost to objective
+        + int(dwell_cost_total * SCALE)
     )
 
     # Solve with enhanced parameters
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300.0  # 5 minute limit
+    solver.parameters.max_time_in_seconds = 300.0
     solver.parameters.num_search_workers = 8
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print(f"MILP solver failed with status: {status}")
-        # Return empty results rather than crashing
         return pd.DataFrame(), pd.DataFrame()
 
-    # Map status to readable names
     status_names = {
         cp_model.OPTIMAL: "OPTIMAL",
         cp_model.FEASIBLE: "FEASIBLE",
@@ -203,24 +188,19 @@ def solve_arc_pooled_path_selection(
         cp_model.MODEL_INVALID: "MODEL_INVALID",
         cp_model.UNKNOWN: "UNKNOWN"
     }
-    status_name = status_names.get(status, f"UNKNOWN_STATUS_{status}")
-    print(f"MILP solver completed with status: {status_name}")
 
-    # extract chosen paths
+    # Extract chosen paths
     chosen_idx = [i for i in path_keys if solver.Value(x[i]) == 1]
     selected_paths = cand.loc[chosen_idx].reset_index(drop=True)
 
-    print(f"Selected {len(selected_paths)} paths from {len(cand)} candidates")
-
-    # FIXED: Enhanced arc aggregation with proper cubic metrics and fill rates
+    # Enhanced arc aggregation with proper cubic metrics and fill rates
     w_cube = weighted_pkg_cube(package_mix)
 
-    agg = {}  # (u,v,scen,day) -> metrics
+    agg = {}
     for i, r in selected_paths.iterrows():
         pkgs = float(r["pkgs_day"])
         cube = pkgs * w_cube
 
-        # Get the original index to map back to path_arcs
         original_idx = chosen_idx[i]
 
         for a_idx in path_arcs[original_idx]:
@@ -229,7 +209,6 @@ def solve_arc_pooled_path_selection(
             key = (meta["from"], meta["to"], r["scenario_id"], r["day_type"])
 
             if key not in agg:
-                # Get enhanced truck calculation for this lane
                 truck_calc = lane_truck_calc.get(lane_key, {
                     'trucks_needed': 1,
                     'container_fill_rate': 0.8,
@@ -264,10 +243,7 @@ def solve_arc_pooled_path_selection(
         total_cost = trucks * val["cost_per_truck"]
         cpp = (total_cost / val["pkgs_day"]) if val["pkgs_day"] > 0 else 0.0
 
-        # Enhanced metrics
         packages_per_truck = val["pkgs_day"] / max(trucks, 1e-9)
-
-        # FIXED: Recalculate cube per truck based on actual lane volume
         actual_cube_per_truck = val["pkg_cube_cuft"] / max(trucks, 1e-9)
 
         rows.append({
@@ -277,11 +253,11 @@ def solve_arc_pooled_path_selection(
             "to_facility": v,
             "distance_miles": val["distance_miles"],
             "pkgs_day": val["pkgs_day"],
-            "pkg_cube_cuft": val["pkg_cube_cuft"],  # Total cubic feet for this lane
+            "pkg_cube_cuft": val["pkg_cube_cuft"],
             "trucks": trucks,
             "physical_containers": val["physical_containers"],
             "packages_per_truck": packages_per_truck,
-            "cube_per_truck": actual_cube_per_truck,  # FIXED: Actual cubic feet per truck
+            "cube_per_truck": actual_cube_per_truck,
             "container_fill_rate": val["container_fill_rate"],
             "truck_fill_rate": val["truck_fill_rate"],
             "packages_dwelled": val["packages_dwelled"],
@@ -293,28 +269,5 @@ def solve_arc_pooled_path_selection(
     arc_summary = pd.DataFrame(rows).sort_values(
         ["scenario_id", "day_type", "from_facility", "to_facility"]
     ).reset_index(drop=True)
-
-    # Validation output with enhanced metrics
-    if not selected_paths.empty:
-        path_type_counts = selected_paths["path_type"].value_counts()
-        print("Selected path types:")
-        for path_type, count in path_type_counts.items():
-            print(f"  {path_type}: {count}")
-
-    if not arc_summary.empty:
-        total_trucks = arc_summary["trucks"].sum()
-        avg_container_fill = arc_summary["container_fill_rate"].mean()
-        avg_truck_fill = arc_summary["truck_fill_rate"].mean()
-        total_dwelled = arc_summary["packages_dwelled"].sum()
-        total_cube = arc_summary["pkg_cube_cuft"].sum()
-        avg_cube_per_truck = arc_summary["cube_per_truck"].mean()
-
-        print(f"Enhanced arc summary: {len(arc_summary)} arcs")
-        print(f"  Total trucks: {total_trucks:.1f}")
-        print(f"  Total cubic feet: {total_cube:,.0f}")
-        print(f"  Avg cubic feet per truck: {avg_cube_per_truck:.0f}")
-        print(f"  Avg container fill: {avg_container_fill:.1%}")
-        print(f"  Avg truck fill: {avg_truck_fill:.1%}")
-        print(f"  Total packages dwelled: {total_dwelled:,.0f}")
 
     return selected_paths, arc_summary

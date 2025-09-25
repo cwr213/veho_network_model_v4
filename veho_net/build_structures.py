@@ -1,4 +1,4 @@
-# veho_net/build_structures.py - WITH CIRCULAR ROUTING FIX
+# veho_net/build_structures.py - CLEANED VERSION with minimal debug output
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -88,8 +88,6 @@ def build_od_and_direct(
     if inj.empty:
         raise ValueError("No valid injection origins found. Ensure hub/hybrid facilities have is_injection_node=1")
 
-    print(f"Valid MM injection origins: {len(inj)} hub/hybrid facilities")
-
     # Normalize injection shares
     inj["abs_w"] = pd.to_numeric(inj["absolute_share"], errors="coerce").fillna(0.0)
     total_w = float(inj["abs_w"].sum())
@@ -109,8 +107,6 @@ def build_od_and_direct(
 
     # Remove O==D pairs (handled by direct injection)
     od = od[od["origin"] != od["dest"]].reset_index(drop=True)
-
-    print(f"Generated {len(od)} middle-mile OD pairs")
 
     return od, direct, pop_by_dest
 
@@ -140,8 +136,6 @@ def candidate_paths(
     valid_intermediate_types = ["hub", "hybrid"]
     hubs_enabled = fac.index[fac["type"].isin(valid_intermediate_types)]
 
-    print(f"Available intermediate facilities: {len(hubs_enabled)} hub/hybrid facilities")
-
     def raw_distance(o, d):
         return haversine_miles(
             float(fac.at[o, "lat"]), float(fac.at[o, "lon"]),
@@ -170,9 +164,6 @@ def candidate_paths(
         elif facility_type == "launch":
             launch_facilities.add(facility_name)
 
-    print(
-        f"Facility classification: {len(primary_hubs)} primary hubs, {len(secondary_hubs)} secondary hubs, {len(launch_facilities)} launch facilities")
-
     def is_secondary_hub(facility):
         """Check if facility is a secondary hub (must route outbound through parent)"""
         return facility in secondary_hubs
@@ -183,11 +174,7 @@ def candidate_paths(
 
     def build_path_with_constraints(origin, dest, od_volume):
         """
-        Build valid paths respecting your two rules:
-        1. Secondary hub outbound constraint
-        2. Launch facility parent as second-to-last
-
-        CRITICAL: Prevent circular routing where origin appears in destination's parent chain
+        Build valid paths respecting routing rules and preventing circular routing.
         """
         paths = []
 
@@ -196,7 +183,6 @@ def candidate_paths(
             # Launch facility: parent hub must be second-to-last
             dest_parent = get_launch_parent(dest)
             if dest_parent == dest:
-                # Launch with no parent or self-parent
                 required_end = [dest]
             else:
                 required_end = [dest_parent, dest]
@@ -205,10 +191,8 @@ def candidate_paths(
             required_end = [dest]
 
         # CRITICAL FIX: Check for circular routing
-        # If origin is in the destination's required path, we have a circular route
         if origin in required_end:
-            # Circular route detected: origin is the parent hub for destination
-            # Just go direct: origin -> dest
+            # Circular route detected: just go direct
             paths.append([origin, dest])
             return paths
 
@@ -217,29 +201,24 @@ def candidate_paths(
             # Secondary hub: MUST route outbound through parent
             origin_parent = parent_map[origin]
             if origin_parent == origin:
-                # Shouldn't happen, but handle gracefully
                 required_start = [origin]
             else:
-                # ADDITIONAL CHECK: Don't route through parent if it creates a circle back
-                # Example: Seattle (parent=Sacramento) -> Portland (parent=Seattle)
-                # Should NOT be: Seattle -> Sacramento -> ... -> Seattle -> Portland
+                # Additional check: Don't route through parent if it creates circular routing
                 if origin_parent in required_end or origin in required_end:
-                    # This would create circular routing, skip parent requirement
                     required_start = [origin]
                 else:
                     required_start = [origin, origin_parent]
         else:
-            # Primary hub or launch: flexible outbound (but launch can't be origin anyway)
+            # Primary hub or launch: flexible outbound
             required_start = [origin]
 
         # Build paths connecting required start and end segments
-        start_node = required_start[-1]  # Last node of required start
-        end_node = required_end[0]  # First node of required end
+        start_node = required_start[-1]
+        end_node = required_end[0]
 
         if start_node == end_node:
             # Direct connection possible
             combined_path = required_start + required_end[1:]
-            # Final check: ensure no duplicates in path
             if len(combined_path) == len(set(combined_path)):
                 paths.append(combined_path)
         else:
@@ -248,27 +227,23 @@ def candidate_paths(
 
             # Option 1: Direct intermediate connection
             combined_path = required_start + required_end
-            # Check for circular routing in combined path
             if len(combined_path) == len(set(combined_path)):
                 paths.append(combined_path)
 
             # Option 2: One intermediate hub (for consolidation)
-            if od_volume < 1500 and len(hubs_enabled) > 0:  # Only for smaller volumes
+            if od_volume < 1500 and len(hubs_enabled) > 0:
                 candidate_intermediates = [h for h in hubs_enabled
                                            if h not in required_start and h not in required_end]
 
                 if candidate_intermediates:
-                    # Choose best intermediate hub
                     best_intermediate = min(candidate_intermediates,
                                             key=lambda h: raw_distance(start_node, h) + raw_distance(h, end_node))
 
-                    # Check if detour is reasonable
                     intermediate_distance = (raw_distance(start_node, best_intermediate) +
                                              raw_distance(best_intermediate, end_node))
 
                     if intermediate_distance <= around_factor * direct_distance:
                         intermediate_path = required_start + [best_intermediate] + required_end
-                        # Avoid duplicates and circular routes
                         if len(intermediate_path) == len(set(intermediate_path)) and intermediate_path not in paths:
                             paths.append(intermediate_path)
 
@@ -319,7 +294,6 @@ def candidate_paths(
 
     # Final validation: ensure no launch facilities as intermediate stops
     def validate_path_nodes(path_nodes):
-        # Check intermediate nodes (skip first and last)
         for i, node in enumerate(path_nodes[1:-1], 1):
             if node in fac.index and fac.at[node, "type"] == "launch":
                 return False
@@ -327,25 +301,10 @@ def candidate_paths(
 
     initial_count = len(df)
     df = df[df["path_nodes"].apply(validate_path_nodes)].reset_index(drop=True)
-    if len(df) < initial_count:
-        print(f"Filtered out {initial_count - len(df)} paths with launch facilities as intermediate stops")
 
     # Remove exact duplicates
     df["path_nodes_tuple"] = df["path_nodes"].apply(tuple)
     df = df.drop_duplicates(subset=["origin", "dest", "path_nodes_tuple"]).drop(
         columns=["path_nodes_tuple"]).reset_index(drop=True)
-
-    print(f"Generated {len(df)} valid candidate paths:")
-    for path_type, count in path_counts.items():
-        if count > 0:
-            print(f"  {path_type}: {count}")
-
-    # Print rule enforcement summary
-    secondary_outbound_enforced = (df["enforced_secondary_outbound"] == True).sum()
-    launch_parent_enforced = (df["enforced_launch_parent"] == True).sum()
-
-    print(f"Rule enforcement:")
-    print(f"  Secondary hub outbound routing: {secondary_outbound_enforced} paths")
-    print(f"  Launch facility parent hub: {launch_parent_enforced} paths")
 
     return df.drop(columns=["od_volume", "enforced_secondary_outbound", "enforced_launch_parent"])
