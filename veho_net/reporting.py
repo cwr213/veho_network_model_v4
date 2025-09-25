@@ -1,3 +1,7 @@
+import pandas as pd
+import numpy as np
+
+
 def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_selected: pd.DataFrame,
                                       direct_day: pd.DataFrame, arc_summary: pd.DataFrame) -> pd.DataFrame:
     """
@@ -99,7 +103,7 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
             # CRITICAL FIX: Calculate costs per package correctly
             injection_sort_cpp = (injection_processing_cost / injection_pkgs) if injection_pkgs > 0 else 0
             mm_linehaul_cpp = (injection_linehaul_cost + intermediate_linehaul_cost) / (
-                        injection_pkgs + intermediate_pkgs) if (injection_pkgs + intermediate_pkgs) > 0 else 0
+                    injection_pkgs + intermediate_pkgs) if (injection_pkgs + intermediate_pkgs) > 0 else 0
             mm_processing_cpp = (intermediate_processing_cost / intermediate_pkgs) if intermediate_pkgs > 0 else 0
             last_mile_delivery_cpp = (last_mile_delivery_cost / last_mile_pkgs) if last_mile_pkgs > 0 else 0
 
@@ -207,3 +211,79 @@ def _calculate_hourly_throughput_with_costs(volume_df: pd.DataFrame, timing_kv: 
             df[col] = df[col].fillna(0).round(3)
 
     return df
+
+
+def add_zone(df: pd.DataFrame, facilities: pd.DataFrame) -> pd.DataFrame:
+    """Add zone classification based on distance or region."""
+    if df.empty:
+        return df
+
+    # Simple zone logic - can be enhanced based on your needs
+    df = df.copy()
+    df['zone'] = 'unknown'
+
+    # Create facility lookup
+    fac_regions = facilities.set_index('facility_name')['region'].to_dict()
+
+    # Add zones based on origin regions
+    if 'origin' in df.columns:
+        df['zone'] = df['origin'].map(fac_regions).fillna('unknown')
+
+    return df
+
+
+def build_od_selected_outputs(od_selected: pd.DataFrame, facilities: pd.DataFrame,
+                              direct_day: pd.DataFrame) -> pd.DataFrame:
+    """Build enhanced OD outputs with zone information."""
+    if od_selected.empty:
+        return od_selected
+
+    od_out = od_selected.copy()
+
+    # Add zone information for analysis
+    od_out = add_zone(od_out, facilities)
+
+    return od_out
+
+
+def build_dwell_hotspots(od_selected: pd.DataFrame) -> pd.DataFrame:
+    """Build dwell hotspots analysis."""
+    if od_selected.empty or 'packages_dwelled' not in od_selected.columns:
+        return pd.DataFrame()
+
+    # Filter to ODs with significant dwell
+    dwelled = od_selected[od_selected['packages_dwelled'] > 10].copy()
+
+    if dwelled.empty:
+        return pd.DataFrame()
+
+    # Aggregate by origin
+    hotspots = dwelled.groupby('origin').agg({
+        'packages_dwelled': 'sum',
+        'pkgs_day': 'sum',
+        'dest': 'count'
+    }).reset_index()
+
+    hotspots['dwell_rate'] = hotspots['packages_dwelled'] / hotspots['pkgs_day']
+    hotspots = hotspots.sort_values('packages_dwelled', ascending=False)
+
+    return hotspots
+
+
+def build_lane_summary(arc_summary: pd.DataFrame) -> pd.DataFrame:
+    """Build lane summary from arc data."""
+    if arc_summary.empty:
+        return pd.DataFrame()
+
+    # Group by lane (from-to pair) aggregating across scenarios/day types
+    lane_summary = arc_summary.groupby(['from_facility', 'to_facility']).agg({
+        'pkgs_day': 'sum',
+        'trucks': 'mean',
+        'total_cost': 'sum',
+        'distance_miles': 'first',
+        'packages_dwelled': 'sum'
+    }).reset_index()
+
+    lane_summary['cost_per_pkg'] = lane_summary['total_cost'] / lane_summary['pkgs_day'].replace(0, 1)
+
+    return lane_summary.sort_values('total_cost', ascending=False)

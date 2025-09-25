@@ -142,11 +142,17 @@ def _check_mileage_bands(df_raw: pd.DataFrame):
 def _check_timing_params(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
     required_keys = {
-        "cpt_hours_local", "delivery_day_cutoff_local", "load_hours", "unload_hours",
+        "load_hours", "unload_hours",
         "sort_hours_per_touch", "crossdock_hours_per_touch", "departure_cutoff_hours_per_move",
         # Enhanced with VA parameters
         "injection_va_hours", "middle_mile_va_hours", "last_mile_va_hours"
     }
+
+    # REMOVED: Legacy timing parameters that are not used in current logic
+    legacy_keys = {
+        "cpt_hours_local", "delivery_day_cutoff_local"
+    }
+
     # NEW: Sort optimization parameters
     enhanced_keys = {
         "sort_points_per_destination", "hours_per_touch"
@@ -154,6 +160,7 @@ def _check_timing_params(df_raw: pd.DataFrame):
 
     missing_required = sorted(required_keys - set(df["key"]))
     missing_enhanced = sorted(enhanced_keys - set(df["key"]))
+    present_legacy = sorted(legacy_keys & set(df["key"]))
 
     if missing_required:
         raise ValueError(f"timing_params missing required keys: {missing_required}")
@@ -162,10 +169,16 @@ def _check_timing_params(df_raw: pd.DataFrame):
         print(f"INFO: timing_params missing enhanced sort optimization keys: {missing_enhanced}")
         print("      Default values will be used: sort_points_per_destination=2, hours_per_touch=6.0")
 
+    if present_legacy:
+        print(f"INFO: timing_params contains legacy keys that are not used in current logic: {present_legacy}")
+        print("      These can be safely removed from your input file")
+
 
 def _check_cost_params(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
-    required_keys = {"sort_cost_per_pkg", "crossdock_touch_cost_per_pkg", "last_mile_cpp"}
+
+    # UPDATED: Core required parameters (removed last_mile_cpp as it's not used)
+    required_keys = {"sort_cost_per_pkg", "crossdock_touch_cost_per_pkg"}
 
     # ENHANCED: New cost parameters for sort optimization
     enhanced_keys = {
@@ -174,8 +187,14 @@ def _check_cost_params(df_raw: pd.DataFrame):
         "dwell_cost_per_pkg_per_day"
     }
 
+    # Legacy parameters that may be present but are not required
+    legacy_keys = {
+        "last_mile_cpp"  # This was renamed/replaced with more specific parameters
+    }
+
     missing_required = sorted(required_keys - set(df["key"]))
     missing_enhanced = sorted(enhanced_keys - set(df["key"]))
+    present_legacy = sorted(legacy_keys & set(df["key"]))
 
     if missing_required:
         raise ValueError(f"cost_params missing required keys: {missing_required}")
@@ -184,9 +203,10 @@ def _check_cost_params(df_raw: pd.DataFrame):
         print(f"INFO: cost_params missing enhanced sort optimization keys: {missing_enhanced}")
         print("      Default values will be used where applicable")
 
-    # Validate last_mile_cpp rename
-    if "last_mile_cpp" in set(df["key"]):
-        print("INFO: Found 'last_mile_cpp' - this should be renamed to 'last_mile_delivery_cost_per_pkg' for clarity")
+    if present_legacy:
+        print(f"INFO: cost_params contains legacy parameter: {present_legacy}")
+        print("      This parameter is no longer used in current logic - consider removing or renaming to:")
+        print("      'last_mile_delivery_cost_per_pkg' for last mile delivery costs")
 
 
 def _check_package_mix(df_raw: pd.DataFrame):
@@ -217,7 +237,7 @@ def _check_scenarios(df_raw: pd.DataFrame):
 
 
 def validate_inputs(dfs: dict):
-    """Enhanced validation with new sort optimization parameters."""
+    """Enhanced validation with legacy parameter handling."""
     print("Validating input sheets...")
 
     _check_container_params(dfs["container_params"])
@@ -233,4 +253,4 @@ def validate_inputs(dfs: dict):
     _check_scenarios(dfs["scenarios"])
 
     print("✅ Input validation complete - all required fields present")
-    print("ℹ️  Check console messages above for any optional enhancements")
+    print("ℹ️  Check console messages above for any optional enhancements or legacy parameter notes")

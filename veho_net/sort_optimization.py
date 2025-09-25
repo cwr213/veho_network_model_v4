@@ -1,4 +1,7 @@
 # veho_net/sort_optimization.py - CORRECTED LOGIC
+import pandas as pd
+import numpy as np
+
 
 def calculate_containerization_costs_corrected(od_selected: pd.DataFrame, facilities: pd.DataFrame,
                                                mileage_bands: pd.DataFrame, costs: dict,
@@ -13,6 +16,16 @@ def calculate_containerization_costs_corrected(od_selected: pd.DataFrame, facili
     """
     try:
         if od_selected.empty:
+            print("Warning: Empty OD dataset for containerization costs")
+            return pd.DataFrame()
+
+        # CRITICAL: Validate required columns
+        required_cols = ['origin', 'dest', 'pkgs_day']
+        missing_cols = [col for col in required_cols if col not in od_selected.columns]
+
+        if missing_cols:
+            print(f"Warning: Missing required columns for containerization costs: {missing_cols}")
+            print(f"Available columns: {list(od_selected.columns)}")
             return pd.DataFrame()
 
         results = []
@@ -251,6 +264,32 @@ def calculate_level_costs_corrected(od_row: pd.Series, all_origin_ods: pd.DataFr
         'total_cost': total_cost,
         'cost_per_pkg': total_cost / pkgs_day if pkgs_day > 0 else 0,
         'od_share': od_share  # For debugging
+    }
+
+
+def enhanced_container_truck_calculation(lane_od_pairs, package_mix, container_params, cost_kv, strategy):
+    """
+    Simplified truck calculation for sort optimization.
+    This is a placeholder - the full implementation should be imported from time_cost.py
+    """
+    total_pkgs = sum(pkgs for _, pkgs in lane_od_pairs)
+
+    if total_pkgs <= 0:
+        return {
+            'trucks_needed': 1,
+            'truck_fill_rate': 0.8,
+            'container_fill_rate': 0.8,
+            'packages_dwelled': 0
+        }
+
+    # Simple calculation - should use the full logic from time_cost.py
+    trucks_needed = max(1, int(np.ceil(total_pkgs / 2000)))  # 2000 pkgs per truck assumption
+
+    return {
+        'trucks_needed': trucks_needed,
+        'truck_fill_rate': min(1.0, total_pkgs / (trucks_needed * 2000)),
+        'container_fill_rate': min(1.0, total_pkgs / (trucks_needed * 2000)),
+        'packages_dwelled': max(0, total_pkgs - (trucks_needed * 2000))
     }
 
 
