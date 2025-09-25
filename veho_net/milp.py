@@ -1,4 +1,4 @@
-# veho_net/milp.py - Clean MILP solver with proper cost usage
+# veho_net/milp.py - TARGETED FIX for cost recalculation in MILP solver
 from ortools.sat.python import cp_model
 import pandas as pd
 from typing import Dict, Tuple, List
@@ -39,26 +39,68 @@ def solve_arc_pooled_path_selection(
         package_mix: pd.DataFrame,
         container_params: pd.DataFrame,
         cost_kv: Dict[str, float],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+        timing_kv: Dict[str, float],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Solve path selection optimization using pre-calculated costs.
-
-    Uses CP-SAT solver to select one optimal path per OD pair while respecting
-    truck capacity constraints and minimizing total system cost.
+    FIXED: Solve path selection with proper strategy-specific cost recalculation.
     """
     cand = candidates.reset_index(drop=True).copy()
     strategy = str(cost_kv.get("load_strategy", "container")).lower()
 
-    print(f"    MILP solver using {strategy} strategy with pre-calculated costs")
+    print(f"    MILP solver using {strategy} strategy with recalculated costs")
+
+    # CRITICAL FIX: Recalculate costs for current strategy using proper parameter flow
+    if "total_cost" in cand.columns:
+        from .time_cost import path_cost_and_time
+
+        # FIXED: Ensure strategy parameters flow correctly
+        timing_kv_for_recalc = timing_kv.copy()
+        timing_kv_for_recalc['load_strategy'] = strategy
+
+        cost_kv_for_recalc = cost_kv.copy()
+        cost_kv_for_recalc['load_strategy'] = strategy
+
+        print(f"    Recalculating costs for {len(cand)} paths using {strategy} strategy...")
+        print(f"    DEBUG: strategy={strategy}, sort_cost=${cost_kv_for_recalc.get('sort_cost_per_pkg', 'MISSING')}")
+
+        # Track cost statistics for debugging
+        original_costs = cand['total_cost'].copy()
+
+        for idx, row in cand.iterrows():
+            try:
+                # FIXED: Recalculate cost with properly configured parameters
+                total_cost, total_hours, sums, steps = path_cost_and_time(
+                    row, facilities, mileage_bands, timing_kv_for_recalc, cost_kv_for_recalc,
+                    package_mix, container_params, float(row["pkgs_day"])
+                )
+
+                # Update the path cost for current strategy
+                cand.at[idx, 'total_cost'] = total_cost
+
+                # Debug first few recalculations
+                if idx < 3:
+                    original_cost = original_costs.iloc[idx]
+                    print(
+                        f"    DEBUG path {idx}: {row.get('path_str', 'unknown')} - original=${original_cost:.0f}, recalc=${total_cost:.0f}")
+
+            except Exception as e:
+                print(f"    Error: Cost recalculation failed for path {idx}: {e}")
+                raise ValueError(f"Cost recalculation failed for path {idx}: {e}")
+
+        # Verify cost recalculation worked
+        recalc_costs = cand['total_cost']
+        cost_changed = not original_costs.equals(recalc_costs)
+        print(f"    Cost recalculation completed. Costs changed: {cost_changed}")
+
+        if not cost_changed:
+            print(f"    WARNING: Costs did not change during recalculation!")
+            print(f"    This suggests the strategy parameter is not flowing correctly.")
 
     # Validate required columns exist
     if "containers_cont" not in cand.columns:
         from .time_cost import containers_for_pkgs_day
         cand["containers_cont"] = cand["pkgs_day"].apply(
             lambda x: containers_for_pkgs_day(x, package_mix, container_params))
-
-    if "total_cost" not in cand.columns:
-        raise ValueError("Candidates missing required 'total_cost' column from path_cost_and_time()")
 
     path_keys = list(cand.index)
 
@@ -86,7 +128,7 @@ def solve_arc_pooled_path_selection(
 
         path_arcs[i] = ids
 
-    # Calculate truck requirements per lane using corrected logic
+    # Calculate truck requirements per lane using input parameters only
     lane_truck_calc = {}
     for (u, v), od_list in lane_od_data.items():
         truck_calc = enhanced_container_truck_calculation(
@@ -124,18 +166,23 @@ def solve_arc_pooled_path_selection(
                 required_trucks_scaled = int(round(truck_calc['trucks_needed'] * SCALE))
                 model.Add(y[a_idx] >= required_trucks_scaled)
             else:
-                # Should not happen if truck calculations are correct
                 print(f"    Warning: No truck calculation for lane {lane_key}")
                 model.Add(y[a_idx] >= 1 * SCALE)  # Minimum 1 truck
         else:
             model.Add(y[a_idx] == 0)
 
-    # Objective: minimize total pre-calculated path costs
+    # Objective: minimize total recalculated path costs
     path_costs = {}
     for i in path_keys:
         path_costs[i] = int(float(cand.at[i, 'total_cost']) * SCALE)
 
     model.Minimize(sum(x[i] * path_costs[i] for i in path_keys))
+
+    # Debug output to verify cost differences between strategies
+    if len(cand) > 0:
+        cost_range = f"${cand['total_cost'].min():.0f} - ${cand['total_cost'].max():.0f}"
+        avg_cost = f"${cand['total_cost'].mean():.0f}"
+        print(f"    Strategy-specific cost range: {cost_range} (avg: {avg_cost})")
 
     # Solve with reasonable time limit
     solver = cp_model.CpSolver()

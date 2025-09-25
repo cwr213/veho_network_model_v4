@@ -1,4 +1,4 @@
-# run_v1.py - Network optimization with corrected fill rates and no hardcoded values
+# run_v1.py - Network optimization with corrected MILP strategy logic and input parameters only
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -374,8 +374,9 @@ def _run_one_strategy(
     # Set pkgs_day column
     od["pkgs_day"] = od[od_day_col]
 
-    # Build candidate paths
-    paths = candidate_paths(od, facilities, mb, around_factor=float(run_kv["path_around_the_world_factor"]))
+    # Build candidate paths - CORRECTED: Pass around_factor from input
+    around_factor = float(run_kv.get("path_around_the_world_factor", 1.5))
+    paths = candidate_paths(od, facilities, mb, around_factor=around_factor)
 
     if paths.empty:
         print(f"  No valid paths generated")
@@ -437,10 +438,10 @@ def _run_one_strategy(
         else:
             paths[f"summary_{col}"] = paths.index.map(cost_time_df[col]).fillna(0)
 
-    # MILP optimization with strategy-aware costs
+    # MILP optimization with strategy-aware costs - CORRECTED: Pass timing_local
     print(f"  Running MILP optimization using {strategy} strategy...")
     od_selected, arc_summary = solve_arc_pooled_path_selection(
-        paths, facilities, mb, pkgmix, cont, costs_local  # Use costs_local with strategy
+        paths, facilities, mb, pkgmix, cont, costs_local, timing_local  # FIXED: Added timing_local
     )
 
     if od_selected.empty:

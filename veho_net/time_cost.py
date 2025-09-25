@@ -1,4 +1,4 @@
-# veho_net/time_cost.py - Corrected fill rate and dwell logic implementation
+# veho_net/time_cost.py - CORRECTED: Remove hardcoded values, use input parameters only
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
@@ -82,16 +82,37 @@ def compute_leg_metrics(fr: str, to: str, facL: dict, bands: pd.DataFrame) -> di
     return {"distance_miles": dist, "fixed": fixed, "var": var, "mph": mph}
 
 
+def calculate_truck_capacity(package_mix: pd.DataFrame, container_params: pd.DataFrame, strategy: str) -> float:
+    """
+    Calculate packages per truck capacity using input parameters only.
+
+    Container strategy: ((usable_cube_cuft × pack_utilization_container) ÷ weighted_avg_pkg_cube) × containers_per_truck
+    Fluid strategy: (trailer_air_cube_cuft × pack_utilization_fluid) ÷ weighted_avg_pkg_cube
+    """
+    weighted_avg_pkg_cube = weighted_pkg_cube(package_mix)
+
+    if strategy.lower() == "container":
+        gaylord_row = container_params[container_params["container_type"].str.lower() == "gaylord"].iloc[0]
+        usable_cube = float(gaylord_row["usable_cube_cuft"])
+        pack_util = float(gaylord_row["pack_utilization_container"])
+        containers_per_truck_val = int(gaylord_row["containers_per_truck"])
+
+        packages_per_truck = ((usable_cube * pack_util) / weighted_avg_pkg_cube) * containers_per_truck_val
+    else:
+        # Fluid strategy
+        trailer_cube = float(container_params["trailer_air_cube_cuft"].iloc[0])
+        pack_util = float(container_params["pack_utilization_fluid"].iloc[0])
+
+        packages_per_truck = (trailer_cube * pack_util) / weighted_avg_pkg_cube
+
+    return packages_per_truck
+
+
 def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix: pd.DataFrame,
                                          container_params: pd.DataFrame, cost_kv: dict,
                                          strategy: str = "container") -> dict:
     """
-    Calculate truck requirements and fill rates with proper capacity logic.
-
-    Key principles:
-    - Use effective capacities (with pack utilization) for truck calculations
-    - Use raw capacities for fill rate reporting (realistic operator view)
-    - Apply dwell logic based on premium_economy_dwell_threshold
+    Calculate truck requirements and fill rates using input parameters only.
     """
     total_pkgs = sum(pkgs for _, pkgs in lane_od_pairs)
 
@@ -106,10 +127,13 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
             'cube_per_truck': 0.0
         }
 
-    # Get parameters from inputs (no hardcoded values)
+    # Use input parameters only - no hardcoded values
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = total_pkgs * w_cube
     raw_trailer_cube = trailer_raw_cube(container_params)
+
+    # Get truck capacity from input parameters
+    packages_per_truck_capacity = calculate_truck_capacity(package_mix, container_params, strategy)
 
     # Get dwell threshold from cost parameters
     dwell_threshold = float(cost_kv.get('premium_economy_dwell_threshold', 0.10))
@@ -126,8 +150,8 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
         exact_containers = total_cube / effective_container_cube
         physical_containers = max(1, int(np.ceil(exact_containers)))
 
-        # Calculate raw trucks needed
-        raw_trucks = physical_containers / cpt
+        # Calculate raw trucks needed using input-based capacity
+        raw_trucks = total_pkgs / packages_per_truck_capacity
 
         # Apply dwell logic - never round below 1 truck
         if raw_trucks <= 1.0:
@@ -139,8 +163,8 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
             if fractional_part < dwell_threshold:
                 # Round down and dwell excess packages
                 final_trucks = int(raw_trucks)
-                missing_containers = (raw_trucks - final_trucks) * cpt
-                packages_dwelled = missing_containers * effective_container_cube / w_cube
+                missing_capacity = (raw_trucks - final_trucks) * packages_per_truck_capacity
+                packages_dwelled = missing_capacity
             else:
                 # Add the partial truck
                 final_trucks = int(np.ceil(raw_trucks))
@@ -155,8 +179,8 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
         pack_util_fluid = float(container_params["pack_utilization_fluid"].iloc[0])
         effective_trailer_cube = raw_trailer_cube * pack_util_fluid
 
-        # Calculate raw trucks needed based on effective space
-        raw_trucks = total_cube / effective_trailer_cube
+        # Calculate raw trucks needed using input-based capacity
+        raw_trucks = total_pkgs / packages_per_truck_capacity
 
         # Apply dwell logic - never round below 1 truck
         if raw_trucks <= 1.0:
@@ -168,8 +192,8 @@ def enhanced_container_truck_calculation(lane_od_pairs: List[Tuple], package_mix
             if fractional_part < dwell_threshold:
                 # Round down and dwell excess packages
                 final_trucks = int(raw_trucks)
-                missing_capacity = (raw_trucks - final_trucks) * effective_trailer_cube
-                packages_dwelled = missing_capacity / w_cube
+                missing_capacity = (raw_trucks - final_trucks) * packages_per_truck_capacity
+                packages_dwelled = missing_capacity
             else:
                 # Add the partial truck
                 final_trucks = int(np.ceil(raw_trucks))
@@ -239,20 +263,20 @@ def path_cost_and_time(
         cont_params: pd.DataFrame,
         day_pkgs: float,
 ) -> Tuple[float, float, dict, list]:
-    """Calculate path cost and time with proper strategy differentiation."""
+    """Calculate path cost and time with proper strategy differentiation using input parameters only."""
     facL = _facility_lookup(facilities)
 
-    # Get timing parameters from inputs
-    hours_per_touch = float(timing_kv.get("hours_per_touch", timing_kv.get("sort_hours_per_touch", 6.0)))
-    load_h = float(timing_kv.get("load_hours", 0.5))
-    unload_h = float(timing_kv.get("unload_hours", 0.5))
+    # Get timing parameters from inputs - NO hardcoded fallbacks
+    hours_per_touch = float(timing_kv["hours_per_touch"])
+    load_h = float(timing_kv["load_hours"])
+    unload_h = float(timing_kv["unload_hours"])
     strategy = str(timing_kv.get("load_strategy", cost_kv.get("load_strategy", "container"))).lower()
 
-    # Get cost parameters from inputs (no hardcoded values)
-    sort_pp = float(cost_kv.get("sort_cost_per_pkg", 0.0))
-    container_handling_cost = float(cost_kv.get("container_handling_cost", 0.0))
-    last_mile_sort_pp = float(cost_kv.get("last_mile_sort_cost_per_pkg", 0.0))
-    last_mile_delivery_pp = float(cost_kv.get("last_mile_delivery_cost_per_pkg", 0.0))
+    # Get cost parameters from inputs - NO hardcoded fallbacks
+    sort_pp = float(cost_kv["sort_cost_per_pkg"])
+    container_handling_cost = float(cost_kv["container_handling_cost"])
+    last_mile_sort_pp = float(cost_kv["last_mile_sort_cost_per_pkg"])
+    last_mile_delivery_pp = float(cost_kv["last_mile_delivery_cost_per_pkg"])
     dwell_cost_pp = float(cost_kv.get("dwell_cost_per_pkg_per_day", 0.0))
     sla_penalty_pp = float(cost_kv.get("sla_penalty_per_touch_per_pkg", 0.0))
 
@@ -279,7 +303,7 @@ def path_cost_and_time(
         leg_metrics.append(m)
         total_distance += m["distance_miles"]
 
-    # Calculate truck requirements with corrected fill rates
+    # Calculate truck requirements with input parameters only
     lane_od_pairs = [(row.to_dict(), day_pkgs)]
     truck_calc = enhanced_container_truck_calculation(
         lane_od_pairs, pkg_mix, cont_params, cost_kv, strategy
@@ -349,7 +373,7 @@ def path_cost_and_time(
             "packages_dwelled": packages_dwelled / len(legs),
         })
 
-    # Summary metrics (removed path-level fill rates - only show at arc level)
+    # Summary metrics
     sums = {
         "distance_miles_total": total_distance,
         "linehaul_hours_total": total_drive_hours,

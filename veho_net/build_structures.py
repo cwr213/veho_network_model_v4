@@ -1,4 +1,4 @@
-# veho_net/build_structures.py - CLEANED VERSION with minimal debug output
+# veho_net/build_structures.py - CORRECTED: Use input parameters only, no hardcoded values
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -115,18 +115,15 @@ def candidate_paths(
         od: pd.DataFrame,
         facilities: pd.DataFrame,
         mileage_bands: pd.DataFrame,
-        around_factor: float = 1.5,
+        around_factor: float = None,  # No hardcoded default - must come from input
 ) -> pd.DataFrame:
     """
-    Path generation with hub rules and circular routing prevention:
-
-    RULE 1: Secondary hubs (parent_hub != facility_name) must route ALL OUTBOUND
-            volume through their parent hub, UNLESS it creates circular routing.
-
-    RULE 2: Launch facilities must have their parent hub as the second-to-last touch.
-
-    CRITICAL FIX: Prevent circular routing where origin appears in destination's parent chain.
+    Path generation with hub rules and circular routing prevention.
+    around_factor must be provided from run_settings.path_around_the_world_factor
     """
+    if around_factor is None:
+        raise ValueError("around_factor must be provided from run_settings.path_around_the_world_factor")
+
     enforce_thresh = facilities.attrs.get("enforce_parent_hub_over_miles", 500)
 
     fac = facilities.set_index("facility_name").copy()
