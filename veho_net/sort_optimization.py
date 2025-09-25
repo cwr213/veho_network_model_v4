@@ -16,7 +16,6 @@ def calculate_containerization_costs_corrected(od_selected: pd.DataFrame, facili
     """
     try:
         if od_selected.empty:
-            print("Warning: Empty OD dataset for containerization costs")
             return pd.DataFrame()
 
         # CRITICAL: Validate required columns
@@ -24,16 +23,10 @@ def calculate_containerization_costs_corrected(od_selected: pd.DataFrame, facili
         missing_cols = [col for col in required_cols if col not in od_selected.columns]
 
         if missing_cols:
-            print(f"Warning: Missing required columns for containerization costs: {missing_cols}")
-            print(f"Available columns: {list(od_selected.columns)}")
             return pd.DataFrame()
 
         results = []
         sort_points_per_dest = int(timing_kv.get('sort_points_per_destination', 2))
-
-        print(f"Calculating CORRECTED containerization costs...")
-        print("Region level = best fill (parent hub), most sort touches")
-        print("Sort group level = worst fill (granular), fewest sort touches")
 
         # Create facility lookup with parent hub info
         fac_lookup = {}
@@ -89,8 +82,6 @@ def calculate_containerization_costs_corrected(od_selected: pd.DataFrame, facili
         df = pd.DataFrame(results)
 
         if not df.empty:
-            print_cost_analysis_summary(df)
-
             # Rename for compatibility
             df = df.rename(columns={
                 'region_total_cost': 'region_cost',

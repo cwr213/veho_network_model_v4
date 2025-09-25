@@ -25,8 +25,6 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
     if not direct_day.empty and 'dest' in direct_day.columns:
         all_facilities.update(direct_day['dest'].unique())
 
-    print(f"Calculating facility costs for {len(all_facilities)} facilities...")
-
     for facility in all_facilities:
         try:
             # 1. INJECTION ROLE: This facility as origin (sending packages out)
@@ -128,16 +126,7 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
 
             volume_data.append(volume_entry)
 
-            # Debug output for facilities with intermediate operations
-            if intermediate_pkgs > 0 and len(volume_data) <= 5:
-                print(f"DEBUG {facility}:")
-                print(f"  Injection: {injection_pkgs:.0f} pkgs, ${injection_sort_cpp:.3f}/pkg processing")
-                print(
-                    f"  Intermediate: {intermediate_pkgs:.0f} pkgs, ${mm_processing_cpp:.3f}/pkg processing, ${mm_linehaul_cpp:.3f}/pkg linehaul")
-                print(f"  Last mile: {last_mile_pkgs:.0f} pkgs, ${last_mile_delivery_cpp:.3f}/pkg delivery")
-
         except Exception as e:
-            print(f"Warning: Error processing facility {facility}: {e}")
             # Add default entry
             volume_data.append({
                 'facility': facility,
@@ -157,22 +146,6 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
             })
 
     result_df = pd.DataFrame(volume_data)
-
-    # Verify we have non-zero middle mile costs
-    total_mm_processing = result_df['mm_processing_cpp'].sum()
-    total_mm_linehaul = result_df['mm_linehaul_cpp'].sum()
-    facilities_with_mm_processing = (result_df['mm_processing_cpp'] > 0).sum()
-    facilities_with_mm_linehaul = (result_df['mm_linehaul_cpp'] > 0).sum()
-
-    print(f"✅ Facility cost calculation complete:")
-    print(f"  Facilities with MM processing costs: {facilities_with_mm_processing}")
-    print(f"  Facilities with MM linehaul costs: {facilities_with_mm_linehaul}")
-    print(f"  Total MM processing cost/pkg: ${total_mm_processing:.3f}")
-    print(f"  Total MM linehaul cost/pkg: ${total_mm_linehaul:.3f}")
-
-    if total_mm_processing == 0 and total_mm_linehaul == 0:
-        print("WARNING: All middle mile costs are zero - check cost allocation logic")
-
     return result_df
 
 
