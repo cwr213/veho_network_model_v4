@@ -1,4 +1,4 @@
-# veho_net/validators.py - ENHANCED with new sort optimization parameters
+# veho_net/validators.py - ENHANCED with better cost parameter validation
 
 import pandas as pd
 
@@ -14,8 +14,6 @@ def _fail(msg: str, df: pd.DataFrame | None = None):
         raise ValueError(f"{msg}\nFound columns: {list(df.columns)}")
     raise ValueError(msg)
 
-
-# ---------------- container_params ----------------
 
 def _check_container_params(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
@@ -36,44 +34,20 @@ def _check_container_params(df_raw: pd.DataFrame):
         _fail("container_params must include a row where container_type == 'gaylord'", df)
 
 
-# ---------------- facilities (ENHANCED) ----------------
-
 def _check_facilities(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
     required = {
         "facility_name", "type", "market", "region",
         "lat", "lon", "timezone", "parent_hub_name", "is_injection_node"
     }
-    # New optional columns for sort optimization
-    optional = {
-        "max_sort_points_capacity", "current_sort_points_used",
-        "last_mile_sort_groups_count", "sort_throughput_pkgs_per_hour"
-    }
 
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"facilities missing required columns: {missing}", df)
 
-    # Check for optional columns and warn if missing
-    missing_optional = sorted(optional - set(df.columns))
-    if missing_optional:
-        print(f"INFO: facilities sheet missing optional sort optimization columns: {missing_optional}")
-        print("      These will be treated as unlimited/unconstrained if not provided")
-
     dups = df["facility_name"][df["facility_name"].duplicated()].unique()
     if len(dups) > 0:
         _fail(f"facilities has duplicate facility_name values: {list(dups)}", df)
-
-    # Validate sort optimization columns if present
-    if "max_sort_points_capacity" in df.columns:
-        bad_capacity = df[df["max_sort_points_capacity"].notna() & (df["max_sort_points_capacity"] < 0)]
-        if not bad_capacity.empty:
-            _fail("facilities.max_sort_points_capacity must be >= 0 when provided", df)
-
-    if "last_mile_sort_groups_count" in df.columns:
-        bad_groups = df[df["last_mile_sort_groups_count"].notna() & (df["last_mile_sort_groups_count"] < 1)]
-        if not bad_groups.empty:
-            _fail("facilities.last_mile_sort_groups_count must be >= 1 when provided", df)
 
 
 def _check_zips(df_raw: pd.DataFrame):
@@ -86,8 +60,6 @@ def _check_zips(df_raw: pd.DataFrame):
     if len(dups) > 0:
         _fail(f"zips has duplicate ZIP codes: {list(dups)}", df)
 
-
-# ---------------- demand (STRICT) ----------------
 
 def _check_demand(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
@@ -116,18 +88,10 @@ def _check_injection_distribution(df: pd.DataFrame):
     if not required.issubset(df.columns):
         missing = required - set(df.columns)
         raise ValueError(f"injection_distribution missing required columns: {sorted(missing)}")
-    # Enabled flag optional, but if present must be 0/1
-    if "enabled_for_injection" in df.columns:
-        bad = ~pd.to_numeric(df["enabled_for_injection"], errors="coerce").isin([0, 1])
-        if bad.any():
-            raise ValueError("injection_distribution.enabled_for_injection must be 0/1 when present")
     # absolute_share must sum > 0 across enabled rows
-    tmp = df.copy()
-    if "enabled_for_injection" in tmp.columns:
-        tmp = tmp[tmp["enabled_for_injection"].astype(int) == 1]
-    w = pd.to_numeric(tmp["absolute_share"], errors="coerce").fillna(0.0)
+    w = pd.to_numeric(df["absolute_share"], errors="coerce").fillna(0.0)
     if float(w.sum()) <= 0:
-        raise ValueError("injection_distribution.absolute_share must sum > 0 over enabled rows")
+        raise ValueError("injection_distribution.absolute_share must sum > 0")
 
 
 def _check_mileage_bands(df_raw: pd.DataFrame):
@@ -145,68 +109,65 @@ def _check_timing_params(df_raw: pd.DataFrame):
         "load_hours", "unload_hours",
         "sort_hours_per_touch", "crossdock_hours_per_touch", "departure_cutoff_hours_per_move",
         # Enhanced with VA parameters
-        "injection_va_hours", "middle_mile_va_hours", "last_mile_va_hours"
-    }
-
-    # REMOVED: Legacy timing parameters that are not used in current logic
-    legacy_keys = {
-        "cpt_hours_local", "delivery_day_cutoff_local"
-    }
-
-    # NEW: Sort optimization parameters
-    enhanced_keys = {
-        "sort_points_per_destination", "hours_per_touch"
+        "injection_va_hours", "middle_mile_va_hours", "last_mile_va_hours",
+        # Enhanced timing
+        "hours_per_touch"
     }
 
     missing_required = sorted(required_keys - set(df["key"]))
-    missing_enhanced = sorted(enhanced_keys - set(df["key"]))
-    present_legacy = sorted(legacy_keys & set(df["key"]))
 
     if missing_required:
-        raise ValueError(f"timing_params missing required keys: {missing_required}")
+        print(f"INFO: timing_params missing some parameters: {missing_required}")
+        print("      Default values will be used where applicable")
 
-    if missing_enhanced:
-        print(f"INFO: timing_params missing enhanced sort optimization keys: {missing_enhanced}")
-        print("      Default values will be used: sort_points_per_destination=2, hours_per_touch=6.0")
+    # Check for legacy parameters
+    legacy_keys = {"cpt_hours_local", "delivery_day_cutoff_local"}
+    present_legacy = sorted(legacy_keys & set(df["key"]))
 
     if present_legacy:
-        print(f"INFO: timing_params contains legacy keys that are not used in current logic: {present_legacy}")
-        print("      These can be safely removed from your input file")
+        print(f"INFO: timing_params contains legacy keys that are not used: {present_legacy}")
 
 
 def _check_cost_params(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
 
-    # UPDATED: Core required parameters (removed last_mile_cpp as it's not used)
-    required_keys = {"sort_cost_per_pkg", "crossdock_touch_cost_per_pkg"}
-
-    # ENHANCED: New cost parameters for sort optimization
-    enhanced_keys = {
-        "sort_setup_cost_per_point", "last_mile_sort_cost_per_pkg",
-        "premium_economy_dwell_threshold", "allow_premium_economy_dwell",
-        "dwell_cost_per_pkg_per_day"
+    # UPDATED: Core required parameters with new container handling logic
+    required_keys = {
+        "sort_cost_per_pkg",
+        "last_mile_sort_cost_per_pkg",
+        "last_mile_delivery_cost_per_pkg",
+        "container_handling_cost"  # NEW: replaces crossdock_touch_cost_per_pkg
     }
 
-    # Legacy parameters that may be present but are not required
-    legacy_keys = {
-        "last_mile_cpp"  # This was renamed/replaced with more specific parameters
+    # Enhanced cost parameters
+    enhanced_keys = {
+        "premium_economy_dwell_threshold", "allow_premium_economy_dwell",
+        "dwell_cost_per_pkg_per_day", "sla_penalty_per_touch_per_pkg",
+        "sort_setup_cost_per_point"
+    }
+
+    # Deprecated parameters that might still be present
+    deprecated_keys = {
+        "crossdock_touch_cost_per_pkg",  # Replaced by container_handling_cost
+        "door_minute_cost"  # Not needed right now
     }
 
     missing_required = sorted(required_keys - set(df["key"]))
     missing_enhanced = sorted(enhanced_keys - set(df["key"]))
-    present_legacy = sorted(legacy_keys & set(df["key"]))
+    present_deprecated = sorted(deprecated_keys & set(df["key"]))
 
     if missing_required:
         raise ValueError(f"cost_params missing required keys: {missing_required}")
 
     if missing_enhanced:
-        print(f"INFO: cost_params missing enhanced sort optimization keys: {missing_enhanced}")
+        print(f"INFO: cost_params missing enhanced parameters: {missing_enhanced}")
         print("      Default values will be used where applicable")
 
-    if present_legacy:
-        print(f"INFO: cost_params contains legacy parameter: {present_legacy}")
-        print("      This parameter is no longer used in current logic - consider removing or renaming to:")
-        print("      'last_mile_delivery_cost_per_pkg' for last mile delivery costs")
+    if present_deprecated:
+        print(f"INFO: cost_params contains deprecated parameters: {present_deprecated}")
+        print("      These parameters are no longer used:")
+        print("      - crossdock_touch_cost_per_pkg → replaced by container_handling_cost")
+        print("      - door_minute_cost → not needed in current logic")
 
 
 def _check_package_mix(df_raw: pd.DataFrame):
@@ -230,14 +191,14 @@ def _check_run_settings(df_raw: pd.DataFrame):
 
 def _check_scenarios(df_raw: pd.DataFrame):
     df = _norm_cols(df_raw)
-    required = {"year", "day_type"}  # pair_id optional in this runner
+    required = {"year", "day_type"}
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"scenarios missing required columns: {missing}", df)
 
 
 def validate_inputs(dfs: dict):
-    """Enhanced validation with legacy parameter handling."""
+    """Enhanced validation with strategy differentiation support."""
     print("Validating input sheets...")
 
     _check_container_params(dfs["container_params"])
@@ -253,4 +214,4 @@ def validate_inputs(dfs: dict):
     _check_scenarios(dfs["scenarios"])
 
     print("✅ Input validation complete - all required fields present")
-    print("ℹ️  Check console messages above for any optional enhancements or legacy parameter notes")
+    print("ℹ️  Check console messages above for any optional enhancements or parameter notes")

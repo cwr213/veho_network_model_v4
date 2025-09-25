@@ -1,4 +1,4 @@
-# veho_net/milp.py - CLEANED VERSION with minimal debug output
+# veho_net/milp.py - UPDATED VERSION with enhanced strategy differentiation
 from ortools.sat.python import cp_model
 import pandas as pd
 from typing import Dict, Tuple, List
@@ -41,9 +41,13 @@ def solve_arc_pooled_path_selection(
         cost_kv: Dict[str, float],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Enhanced MILP solver with proper cubic metrics and lane-level calculations.
+    FIXED: Enhanced MILP solver with proper strategy differentiation.
     """
     cand = candidates.reset_index(drop=True).copy()
+
+    # CRITICAL FIX: Get strategy from cost_kv (now passed properly from run_v1.py)
+    strategy = str(cost_kv.get("load_strategy", "container")).lower()
+    print(f"    MILP solver using {strategy} strategy")
 
     # Ensure containers_cont exists
     if "containers_cont" not in cand.columns:
@@ -53,7 +57,7 @@ def solve_arc_pooled_path_selection(
 
     path_keys = list(cand.index)
 
-    # Enumerate arcs per path and build lane-level data
+    # Enumerate arcs per path and build lane-level data with STRATEGY AWARENESS
     arc_index_map: Dict[Tuple[str, str], int] = {}
     arc_meta: List[Dict] = []
     path_arcs: Dict[int, List[int]] = {}
@@ -77,11 +81,11 @@ def solve_arc_pooled_path_selection(
 
         path_arcs[i] = ids
 
-    # Calculate enhanced truck requirements per lane
+    # Calculate ENHANCED truck requirements per lane with STRATEGY DIFFERENTIATION
     lane_truck_calc = {}
-    strategy = str(cost_kv.get("load_strategy", "container")).lower()
 
     for (u, v), od_list in lane_od_data.items():
+        # CRITICAL: Use the enhanced truck calculation with proper strategy
         truck_calc = enhanced_container_truck_calculation(
             od_list, package_mix, container_params, cost_kv, strategy
         )
@@ -100,7 +104,7 @@ def solve_arc_pooled_path_selection(
     SCALE = 1000
     y = {a_idx: model.NewIntVar(0, 10 ** 9, f"y_{a_idx}") for a_idx in range(len(arc_meta))}
 
-    # Volume constraints per arc with enhanced logic
+    # ENHANCED volume constraints per arc with strategy-specific logic
     for a_idx in range(len(arc_meta)):
         arc = arc_meta[a_idx]
         lane_key = (arc["from"], arc["to"])
@@ -117,60 +121,32 @@ def solve_arc_pooled_path_selection(
                 required_trucks_scaled = int(round(truck_calc['trucks_needed'] * SCALE))
                 model.Add(y[a_idx] >= required_trucks_scaled)
             else:
-                model.Add(y[a_idx] * 2000 * SCALE >= sum(terms))
+                # Fallback constraint based on strategy
+                if strategy == "container":
+                    # Container strategy: assume 2000 packages per truck
+                    model.Add(y[a_idx] * 2000 * SCALE >= sum(terms))
+                else:
+                    # Fluid strategy: assume 1800 packages per truck (less efficient)
+                    model.Add(y[a_idx] * 1800 * SCALE >= sum(terms))
         else:
             model.Add(y[a_idx] == 0)
 
-    # Enhanced objective function
+    # Enhanced objective function - now using pre-calculated costs
     crossdock_pp = float(cost_kv.get("crossdock_touch_cost_per_pkg", 0.0))
     sort_pp = float(cost_kv.get("sort_cost_per_pkg", 0.0))
     dwell_cost_pp = float(cost_kv.get("dwell_cost_per_pkg_per_day", 0.0))
 
-    touch_map = {
-        "direct": 0,
-        "1_touch": 1,
-        "2_touch": 2,
-        "3_touch": 3,
-        "4_touch": 4
-    }
-
-    # Calculate processing costs with strategy awareness
-    processing_cost = {}
+    # CRITICAL FIX: Use pre-calculated strategy-specific costs instead of recalculating
+    # This ensures the MILP uses the exact costs calculated by path_cost_and_time()
+    path_costs = {}
     for i in path_keys:
-        path_type = str(cand.at[i, "path_type"])
-        pkgs_day = float(cand.at[i, "pkgs_day"])
+        # Use the total_cost calculated by path_cost_and_time() which is strategy-aware
+        path_costs[i] = int(float(cand.at[i, 'total_cost']) * SCALE)
 
-        if path_type in touch_map:
-            num_touches = touch_map[path_type]
-        else:
-            path_nodes = cand.at[i, "path_nodes"]
-            if isinstance(path_nodes, list) and len(path_nodes) >= 2:
-                num_touches = len(path_nodes) - 2
-            else:
-                num_touches = 0
+    print(f"    Using pre-calculated {strategy} strategy costs for path selection")
 
-        if strategy == "container":
-            touch_cost = crossdock_pp * pkgs_day * num_touches
-            sort_cost = sort_pp * pkgs_day * 2
-        else:
-            sort_cost = sort_pp * pkgs_day * (num_touches + 2)
-            touch_cost = 0.0
-
-        processing_cost[i] = touch_cost + sort_cost
-
-    # Add dwell costs
-    dwell_cost_total = 0
-    for lane_key, truck_calc in lane_truck_calc.items():
-        dwell_cost_total += truck_calc['packages_dwelled'] * dwell_cost_pp
-
-    # Minimize total cost: transportation + processing + dwell
-    arc_cost = {a_idx: float(arc_meta[a_idx]["cost_per_truck"]) for a_idx in range(len(arc_meta))}
-
-    model.Minimize(
-        sum(y[a_idx] * arc_cost[a_idx] for a_idx in range(len(arc_meta)))
-        + sum(x[i] * processing_cost[i] for i in path_keys)
-        + int(dwell_cost_total * SCALE)
-    )
+    # Simple objective: minimize total pre-calculated path costs
+    model.Minimize(sum(x[i] * path_costs[i] for i in path_keys))
 
     # Solve with enhanced parameters
     solver = cp_model.CpSolver()
@@ -181,19 +157,11 @@ def solve_arc_pooled_path_selection(
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return pd.DataFrame(), pd.DataFrame()
 
-    status_names = {
-        cp_model.OPTIMAL: "OPTIMAL",
-        cp_model.FEASIBLE: "FEASIBLE",
-        cp_model.INFEASIBLE: "INFEASIBLE",
-        cp_model.MODEL_INVALID: "MODEL_INVALID",
-        cp_model.UNKNOWN: "UNKNOWN"
-    }
-
     # Extract chosen paths
     chosen_idx = [i for i in path_keys if solver.Value(x[i]) == 1]
     selected_paths = cand.loc[chosen_idx].reset_index(drop=True)
 
-    # Enhanced arc aggregation with proper cubic metrics and fill rates
+    # ENHANCED arc aggregation with strategy-specific metrics
     w_cube = weighted_pkg_cube(package_mix)
 
     agg = {}
@@ -211,9 +179,9 @@ def solve_arc_pooled_path_selection(
             if key not in agg:
                 truck_calc = lane_truck_calc.get(lane_key, {
                     'trucks_needed': 1,
-                    'container_fill_rate': 0.8,
-                    'truck_fill_rate': 0.8,
-                    'physical_containers': 1,
+                    'container_fill_rate': 0.5 if strategy == "container" else 0.0,
+                    'truck_fill_rate': 0.6 if strategy == "container" else 0.7,  # Different defaults
+                    'physical_containers': 1 if strategy == "container" else 0,
                     'packages_dwelled': 0,
                     'total_cube_cuft': 0,
                     'cube_per_truck': 0
@@ -236,7 +204,7 @@ def solve_arc_pooled_path_selection(
             agg[key]["pkgs_day"] += pkgs
             agg[key]["pkg_cube_cuft"] += cube
 
-    # Build enhanced arc summary with cubic metrics
+    # Build ENHANCED arc summary with strategy-specific metrics
     rows = []
     for (u, v, scen, day), val in agg.items():
         trucks = val["trucks_needed"]
