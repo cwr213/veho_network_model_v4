@@ -1,4 +1,4 @@
-# veho_net/validators.py - Enhanced validation with strict parameter requirements
+# veho_net/validators.py - Enhanced validation with separate sort cost parameters
 
 import pandas as pd
 
@@ -149,16 +149,22 @@ def _check_timing_params(df_raw: pd.DataFrame):
 
 
 def _check_cost_params(df_raw: pd.DataFrame):
-    """Validate all required cost parameters are present."""
+    """Validate all required cost parameters including separate sort costs."""
     df = _norm_cols(df_raw)
 
-    # Required core cost parameters
+    # Required core cost parameters - UPDATED to support separate sort costs
     required_keys = {
-        "sort_cost_per_pkg",
+        "sort_cost_per_pkg",  # Can be used as fallback
         "last_mile_sort_cost_per_pkg",
         "last_mile_delivery_cost_per_pkg",
         "container_handling_cost",
         "premium_economy_dwell_threshold",
+    }
+
+    # Enhanced sort cost parameters (optional but recommended)
+    enhanced_sort_keys = {
+        "injection_sort_cost_per_pkg",
+        "intermediate_sort_cost_per_pkg",
     }
 
     # Optional enhanced parameters
@@ -168,19 +174,30 @@ def _check_cost_params(df_raw: pd.DataFrame):
         "sla_penalty_per_touch_per_pkg",
     }
 
+    # Check required parameters
     missing_required = sorted(required_keys - set(df["key"]))
     if missing_required:
         raise ValueError(f"cost_params missing required keys: {missing_required}")
 
+    # Check for enhanced sort parameters
+    missing_enhanced_sort = sorted(enhanced_sort_keys - set(df["key"]))
+    if missing_enhanced_sort:
+        print(f"INFO: cost_params missing enhanced sort parameters: {missing_enhanced_sort}")
+        print("      Will use 'sort_cost_per_pkg' as fallback for missing sort cost parameters")
+        print("      Consider adding separate injection_sort_cost_per_pkg and intermediate_sort_cost_per_pkg")
+        print("      for more precise strategy differentiation testing")
+
+    # Check optional parameters
     missing_optional = sorted(optional_keys - set(df["key"]))
     if missing_optional:
         print(f"INFO: cost_params missing optional parameters: {missing_optional}")
         print("      Default values of 0.0 will be used")
 
     # Validate cost values are non-negative
+    all_cost_keys = required_keys | enhanced_sort_keys | optional_keys
     for _, row in df.iterrows():
         key = row["key"]
-        if key in (required_keys | optional_keys):
+        if key in all_cost_keys:
             try:
                 value = float(row["value"])
                 if value < 0:
@@ -248,9 +265,7 @@ def _check_scenarios(df_raw: pd.DataFrame):
 
 def validate_inputs(dfs: dict):
     """
-    Comprehensive input validation ensuring all required parameters exist.
-
-    No hardcoded fallback values - all parameters must be provided in inputs.
+    Comprehensive input validation with support for separate sort cost parameters.
     """
     print("Validating input sheets...")
 
@@ -268,3 +283,4 @@ def validate_inputs(dfs: dict):
 
     print("✅ Input validation complete - all required parameters present and valid")
     print("ℹ️  Model will use only input parameters - no hardcoded fallback values")
+    print("🔧 CORRECTED ARCHITECTURE: All cost calculation happens in MILP with proper aggregation")
