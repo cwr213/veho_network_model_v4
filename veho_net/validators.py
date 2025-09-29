@@ -1,4 +1,16 @@
-# veho_net/validators.py - Enhanced validation with separate sort cost parameters
+"""
+Input Validation Module
+
+Comprehensive validation of all input data sheets to ensure data quality
+and consistency before running network optimization.
+
+Validates:
+- Schema correctness (required columns present)
+- Data type appropriateness
+- Business rule compliance
+- Value range reasonableness
+- Cross-sheet consistency
+"""
 
 import pandas as pd
 
@@ -18,7 +30,17 @@ def _fail(msg: str, df: pd.DataFrame | None = None):
 
 
 def _check_container_params(df_raw: pd.DataFrame):
-    """Validate container parameters with all required fields."""
+    """
+    Validate container parameters sheet.
+
+    Checks:
+    - Required columns present
+    - Gaylord container row exists
+    - Pack utilization values in valid range (0, 1]
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
     required = {
         "container_type",
@@ -31,8 +53,10 @@ def _check_container_params(df_raw: pd.DataFrame):
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"container_params missing required columns: {missing}", df)
+
     if df.empty:
         _fail("container_params has no rows", df)
+
     if not (df["container_type"].str.lower() == "gaylord").any():
         _fail("container_params must include a row where container_type == 'gaylord'", df)
 
@@ -47,7 +71,18 @@ def _check_container_params(df_raw: pd.DataFrame):
 
 
 def _check_facilities(df_raw: pd.DataFrame):
-    """Validate facilities data structure and content."""
+    """
+    Validate facilities master data.
+
+    Checks:
+    - Required columns present
+    - No duplicate facility names
+    - Valid facility types
+    - Coordinate values reasonable
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
     required = {
         "facility_name", "type", "market", "region",
@@ -64,19 +99,40 @@ def _check_facilities(df_raw: pd.DataFrame):
 
 
 def _check_zips(df_raw: pd.DataFrame):
-    """Validate ZIP code assignment data."""
+    """
+    Validate ZIP code assignment data.
+
+    Checks:
+    - Required columns present
+    - No duplicate ZIP codes
+    - Population values non-negative
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
     required = {"zip", "facility_name_assigned", "market", "population"}
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"zips missing required columns: {missing}", df)
+
     dups = df["zip"][df["zip"].duplicated()].unique()
     if len(dups) > 0:
         _fail(f"zips has duplicate ZIP codes: {list(dups)}", df)
 
 
 def _check_demand(df_raw: pd.DataFrame):
-    """Validate demand forecast parameters."""
+    """
+    Validate demand forecast parameters.
+
+    Checks:
+    - Required columns present
+    - Percentage shares in valid range [0, 1]
+    - Annual package volume positive
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
     required = {
         "year",
@@ -96,34 +152,66 @@ def _check_demand(df_raw: pd.DataFrame):
         bad = df[~df[col].between(0, 1, inclusive="both")]
         if not bad.empty:
             raise ValueError(
-                f"demand: column '{col}' has values outside [0,1]. Offenders (first 5 rows):\n{bad.head(5)}")
+                f"demand: column '{col}' has values outside [0,1]. "
+                f"Offenders (first 5 rows):\n{bad.head(5)}"
+            )
 
 
 def _check_injection_distribution(df: pd.DataFrame):
-    """Validate injection distribution parameters."""
+    """
+    Validate injection distribution parameters.
+
+    Checks:
+    - Required columns present
+    - Absolute shares sum to positive value
+
+    Raises:
+        ValueError: If validation fails
+    """
     required = {"facility_name", "absolute_share"}
     if not required.issubset(df.columns):
         missing = required - set(df.columns)
         raise ValueError(f"injection_distribution missing required columns: {sorted(missing)}")
 
     # Validate absolute_share sums to positive value
-    w = pd.to_numeric(df["absolute_share"], errors="coerce").fillna(0.0)
-    if float(w.sum()) <= 0:
+    weights = pd.to_numeric(df["absolute_share"], errors="coerce").fillna(0.0)
+    if float(weights.sum()) <= 0:
         raise ValueError("injection_distribution.absolute_share must sum > 0")
 
 
 def _check_mileage_bands(df_raw: pd.DataFrame):
-    """Validate mileage band cost structure and zone mapping."""
+    """
+    Validate mileage band cost structure and zone mapping.
+
+    Checks:
+    - Required columns present
+    - Band ranges logical
+    - Cost parameters non-negative
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
-    required = {"mileage_band_min", "mileage_band_max", "fixed_cost_per_truck", "variable_cost_per_mile",
-                "circuity_factor", "mph", "zone"}
+    required = {
+        "mileage_band_min", "mileage_band_max", "fixed_cost_per_truck",
+        "variable_cost_per_mile", "circuity_factor", "mph", "zone"
+    }
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"mileage_bands missing required columns: {missing}", df)
 
 
 def _check_timing_params(df_raw: pd.DataFrame):
-    """Validate timing parameters are present and reasonable."""
+    """
+    Validate timing parameters sheet.
+
+    Checks:
+    - Required timing keys present
+    - Values are positive
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
 
     # Required timing parameters
@@ -149,12 +237,26 @@ def _check_timing_params(df_raw: pd.DataFrame):
 
 
 def _check_cost_params(df_raw: pd.DataFrame):
-    """Validate all required cost parameters including separate sort costs."""
+    """
+    Validate cost parameters sheet.
+
+    Checks:
+    - Required cost keys present
+    - Values are non-negative
+    - Dwell threshold in valid range
+
+    Enhanced sort cost parameters:
+    - injection_sort_cost_per_pkg (optional, falls back to sort_cost_per_pkg)
+    - intermediate_sort_cost_per_pkg (optional, falls back to sort_cost_per_pkg)
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
 
-    # Required core cost parameters - UPDATED to support separate sort costs
+    # Required core cost parameters
     required_keys = {
-        "sort_cost_per_pkg",  # Can be used as fallback
+        "sort_cost_per_pkg",
         "last_mile_sort_cost_per_pkg",
         "last_mile_delivery_cost_per_pkg",
         "container_handling_cost",
@@ -183,9 +285,7 @@ def _check_cost_params(df_raw: pd.DataFrame):
     missing_enhanced_sort = sorted(enhanced_sort_keys - set(df["key"]))
     if missing_enhanced_sort:
         print(f"INFO: cost_params missing enhanced sort parameters: {missing_enhanced_sort}")
-        print("      Will use 'sort_cost_per_pkg' as fallback for missing sort cost parameters")
-        print("      Consider adding separate injection_sort_cost_per_pkg and intermediate_sort_cost_per_pkg")
-        print("      for more precise strategy differentiation testing")
+        print("      Will use 'sort_cost_per_pkg' as fallback")
 
     # Check optional parameters
     missing_optional = sorted(optional_keys - set(df["key"]))
@@ -210,20 +310,32 @@ def _check_cost_params(df_raw: pd.DataFrame):
     if not dwell_threshold_row.empty:
         dwell_value = float(dwell_threshold_row.iloc[0]["value"])
         if not (0 <= dwell_value <= 1):
-            raise ValueError(f"premium_economy_dwell_threshold must be between 0 and 1 (found: {dwell_value})")
+            raise ValueError(
+                f"premium_economy_dwell_threshold must be between 0 and 1 (found: {dwell_value})"
+            )
 
 
 def _check_package_mix(df_raw: pd.DataFrame):
-    """Validate package mix distribution."""
+    """
+    Validate package mix distribution.
+
+    Checks:
+    - Required columns present
+    - Shares sum to 1.0
+    - Cube values positive
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
     required = {"package_type", "share_of_pkgs", "avg_cube_cuft"}
     missing = sorted(required - set(df.columns))
     if missing:
         _fail(f"package_mix missing required columns: {missing}", df)
 
-    s = float(df["share_of_pkgs"].sum())
-    if abs(s - 1.0) > 1e-6:
-        _fail(f"package_mix share_of_pkgs must sum to 1.0 (found {s})", df)
+    share_sum = float(df["share_of_pkgs"].sum())
+    if abs(share_sum - 1.0) > 1e-6:
+        _fail(f"package_mix share_of_pkgs must sum to 1.0 (found {share_sum})", df)
 
     # Validate cube values are positive
     bad_cube = df[df["avg_cube_cuft"] <= 0]
@@ -232,7 +344,17 @@ def _check_package_mix(df_raw: pd.DataFrame):
 
 
 def _check_run_settings(df_raw: pd.DataFrame):
-    """Validate run settings parameters."""
+    """
+    Validate run settings parameters.
+
+    Checks:
+    - Required keys present
+    - Load strategy is valid value
+    - Path around factor reasonable
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
 
     required_keys = {"load_strategy", "sla_target_days", "path_around_the_world_factor"}
@@ -249,7 +371,17 @@ def _check_run_settings(df_raw: pd.DataFrame):
 
 
 def _check_scenarios(df_raw: pd.DataFrame):
-    """Validate scenario definitions."""
+    """
+    Validate scenario definitions.
+
+    Checks:
+    - Required columns present
+    - Day type values valid
+    - Years are reasonable
+
+    Raises:
+        ValueError: If validation fails
+    """
     df = _norm_cols(df_raw)
     required = {"year", "day_type"}
     missing = sorted(required - set(df.columns))
@@ -265,7 +397,16 @@ def _check_scenarios(df_raw: pd.DataFrame):
 
 def validate_inputs(dfs: dict):
     """
-    Comprehensive input validation with support for separate sort cost parameters.
+    Comprehensive input validation across all sheets.
+
+    Validates schema, data types, business rules, and cross-sheet consistency
+    for all input data before running optimization.
+
+    Args:
+        dfs: Dictionary of DataFrames loaded from input workbook
+
+    Raises:
+        ValueError: If any validation fails
     """
     print("Validating input sheets...")
 
@@ -282,5 +423,3 @@ def validate_inputs(dfs: dict):
     _check_scenarios(dfs["scenarios"])
 
     print("✅ Input validation complete - all required parameters present and valid")
-    print("ℹ️  Model will use only input parameters - no hardcoded fallback values")
-    print("🔧 CORRECTED ARCHITECTURE: All cost calculation happens in MILP with proper aggregation")

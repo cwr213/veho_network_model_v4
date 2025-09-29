@@ -1,4 +1,16 @@
-# run_v1.py - CORRECTED: Remove cost pre-calculation, let MILP handle all costs
+"""
+Main Execution Script for Network Optimization
+
+Orchestrates the complete network optimization workflow:
+1. Load and validate input data
+2. Generate OD matrices and candidate paths
+3. Optimize path selection via MILP
+4. Calculate network metrics and KPIs
+5. Generate comprehensive output reports
+
+Run with: python run_v1.py --input data/input.xlsx --output_dir outputs/
+"""
+
 import argparse
 from pathlib import Path
 import pandas as pd
@@ -24,7 +36,7 @@ from veho_net.write_outputs import (
     write_executive_summary_workbook
 )
 
-# Output naming
+# Output file naming templates
 OUTPUT_FILE_TEMPLATE = "{scenario_id}_{strategy}.xlsx"
 COMPARE_FILE_TEMPLATE = "{scenario_id}_compare.xlsx"
 EXECUTIVE_SUMMARY_TEMPLATE = "{scenario_id}_exec_sum.xlsx"
@@ -33,11 +45,20 @@ EXECUTIVE_SUMMARY_TEMPLATE = "{scenario_id}_exec_sum.xlsx"
 def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate OD-level fill rates based on actual lane usage.
-    Multiple ODs share lanes, so aggregate fill rates from lane level data.
+
+    Multiple ODs can share lanes, so aggregate fill rates from lane-level data
+    weighted by each OD's share of the lane volume.
+
+    Args:
+        od_selected: Selected OD paths with path information
+        arc_summary: Arc-level aggregated metrics including fill rates
+
+    Returns:
+        od_selected with updated fill rate columns
     """
     od = od_selected.copy()
 
-    # Initialize with zero (no hardcoded defaults)
+    # Initialize with zero (no defaults)
     od['container_fill_rate'] = 0.0
     od['truck_fill_rate'] = 0.0
     od['packages_dwelled'] = 0.0
@@ -96,6 +117,13 @@ def _fix_od_fill_rates_from_lanes(od_selected: pd.DataFrame, arc_summary: pd.Dat
 def _fix_facility_rollup_last_mile_costs(facility_rollup: pd.DataFrame, od_selected: pd.DataFrame) -> pd.DataFrame:
     """
     Add last mile cost calculations to facility rollup by destination.
+
+    Args:
+        facility_rollup: Facility-level volume and cost aggregations
+        od_selected: Selected OD paths with processing costs
+
+    Returns:
+        facility_rollup with added last_mile_cost and last_mile_cpp columns
     """
     if facility_rollup.empty:
         return facility_rollup
@@ -109,13 +137,13 @@ def _fix_facility_rollup_last_mile_costs(facility_rollup: pd.DataFrame, od_selec
     if od_selected.empty:
         return facility_rollup
 
-    # Check if processing_cost column exists in od_selected (from new MILP architecture)
+    # Check if processing_cost column exists
     if 'processing_cost' not in od_selected.columns:
         print("  Warning: processing_cost column missing from od_selected, skipping last mile cost calculation")
         return facility_rollup
 
     try:
-        # Calculate processing costs by destination facility (approximation for last mile costs)
+        # Calculate processing costs by destination facility
         last_mile_costs = od_selected.groupby('dest').agg({
             'processing_cost': 'sum',
             'pkgs_day': 'sum'
@@ -124,7 +152,7 @@ def _fix_facility_rollup_last_mile_costs(facility_rollup: pd.DataFrame, od_selec
         last_mile_costs['last_mile_cpp'] = last_mile_costs['processing_cost'] / last_mile_costs['pkgs_day'].replace(0,
                                                                                                                     1)
 
-        # Update facility rollup with last mile costs where they exist
+        # Update facility rollup with last mile costs
         for _, cost_row in last_mile_costs.iterrows():
             facility_name = cost_row['dest']
             facility_mask = facility_rollup['facility'] == facility_name
@@ -139,7 +167,25 @@ def _fix_facility_rollup_last_mile_costs(facility_rollup: pd.DataFrame, od_selec
     return facility_rollup
 
 
-# Removed _fix_network_kpis function - now using MILP-calculated network KPIs directly
+def _validate_scenario_consistency(scenario_row: pd.Series, demand_df: pd.DataFrame):
+    """
+    Validate that scenario parameters align with available demand data.
+
+    Args:
+        scenario_row: Scenario configuration
+        demand_df: Demand forecast data
+
+    Raises:
+        ValueError: If scenario year not found in demand data
+    """
+    year = int(scenario_row.get("year", scenario_row.get("demand_year", 2028)))
+
+    if year not in demand_df['year'].values:
+        available_years = sorted(demand_df['year'].unique())
+        raise ValueError(
+            f"Scenario year {year} not found in demand data. "
+            f"Available years: {available_years}"
+        )
 
 
 def _run_one_strategy(
@@ -159,9 +205,34 @@ def _run_one_strategy(
         out_dir: Path,
 ):
     """
-    CORRECTED: Execute network optimization with MILP-only cost calculation.
-    """
+    Execute network optimization for a single strategy.
 
+    Workflow:
+    1. Extract scenario parameters and validate
+    2. Build OD matrix and candidate paths
+    3. Optimize path selection via MILP
+    4. Calculate network metrics and KPIs
+    5. Generate output reports
+
+    Args:
+        base_id: Base identifier for output naming
+        strategy: Loading strategy ('container' or 'fluid')
+        facilities: Facility master data
+        zips: ZIP code assignments
+        demand: Demand forecast
+        inj: Injection distribution
+        mb: Mileage bands
+        timing: Timing parameters
+        costs: Cost parameters
+        cont: Container parameters
+        pkgmix: Package mix distribution
+        run_kv: Run settings
+        scenario_row: Scenario configuration
+        out_dir: Output directory
+
+    Returns:
+        Tuple of (scenario_id, output_path, kpis, results_dict) or None if failed
+    """
     # Extract scenario information
     scenario_id_from_input = scenario_row.get("scenario_id",
                                               scenario_row.get("pair_id", "default_scenario"))
@@ -174,7 +245,6 @@ def _run_one_strategy(
     timing_local = dict(timing)
     timing_local["load_strategy"] = strategy
 
-    # Add strategy to costs dict for MILP solver
     costs_local = dict(costs)
     costs_local["load_strategy"] = strategy
 
@@ -182,6 +252,13 @@ def _run_one_strategy(
     facilities.attrs["enforce_parent_hub_over_miles"] = int(run_kv.get("enforce_parent_hub_over_miles", 500))
 
     print(f"Processing {scenario_id}: {year} {day_type} {strategy} strategy")
+
+    # Validate scenario consistency
+    try:
+        _validate_scenario_consistency(scenario_row, demand)
+    except ValueError as e:
+        print(f"  Error: {e}")
+        return None
 
     # Build OD matrix
     year_demand = demand.query("year == @year").copy()
@@ -204,7 +281,7 @@ def _run_one_strategy(
     # Set pkgs_day column
     od["pkgs_day"] = od[od_day_col]
 
-    # Build candidate paths - SAME for both strategies
+    # Build candidate paths
     around_factor = float(run_kv.get("path_around_the_world_factor", 1.5))
     paths = candidate_paths(od, facilities, mb, around_factor=around_factor)
 
@@ -214,7 +291,7 @@ def _run_one_strategy(
 
     print(f"  Generated {len(paths)} candidate paths")
 
-    # Merge packages - NO cost pre-calculation
+    # Merge packages
     paths = paths.merge(
         od[['origin', 'dest', 'pkgs_day']],
         on=['origin', 'dest'],
@@ -227,13 +304,13 @@ def _run_one_strategy(
 
     paths['pkgs_day'] = paths['pkgs_day'].fillna(0)
 
-    # Add basic metadata for MILP
+    # Add metadata for MILP
     paths["scenario_id"] = scenario_id
     paths["day_type"] = day_type
 
-    print(f"  Paths prepared for MILP optimization (no pre-calculated costs)")
+    print(f"  Paths prepared for MILP optimization")
 
-    # CORRECTED: MILP solver handles ALL cost calculation and returns network KPIs
+    # Run MILP optimization
     print(f"  Running MILP optimization with {strategy} strategy cost calculation...")
     od_selected, arc_summary, network_kpis = solve_arc_pooled_path_selection(
         paths, facilities, mb, pkgmix, cont, costs_local, timing_local
@@ -268,7 +345,7 @@ def _run_one_strategy(
     )
     facility_rollup = _fix_facility_rollup_last_mile_costs(facility_rollup, od_selected)
 
-    # Validate aggregate calculations (skip network KPI validation since using MILP values)
+    # Validate aggregate calculations
     validation_results = validate_network_aggregations(od_selected, arc_summary, facility_rollup)
 
     if not validation_results.get('package_consistency', True):
@@ -281,13 +358,30 @@ def _run_one_strategy(
         print(f"    OD total cost: ${validation_results.get('total_od_cost', 0):,.0f}")
         print(f"    Arc total cost: ${validation_results.get('total_arc_cost', 0):,.0f}")
 
-    # Generate path steps for output
+    # Generate path steps using arc_summary data (Option B approach)
     path_steps = []
+
     for _, od_row in od_selected.iterrows():
         path_str = str(od_row.get('path_str', f"{od_row['origin']}->{od_row['dest']}"))
         nodes = path_str.split('->')
 
         for i, (from_fac, to_fac) in enumerate(zip(nodes[:-1], nodes[1:])):
+            # Look up actual arc data from arc_summary
+            arc_data = arc_summary[
+                (arc_summary['from_facility'] == from_fac.strip()) &
+                (arc_summary['to_facility'] == to_fac.strip())
+                ]
+
+            if not arc_data.empty:
+                arc_row = arc_data.iloc[0]
+                distance_miles = float(arc_row.get('distance_miles', 0))
+                # Calculate drive hours from distance and mph (can be added to arc_summary if needed)
+                drive_hours = distance_miles / 55.0  # Approximate average mph
+            else:
+                # Fallback if arc not found (shouldn't happen but defensive coding)
+                distance_miles = 0
+                drive_hours = 0
+
             path_steps.append({
                 'scenario_id': scenario_id,
                 'origin': od_row['origin'],
@@ -295,20 +389,19 @@ def _run_one_strategy(
                 'step_order': i + 1,
                 'from_facility': from_fac.strip(),
                 'to_facility': to_fac.strip(),
-                'distance_miles': 500,  # Default - could calculate actual
-                'drive_hours': 8,  # Default
-                'processing_hours_at_destination': 2
+                'distance_miles': distance_miles,
+                'drive_hours': drive_hours,
+                'processing_hours_at_destination': float(timing_local.get('hours_per_touch', 8.0))
             })
 
     path_steps_df = pd.DataFrame(path_steps)
     lane_summary = build_lane_summary(arc_summary)
 
-    # Calculate KPIs using MILP-provided network KPIs (no recalculation)
+    # Calculate KPIs using MILP-provided network KPIs
     total_cost = od_selected["total_cost"].sum()
     total_pkgs = od_selected["pkgs_day"].sum()
     cost_per_pkg = total_cost / max(total_pkgs, 1)
 
-    # Use KPIs from MILP solver (already correctly calculated)
     kpis = pd.Series({
         "total_cost": total_cost,
         "cost_per_pkg": cost_per_pkg,
@@ -327,7 +420,6 @@ def _run_one_strategy(
                             "path_type"] == "3_touch").mean() * 100 if "path_type" in od_selected.columns else 0,
     })
 
-    # Remove the old network KPI calculation since we're using MILP values
     print(f"  MILP-calculated network avg truck fill rate: {network_kpis['avg_truck_fill_rate']:.1%}")
     print(f"  MILP-calculated network avg container fill rate: {network_kpis['avg_container_fill_rate']:.1%}")
 
@@ -355,7 +447,7 @@ def _run_one_strategy(
         facility_rollup,
         arc_summary,
         kpis,
-        None  # No sort allocation for core model
+        None
     )
 
     if not write_success:
@@ -379,15 +471,18 @@ def main(input_path: str, output_dir: str):
 
     Loads input data, validates parameters, runs optimization for both
     container and fluid strategies, and generates comparison reports.
+
+    Args:
+        input_path: Path to input Excel workbook
+        output_dir: Directory for output files
     """
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
-    print(f"🚀 Starting Network Optimization with Corrected Architecture")
+    print(f"🚀 Starting Network Optimization")
     print(f"📁 Input: {input_path.name}")
     print(f"📁 Output: {output_dir}")
-    print(f"🔧 All cost calculation happens in MILP with proper aggregation")
 
     dfs = load_workbook(input_path)
     validate_inputs(dfs)
@@ -477,7 +572,7 @@ def main(input_path: str, output_dir: str):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Veho Network Optimization with Corrected Architecture")
+    parser = argparse.ArgumentParser(description="Veho Network Optimization")
     parser.add_argument("--input", required=True, help="Path to input Excel file")
     parser.add_argument("--output_dir", required=True, help="Path to output directory")
     args = parser.parse_args()

@@ -1,16 +1,49 @@
-# veho_net/reporting.py - Fixed zone and cost calculations
+"""
+Network Reporting Module
+
+Generates facility-level, arc-level, and network-level aggregations and KPIs
+from optimization results. Provides executive-ready metrics and operational insights.
+
+Key Functions:
+- Facility volume analysis by role (injection, intermediate, last-mile)
+- Hourly throughput calculations for capacity planning
+- Zone classification for pricing analysis
+- Dwell hotspot identification for operational attention
+- Network-wide KPI aggregation and validation
+"""
+
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
 
 
-def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_selected: pd.DataFrame,
-                                      direct_day: pd.DataFrame, arc_summary: pd.DataFrame) -> pd.DataFrame:
+def _identify_volume_types_with_costs(
+        od_selected: pd.DataFrame,
+        path_steps_selected: pd.DataFrame,
+        direct_day: pd.DataFrame,
+        arc_summary: pd.DataFrame
+) -> pd.DataFrame:
     """
     Calculate facility volume and cost breakdowns by role type.
 
     Each facility shows costs for packages that ORIGINATE there,
-    including the full cost chain through to final delivery.
+    including the full cost chain through to final delivery. This
+    attribution approach supports hub network development by showing
+    end-to-end costs by injection point.
+
+    Facility Roles:
+    - Injection: Packages originating at this facility (full cost chain)
+    - Intermediate: Packages passing through (processing cost only)
+    - Last Mile: Packages delivered here (from direct or middle-mile)
+
+    Args:
+        od_selected: Selected OD paths with costs
+        path_steps_selected: Path step details (currently unused)
+        direct_day: Direct injection volumes
+        arc_summary: Arc-level aggregated metrics
+
+    Returns:
+        DataFrame with facility-level volume and cost metrics by role
     """
     volume_data = []
 
@@ -28,7 +61,7 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
         try:
             # Injection role: facility as origin - show FULL cost chain for originating packages
             injection_pkgs = 0
-            total_injection_cost = 0  # Full cost chain for packages originating here
+            total_injection_cost = 0
 
             if not od_selected.empty:
                 outbound_ods = od_selected[od_selected['origin'] == facility]
@@ -134,10 +167,24 @@ def _identify_volume_types_with_costs(od_selected: pd.DataFrame, path_steps_sele
     return pd.DataFrame(volume_data)
 
 
-def _calculate_hourly_throughput_with_costs(volume_df: pd.DataFrame, timing_kv: dict,
-                                            load_strategy: str) -> pd.DataFrame:
+def _calculate_hourly_throughput_with_costs(
+        volume_df: pd.DataFrame,
+        timing_kv: dict,
+        load_strategy: str
+) -> pd.DataFrame:
     """
     Calculate facility throughput requirements based on value-added hours.
+
+    Uses timing parameters to convert daily volumes into hourly throughput
+    requirements for capacity planning and labor forecasting.
+
+    Args:
+        volume_df: Facility volume data by role
+        timing_kv: Timing parameters with VA hours by facility role
+        load_strategy: Loading strategy (used for context, not calculation)
+
+    Returns:
+        volume_df with added hourly throughput columns
     """
     df = volume_df.copy()
 
@@ -167,11 +214,26 @@ def _calculate_hourly_throughput_with_costs(volume_df: pd.DataFrame, timing_kv: 
     return df
 
 
-def calculate_zone_from_distance(origin: str, dest: str, facilities: pd.DataFrame,
-                                 mileage_bands: pd.DataFrame) -> str:
+def calculate_zone_from_distance(
+        origin: str,
+        dest: str,
+        facilities: pd.DataFrame,
+        mileage_bands: pd.DataFrame
+) -> str:
     """
     Calculate zone based on straight-line haversine distance between origin and destination.
-    Uses zone column from mileage_bands sheet.
+
+    Zone classification is based on O-D distance regardless of routing, as zones
+    drive shipper pricing and should not depend on carrier routing decisions.
+
+    Args:
+        origin: Origin facility name
+        dest: Destination facility name
+        facilities: Facility master with coordinates
+        mileage_bands: Mileage bands with zone mappings
+
+    Returns:
+        Zone classification string (e.g., "Zone 1", "Zone 2")
     """
     try:
         # Get facility coordinates
@@ -183,7 +245,7 @@ def calculate_zone_from_distance(origin: str, dest: str, facilities: pd.DataFram
         o_lat, o_lon = fac_lookup.at[origin, 'lat'], fac_lookup.at[origin, 'lon']
         d_lat, d_lon = fac_lookup.at[dest, 'lat'], fac_lookup.at[dest, 'lon']
 
-        # Calculate straight-line distance (no circuity)
+        # Calculate straight-line distance (no circuity factor applied for zone classification)
         raw_distance = haversine_miles(o_lat, o_lon, d_lat, d_lon)
 
         # Look up zone from mileage bands
@@ -203,8 +265,25 @@ def calculate_zone_from_distance(origin: str, dest: str, facilities: pd.DataFram
         return 'unknown'
 
 
-def add_zone(df: pd.DataFrame, facilities: pd.DataFrame, mileage_bands: pd.DataFrame = None) -> pd.DataFrame:
-    """Add zone classification based on origin-destination distance."""
+def add_zone(
+        df: pd.DataFrame,
+        facilities: pd.DataFrame,
+        mileage_bands: pd.DataFrame = None
+) -> pd.DataFrame:
+    """
+    Add zone classification based on origin-destination straight-line distance.
+
+    Direct injection (no middle-mile routing) is always classified as "Zone 0".
+    All other flows classified by O-D distance using mileage_bands zone mapping.
+
+    Args:
+        df: DataFrame with origin, dest, and optionally path_type columns
+        facilities: Facility master data
+        mileage_bands: Mileage bands with zone mappings (optional)
+
+    Returns:
+        df with added 'zone' column
+    """
     if df.empty:
         return df
 
@@ -229,9 +308,27 @@ def add_zone(df: pd.DataFrame, facilities: pd.DataFrame, mileage_bands: pd.DataF
     return df
 
 
-def build_od_selected_outputs(od_selected: pd.DataFrame, facilities: pd.DataFrame,
-                              direct_day: pd.DataFrame, mileage_bands: pd.DataFrame = None) -> pd.DataFrame:
-    """Build OD output table with correct zone information."""
+def build_od_selected_outputs(
+        od_selected: pd.DataFrame,
+        facilities: pd.DataFrame,
+        direct_day: pd.DataFrame,
+        mileage_bands: pd.DataFrame = None
+) -> pd.DataFrame:
+    """
+    Build OD output table with correct zone information.
+
+    Adds zone classification based on O-D straight-line distance for
+    pricing and analysis purposes.
+
+    Args:
+        od_selected: Selected OD paths from optimization
+        facilities: Facility master data
+        direct_day: Direct injection volumes
+        mileage_bands: Mileage bands with zone mappings
+
+    Returns:
+        od_selected with added zone column
+    """
     if od_selected.empty:
         return od_selected
 
@@ -244,11 +341,22 @@ def build_od_selected_outputs(od_selected: pd.DataFrame, facilities: pd.DataFram
 
 
 def build_dwell_hotspots(od_selected: pd.DataFrame) -> pd.DataFrame:
-    """Identify facilities with significant package dwell for operational attention."""
+    """
+    Identify facilities with significant package dwell for operational attention.
+
+    Flags origin facilities where packages are being held for next-day
+    dispatch due to premium economy threshold rounding.
+
+    Args:
+        od_selected: Selected OD paths with packages_dwelled column
+
+    Returns:
+        DataFrame of dwell hotspots sorted by total dwelled packages
+    """
     if od_selected.empty or 'packages_dwelled' not in od_selected.columns:
         return pd.DataFrame()
 
-    # Filter to ODs with meaningful dwell volumes
+    # Filter to ODs with meaningful dwell volumes (>10 packages)
     dwelled = od_selected[od_selected['packages_dwelled'] > 10].copy()
 
     if dwelled.empty:
@@ -268,7 +376,18 @@ def build_dwell_hotspots(od_selected: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_lane_summary(arc_summary: pd.DataFrame) -> pd.DataFrame:
-    """Create lane-level summary aggregating across scenarios and day types."""
+    """
+    Create lane-level summary aggregating across scenarios and day types.
+
+    Useful for identifying high-volume or high-cost lanes for
+    operational focus and carrier negotiations.
+
+    Args:
+        arc_summary: Arc-level data with volumes and costs
+
+    Returns:
+        DataFrame of lane summaries sorted by total cost
+    """
     if arc_summary.empty:
         return pd.DataFrame()
 
@@ -286,11 +405,31 @@ def build_lane_summary(arc_summary: pd.DataFrame) -> pd.DataFrame:
     return lane_summary.sort_values('total_cost', ascending=False)
 
 
-def validate_network_aggregations(od_selected: pd.DataFrame, arc_summary: pd.DataFrame,
-                                  facility_rollup: pd.DataFrame) -> dict:
+def validate_network_aggregations(
+        od_selected: pd.DataFrame,
+        arc_summary: pd.DataFrame,
+        facility_rollup: pd.DataFrame
+) -> dict:
     """
     Validate that aggregate calculations are mathematically consistent.
-    Uses package-weighted averages for fill rates.
+
+    Checks package volume consistency across OD, arc, and facility levels.
+    Validates cost aggregations between OD and arc levels. Uses package-weighted
+    averages for fill rate calculations.
+
+    Validation Checks:
+    1. Total OD packages = Total facility injection packages
+    2. Total OD packages = Total arc packages
+    3. Total OD cost ≈ Total arc cost (within 5%)
+    4. Network fill rates calculated consistently
+
+    Args:
+        od_selected: Selected OD paths
+        arc_summary: Arc-level aggregations
+        facility_rollup: Facility-level aggregations
+
+    Returns:
+        Dictionary with validation results and metrics
     """
     validation_results = {}
 
@@ -304,6 +443,7 @@ def validate_network_aggregations(od_selected: pd.DataFrame, arc_summary: pd.Dat
         validation_results['total_arc_packages'] = total_arc_pkgs
         validation_results['total_facility_injection'] = total_facility_injection
         validation_results['package_consistency'] = abs(total_od_pkgs - total_facility_injection) < 0.01
+        validation_results['arc_package_consistency'] = abs(total_od_pkgs - total_arc_pkgs) < 0.01
 
         # Cost validation
         total_od_cost = od_selected['total_cost'].sum() if 'total_cost' in od_selected.columns else 0

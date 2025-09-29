@@ -1,4 +1,17 @@
-# veho_net/build_structures.py - CORRECTED: Use input parameters only, no hardcoded values
+"""
+Network Structure Generation Module
+
+Builds OD (origin-destination) matrices and generates candidate paths for optimization.
+Enforces business rules around facility types and routing constraints.
+
+Key Business Rules:
+- Only hub/hybrid facilities can originate middle-mile flows
+- Launch facilities only receive direct injection (never send outbound)
+- Secondary hubs must route outbound through parent hub
+- Launch facilities require parent hub as second-to-last stop
+- No circular routing allowed (facility cannot appear twice in path)
+"""
+
 import pandas as pd
 import numpy as np
 from .geo import haversine_miles
@@ -11,8 +24,22 @@ def build_od_and_direct(
         injection_distribution: pd.DataFrame,
 ):
     """
-    Enhanced OD generation ensuring only hub/hybrid facilities can originate middle-mile flows.
-    Launch facilities only receive direct injection, never send outbound flows.
+    Generate OD matrix for middle-mile flows and direct injection volumes.
+
+    Middle-mile flows can only originate from hub/hybrid facilities that are
+    enabled as injection nodes. Launch facilities only receive direct injection.
+
+    Args:
+        facilities: Facility master with type, coordinates, injection flags
+        zips: ZIP code assignments to facilities with population data
+        year_demand: Annual demand forecast with peak/offpeak splits
+        injection_distribution: Injection share allocation across hub facilities
+
+    Returns:
+        Tuple of (od_matrix, direct_injection, destination_population_shares)
+
+    Raises:
+        ValueError: If required columns missing or data inconsistencies found
     """
     # Schema validation
     req_fac = {"facility_name", "type", "lat", "lon", "parent_hub_name", "is_injection_node"}
@@ -42,11 +69,11 @@ def build_od_and_direct(
     fac = facilities.drop_duplicates(subset=["facility_name"]).reset_index(drop=True)
     z = zips[["zip", "facility_name_assigned", "population"]].drop_duplicates(subset=["zip"]).copy()
 
-    # Destination population shares
+    # Calculate destination population shares (all facilities can receive)
     pop_by_dest = z.groupby("facility_name_assigned", as_index=False)["population"].sum()
     pop_by_dest["dest_pop_share"] = pop_by_dest["population"] / pop_by_dest["population"].sum()
 
-    # Demand parameters
+    # Extract demand parameters
     yd = year_demand.copy()
     year_val = int(yd["year"].iloc[0])
     annual_total = float(yd["annual_pkgs"].sum())
@@ -55,7 +82,7 @@ def build_od_and_direct(
     mm_off = float(yd["middle_mile_share_offpeak"].iloc[0])
     mm_peak = float(yd["middle_mile_share_peak"].iloc[0])
 
-    # Direct injection (all facilities can receive direct injection)
+    # Direct injection volumes (all facilities receive proportional to population)
     direct = pop_by_dest.rename(columns={"facility_name_assigned": "dest"}).copy()
     direct["year"] = year_val
     direct["dir_pkgs_offpeak_day"] = annual_total * off_pct * (1.0 - mm_off) * direct["dest_pop_share"]
@@ -64,7 +91,7 @@ def build_od_and_direct(
     # Middle-mile injection: ONLY hub/hybrid facilities can be origins
     inj = injection_distribution[["facility_name", "absolute_share"]].copy()
 
-    # Join facilities data and filter
+    # Join facilities data and filter to valid origins
     inj = inj.merge(
         fac[["facility_name", "is_injection_node", "type", "parent_hub_name"]],
         on="facility_name",
@@ -75,10 +102,11 @@ def build_od_and_direct(
     if inj["is_injection_node"].isna().any():
         missing = inj.loc[inj["is_injection_node"].isna(), "facility_name"].unique().tolist()
         raise ValueError(
-            f"injection_distribution.facility_name not found in facilities: {missing[:10]}{'...' if len(missing) > 10 else ''}"
+            f"injection_distribution.facility_name not found in facilities: "
+            f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
         )
 
-    # Critical constraint: Only hub/hybrid facilities can originate middle-mile flows
+    # Business rule: Only hub/hybrid facilities can originate middle-mile flows
     valid_origin_types = ['hub', 'hybrid']
     inj = inj[
         (inj["is_injection_node"].astype(int) == 1) &
@@ -97,7 +125,7 @@ def build_od_and_direct(
     inj["inj_share"] = inj["abs_w"] / total_w
     inj = inj[["facility_name", "inj_share"]].rename(columns={"facility_name": "origin"})
 
-    # Build middle-mile OD matrix
+    # Build middle-mile OD matrix (cross-product of injection origins and destinations)
     dest2 = pop_by_dest.rename(columns={"facility_name_assigned": "dest"})[["dest", "dest_pop_share"]]
     grid = inj.assign(_k=1).merge(dest2.assign(_k=1), on="_k").drop(columns="_k")
 
@@ -105,7 +133,7 @@ def build_od_and_direct(
     od["pkgs_offpeak_day"] = annual_total * off_pct * mm_off * od["inj_share"] * od["dest_pop_share"]
     od["pkgs_peak_day"] = annual_total * peak_pct * mm_peak * od["inj_share"] * od["dest_pop_share"]
 
-    # Remove O==D pairs (handled by direct injection)
+    # Remove O==D pairs (handled by direct injection, not middle-mile routing)
     od = od[od["origin"] != od["dest"]].reset_index(drop=True)
 
     return od, direct, pop_by_dest
@@ -115,11 +143,30 @@ def candidate_paths(
         od: pd.DataFrame,
         facilities: pd.DataFrame,
         mileage_bands: pd.DataFrame,
-        around_factor: float = None,  # No hardcoded default - must come from input
+        around_factor: float = None,
 ) -> pd.DataFrame:
     """
-    Path generation with hub rules and circular routing prevention.
-    around_factor must be provided from run_settings.path_around_the_world_factor
+    Generate candidate paths for each OD pair with routing constraint enforcement.
+
+    Routing Rules:
+    1. Secondary hubs MUST route outbound through parent hub
+    2. Launch facility destinations MUST have parent hub as second-to-last stop
+    3. Only hub/hybrid facilities can be intermediate stops
+    4. No circular routing (facility cannot appear twice in path)
+    5. Paths cannot exceed around_factor × straight-line O-D distance
+
+    Args:
+        od: OD matrix with origin, dest, package volumes
+        facilities: Facility master with type, parent relationships
+        mileage_bands: Distance-based parameters (used for around_factor check)
+        around_factor: Maximum path distance as multiple of straight-line distance.
+                      Must be provided from run_settings.path_around_the_world_factor
+
+    Returns:
+        DataFrame of candidate paths with path_nodes, path_str, path_type
+
+    Raises:
+        ValueError: If around_factor not provided from run_settings
     """
     if around_factor is None:
         raise ValueError("around_factor must be provided from run_settings.path_around_the_world_factor")
@@ -134,6 +181,7 @@ def candidate_paths(
     hubs_enabled = fac.index[fac["type"].isin(valid_intermediate_types)]
 
     def raw_distance(o, d):
+        """Calculate straight-line haversine distance between two facilities."""
         return haversine_miles(
             float(fac.at[o, "lat"]), float(fac.at[o, "lon"]),
             float(fac.at[d, "lat"]), float(fac.at[d, "lon"])
@@ -162,51 +210,55 @@ def candidate_paths(
             launch_facilities.add(facility_name)
 
     def is_secondary_hub(facility):
-        """Check if facility is a secondary hub (must route outbound through parent)"""
+        """Check if facility is a secondary hub (must route outbound through parent)."""
         return facility in secondary_hubs
 
     def get_launch_parent(launch_facility):
-        """Get the required parent hub for a launch facility"""
+        """Get the required parent hub for a launch facility."""
         return parent_map.get(launch_facility, launch_facility)
 
     def build_path_with_constraints(origin, dest, od_volume):
         """
         Build valid paths respecting routing rules and preventing circular routing.
+
+        Enforces:
+        - Secondary hub outbound routing through parent
+        - Launch facility inbound routing through parent
+        - No circular routing (facility appears max once)
+        - Distance reasonableness via around_factor
         """
         paths = []
 
-        # Determine destination constraint first (RULE 2)
+        # Determine destination constraint first (RULE 2: Launch facility parent requirement)
         if dest in launch_facilities:
-            # Launch facility: parent hub must be second-to-last
             dest_parent = get_launch_parent(dest)
             if dest_parent == dest:
                 required_end = [dest]
             else:
                 required_end = [dest_parent, dest]
         else:
-            # Hub/hybrid destination: flexible inbound
+            # Hub/hybrid destination: flexible inbound routing
             required_end = [dest]
 
-        # CRITICAL FIX: Check for circular routing
+        # Check for circular routing before building paths
         if origin in required_end:
-            # Circular route detected: just go direct
+            # Circular route detected: origin already in destination chain, just go direct
             paths.append([origin, dest])
             return paths
 
-        # Determine origin constraint (RULE 1)
+        # Determine origin constraint (RULE 1: Secondary hub parent requirement)
         if is_secondary_hub(origin):
-            # Secondary hub: MUST route outbound through parent
             origin_parent = parent_map[origin]
             if origin_parent == origin:
                 required_start = [origin]
             else:
-                # Additional check: Don't route through parent if it creates circular routing
+                # Verify no circular routing through parent
                 if origin_parent in required_end or origin in required_end:
                     required_start = [origin]
                 else:
                     required_start = [origin, origin_parent]
         else:
-            # Primary hub or launch: flexible outbound
+            # Primary hub or launch: flexible outbound routing
             required_start = [origin]
 
         # Build paths connecting required start and end segments
@@ -216,7 +268,7 @@ def candidate_paths(
         if start_node == end_node:
             # Direct connection possible
             combined_path = required_start + required_end[1:]
-            if len(combined_path) == len(set(combined_path)):
+            if len(combined_path) == len(set(combined_path)):  # No duplicates
                 paths.append(combined_path)
         else:
             # Need intermediate connection(s)
@@ -227,18 +279,25 @@ def candidate_paths(
             if len(combined_path) == len(set(combined_path)):
                 paths.append(combined_path)
 
-            # Option 2: One intermediate hub (for consolidation)
-            if od_volume < 1500 and len(hubs_enabled) > 0:
-                candidate_intermediates = [h for h in hubs_enabled
-                                           if h not in required_start and h not in required_end]
+            # Option 2: One intermediate hub (allows MILP to optimize consolidation decision)
+            if len(hubs_enabled) > 0:
+                candidate_intermediates = [
+                    h for h in hubs_enabled
+                    if h not in required_start and h not in required_end
+                ]
 
                 if candidate_intermediates:
-                    best_intermediate = min(candidate_intermediates,
-                                            key=lambda h: raw_distance(start_node, h) + raw_distance(h, end_node))
+                    best_intermediate = min(
+                        candidate_intermediates,
+                        key=lambda h: raw_distance(start_node, h) + raw_distance(h, end_node)
+                    )
 
-                    intermediate_distance = (raw_distance(start_node, best_intermediate) +
-                                             raw_distance(best_intermediate, end_node))
+                    intermediate_distance = (
+                            raw_distance(start_node, best_intermediate) +
+                            raw_distance(best_intermediate, end_node)
+                    )
 
+                    # Check around_factor constraint (path cannot be too circuitous)
                     if intermediate_distance <= around_factor * direct_distance:
                         intermediate_path = required_start + [best_intermediate] + required_end
                         if len(intermediate_path) == len(set(intermediate_path)) and intermediate_path not in paths:
@@ -289,19 +348,37 @@ def candidate_paths(
     if df.empty:
         return df
 
-    # Final validation: ensure no launch facilities as intermediate stops
+    # Final validation: Comprehensive circular routing and launch facility checks
     def validate_path_nodes(path_nodes):
+        """
+        Validate path does not violate routing rules.
+
+        Checks:
+        1. No launch facilities as intermediate stops
+        2. No facility appears twice (circular routing)
+        """
+        # Check for launch facilities in intermediate positions
         for i, node in enumerate(path_nodes[1:-1], 1):
             if node in fac.index and fac.at[node, "type"] == "launch":
                 return False
+
+        # Check for circular routing (facility appears twice)
+        if len(path_nodes) != len(set(path_nodes)):
+            return False
+
         return True
 
     initial_count = len(df)
     df = df[df["path_nodes"].apply(validate_path_nodes)].reset_index(drop=True)
 
+    removed_count = initial_count - len(df)
+    if removed_count > 0:
+        print(f"  Removed {removed_count} invalid paths (circular routing or launch facility violations)")
+
     # Remove exact duplicates
     df["path_nodes_tuple"] = df["path_nodes"].apply(tuple)
     df = df.drop_duplicates(subset=["origin", "dest", "path_nodes_tuple"]).drop(
-        columns=["path_nodes_tuple"]).reset_index(drop=True)
+        columns=["path_nodes_tuple"]
+    ).reset_index(drop=True)
 
     return df.drop(columns=["od_volume", "enforced_secondary_outbound", "enforced_launch_parent"])
