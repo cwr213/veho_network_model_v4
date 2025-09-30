@@ -270,7 +270,7 @@ def solve_network_optimization(
 
     selected_paths = _build_selected_paths_dataframe(
         chosen_idx, path_od_data, path_arcs, arc_meta, arc_trucks, arc_pkgs,
-        sort_decisions, cost_params, facilities, solver
+        sort_decisions, cost_params, facilities, package_mix, container_params, solver
     )
 
     arc_summary = _build_arc_summary_dataframe(
@@ -331,6 +331,10 @@ def _calculate_arc_cost(
     lat2, lon2 = fac.at[v, "lat"], fac.at[v, "lon"]
 
     raw = haversine_miles(lat1, lon1, lat2, lon2)
+
+    if u == v:
+        return 0.0, 0.0, 0.0
+
     fixed, var, circuit, mph = band_lookup(raw, mileage_bands)
     dist = raw * circuit
 
@@ -375,9 +379,7 @@ def _calculate_processing_cost(
         package_mix: pd.DataFrame,
         container_params: pd.DataFrame
 ) -> float:
-    """
-    Calculate per-package processing cost based on sort level and strategy.
-    """
+    """Calculate per-package processing cost based on sort level and strategy."""
     path_nodes = path_data['path_nodes']
     origin = path_data['origin']
     dest = path_data['dest']
@@ -648,6 +650,8 @@ def _build_selected_paths_dataframe(
         sort_decisions: Dict,
         cost_params: CostParameters,
         facilities: pd.DataFrame,
+        package_mix: pd.DataFrame,
+        container_params: pd.DataFrame,
         solver: cp_model.CpSolver
 ) -> pd.DataFrame:
     """Build selected paths DataFrame with costs and metrics."""
@@ -672,7 +676,7 @@ def _build_selected_paths_dataframe(
 
         processing_cost_per_pkg = _calculate_processing_cost(
             path_data, chosen_sort_level, path_data['effective_strategy'],
-            cost_params, facilities, None, None
+            cost_params, facilities, package_mix, container_params
         )
         total_processing_cost = processing_cost_per_pkg * path_data['pkgs_day']
 

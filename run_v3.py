@@ -1,13 +1,5 @@
 """
 Main Execution Script for Network Optimization v3
-
-Orchestrates complete workflow:
-1. Load and validate inputs
-2. Generate OD matrices and candidate paths
-3. Run MILP optimization
-4. Calculate metrics and generate outputs
-
-Run with: python run_v3.py --input data/input.xlsx --output_dir outputs/
 """
 
 import argparse
@@ -28,6 +20,7 @@ from veho_net.reporting_v3 import (
     calculate_hourly_throughput,
     add_zone_classification,
     build_path_steps,
+    build_sort_summary,
     validate_network_aggregations
 )
 from veho_net.write_outputs_v3 import (
@@ -38,20 +31,13 @@ from veho_net.write_outputs_v3 import (
 
 
 def main(input_path: str, output_dir: str):
-    """
-    Main execution function for network optimization.
-
-    Args:
-        input_path: Path to input Excel file
-        output_dir: Directory for output files
-    """
+    """Main execution function for network optimization."""
     start_time = datetime.now()
 
     print("=" * 70)
     print("VEHO NETWORK OPTIMIZATION v3")
     print("=" * 70)
 
-    # Setup paths
     input_path = Path(input_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
@@ -59,7 +45,6 @@ def main(input_path: str, output_dir: str):
     print(f"\n📁 Input: {input_path.name}")
     print(f"📁 Output: {output_dir}")
 
-    # Load and validate inputs
     print(f"\n{'=' * 70}")
     print("LOADING INPUTS")
     print("=" * 70)
@@ -67,7 +52,6 @@ def main(input_path: str, output_dir: str):
     dfs = load_workbook(input_path)
     validate_inputs(dfs)
 
-    # Parse parameters
     print(f"\n{'=' * 70}")
     print("PARSING PARAMETERS")
     print("=" * 70)
@@ -76,7 +60,6 @@ def main(input_path: str, output_dir: str):
     cost_params_dict = params_to_dict(dfs["cost_params"])
     run_settings_dict = params_to_dict(dfs["run_settings"])
 
-    # Create typed parameter objects
     cost_params = CostParameters(
         injection_sort_cost_per_pkg=float(cost_params_dict["injection_sort_cost_per_pkg"]),
         intermediate_sort_cost_per_pkg=float(cost_params_dict["intermediate_sort_cost_per_pkg"]),
@@ -105,7 +88,6 @@ def main(input_path: str, output_dir: str):
         print("\n✅ Sort level optimization (region/market/sort_group) ENABLED")
         print("   Model will optimize sort level per OD pair with capacity constraints")
 
-    # Process scenarios
     print(f"\n{'=' * 70}")
     print(f"PROCESSING {len(dfs['scenarios'])} SCENARIOS")
     print("=" * 70)
@@ -124,7 +106,6 @@ def main(input_path: str, output_dir: str):
         print("─" * 70)
 
         try:
-            # Build OD matrix
             print("\n1. Building OD matrix...")
             year_demand = dfs["demand"].query("year == @year").copy()
 
@@ -139,7 +120,6 @@ def main(input_path: str, output_dir: str):
                 dfs["injection_distribution"]
             )
 
-            # Set package column based on day type
             od_col = "pkgs_offpeak_day" if day_type == "offpeak" else "pkgs_peak_day"
             direct_col = "dir_pkgs_offpeak_day" if day_type == "offpeak" else "dir_pkgs_peak_day"
 
@@ -152,10 +132,8 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Generated {len(od)} OD pairs")
 
-            # Set direct injection column
             direct_day["dir_pkgs_day"] = direct_day[direct_col]
 
-            # Generate candidate paths
             print("\n2. Generating candidate paths...")
             paths = candidate_paths(
                 od,
@@ -168,7 +146,6 @@ def main(input_path: str, output_dir: str):
                 print(f"  ❌ No valid paths generated")
                 continue
 
-            # Merge package volumes
             paths = paths.merge(
                 od[['origin', 'dest', 'pkgs_day']],
                 on=['origin', 'dest'],
@@ -181,7 +158,6 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Generated {len(paths)} candidate paths")
 
-            # Run MILP optimization
             print("\n3. Running MILP optimization...")
             od_selected, arc_summary, network_kpis, sort_summary = solve_network_optimization(
                 paths,
@@ -201,17 +177,14 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Selected {len(od_selected)} optimal paths")
 
-            # Generate reporting outputs
             print("\n4. Generating outputs...")
 
-            # Add zone classification
             od_selected = add_zone_classification(
                 od_selected,
                 dfs["facilities"],
                 dfs["mileage_bands"]
             )
 
-            # Build path steps
             path_steps = build_path_steps(
                 od_selected,
                 dfs["facilities"],
@@ -219,14 +192,15 @@ def main(input_path: str, output_dir: str):
                 timing_params_dict
             )
 
-            # Build facility rollup
             facility_rollup = build_facility_rollup(
                 od_selected,
                 direct_day,
                 arc_summary,
                 dfs["package_mix"],
                 dfs["container_params"],
-                global_strategy.value
+                global_strategy.value,
+                dfs["facilities"],
+                cost_params
             )
 
             facility_rollup = calculate_hourly_throughput(
@@ -234,7 +208,6 @@ def main(input_path: str, output_dir: str):
                 timing_params_dict
             )
 
-            # Validate aggregations
             validation_results = validate_network_aggregations(
                 od_selected,
                 arc_summary,
@@ -244,7 +217,6 @@ def main(input_path: str, output_dir: str):
             if not validation_results.get('package_consistency', True):
                 print("  ⚠️  Warning: Package volume inconsistency detected")
 
-            # Calculate KPIs
             total_cost = od_selected["total_cost"].sum()
             total_pkgs = od_selected["pkgs_day"].sum()
             cost_per_pkg = total_cost / max(total_pkgs, 1)
@@ -261,7 +233,6 @@ def main(input_path: str, output_dir: str):
                 **network_kpis
             })
 
-            # Build scenario summary
             scenario_summary = pd.DataFrame([
                 {"key": "scenario_id", "value": scenario_id},
                 {"key": "year", "value": year},
@@ -272,12 +243,21 @@ def main(input_path: str, output_dir: str):
                 {"key": "total_packages", "value": total_pkgs}
             ])
 
-            # Write output file
             output_filename = OUTPUT_FILE_TEMPLATE.format(
                 scenario_id=scenario_id,
                 strategy=global_strategy.value
             )
             output_path = output_dir / output_filename
+
+            if enable_sort_opt and not sort_summary.empty:
+                sort_analysis = build_sort_summary(
+                    od_selected,
+                    {(row['scenario_id'], row['origin'], row['dest'], row['day_type']): row['chosen_sort_level']
+                     for _, row in od_selected.iterrows()},
+                    dfs["facilities"]
+                )
+            else:
+                sort_analysis = sort_summary
 
             write_success = write_workbook(
                 output_path,
@@ -287,7 +267,7 @@ def main(input_path: str, output_dir: str):
                 facility_rollup,
                 arc_summary,
                 kpis,
-                sort_summary
+                sort_analysis
             )
 
             if write_success:
@@ -298,7 +278,6 @@ def main(input_path: str, output_dir: str):
                 print(f"  ❌ Failed to write output file")
                 continue
 
-            # Store results for comparison
             all_results.append(kpis.to_dict())
 
         except Exception as e:
@@ -307,13 +286,11 @@ def main(input_path: str, output_dir: str):
             traceback.print_exc()
             continue
 
-    # Write comparison outputs
     if len(all_results) > 1:
         print(f"\n{'=' * 70}")
         print("GENERATING COMPARISON REPORTS")
         print("=" * 70)
 
-        # Comparison workbook
         compare_path = output_dir / "comparison.xlsx"
         compare_success = write_comparison_workbook(
             compare_path,
@@ -325,7 +302,6 @@ def main(input_path: str, output_dir: str):
             created_files.append("comparison.xlsx")
             print(f"  ✓ Created: comparison.xlsx")
 
-        # Executive summary
         exec_path = output_dir / "executive_summary.xlsx"
         exec_success = write_executive_summary(
             exec_path,
@@ -337,7 +313,6 @@ def main(input_path: str, output_dir: str):
             created_files.append("executive_summary.xlsx")
             print(f"  ✓ Created: executive_summary.xlsx")
 
-    # Final summary
     elapsed = datetime.now() - start_time
 
     print(f"\n{'=' * 70}")
@@ -377,6 +352,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ FATAL ERROR: {e}")
         import traceback
-
         traceback.print_exc()
         exit(1)
