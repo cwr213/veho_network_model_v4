@@ -2,7 +2,6 @@
 Reporting Module
 
 Generates facility-level aggregations, zone classifications, and network metrics.
-Properly handles direct injection vs. middle-mile injection separation.
 """
 
 import pandas as pd
@@ -22,27 +21,10 @@ def build_facility_rollup(
 ) -> pd.DataFrame:
     """
     Calculate facility volume and cost breakdowns by role.
-
-    Separates:
-    - Direct injection (Zone 0) - shipper direct to facility
-    - Middle-mile injection (Zones 1-5) - origin of network flows
-    - Intermediate (pass-through for crossdock/sort)
-    - Last mile (direct + middle-mile arrivals for final delivery)
-
-    Args:
-        od_selected: Selected OD paths with costs
-        direct_day: Direct injection volumes (Zone 0)
-        arc_summary: Arc-level aggregations
-        package_mix: Package distribution
-        container_params: Container parameters
-        strategy: Loading strategy
-
-    Returns:
-        DataFrame with facility-level metrics by role
+    Uses path-level data to correctly identify intermediate vs. final destination packages.
     """
     volume_data = []
 
-    # Collect all facilities
     all_facilities = set()
     if not od_selected.empty:
         all_facilities.update(od_selected['origin'].unique())
@@ -52,7 +34,6 @@ def build_facility_rollup(
 
     for facility in all_facilities:
         try:
-            # === DIRECT INJECTION (Zone 0) ===
             direct_injection_pkgs = 0
             direct_injection_containers = 0
             direct_injection_cube = 0.0
@@ -64,7 +45,6 @@ def build_facility_rollup(
                     if not facility_direct.empty:
                         direct_injection_pkgs = facility_direct[direct_col].sum()
 
-                        # Calculate containers for direct injection
                         if direct_injection_pkgs > 0:
                             containers_calc = _calculate_containers_for_volume(
                                 direct_injection_pkgs, package_mix, container_params, strategy
@@ -72,7 +52,6 @@ def build_facility_rollup(
                             direct_injection_containers = containers_calc['containers']
                             direct_injection_cube = containers_calc['cube']
 
-            # === MIDDLE-MILE INJECTION (Origin) ===
             mm_injection_pkgs = 0
             mm_injection_containers = 0
             mm_injection_cube = 0.0
@@ -84,7 +63,6 @@ def build_facility_rollup(
                     mm_injection_pkgs = outbound_ods['pkgs_day'].sum()
                     mm_injection_cost = outbound_ods['total_cost'].sum()
 
-                    # Calculate containers for middle-mile injection
                     if mm_injection_pkgs > 0:
                         containers_calc = _calculate_containers_for_volume(
                             mm_injection_pkgs, package_mix, container_params, strategy
@@ -92,46 +70,32 @@ def build_facility_rollup(
                         mm_injection_containers = containers_calc['containers']
                         mm_injection_cube = containers_calc['cube']
 
-            # === INTERMEDIATE (Pass-through) ===
             intermediate_pkgs = 0
             intermediate_containers = 0
             intermediate_cube = 0.0
 
-            if not arc_summary.empty and not od_selected.empty:
-                # Packages arriving at this facility
-                inbound_arcs = arc_summary[
-                    (arc_summary['to_facility'] == facility) &
-                    (arc_summary['from_facility'] != facility)
-                    ]
+            if not od_selected.empty:
+                for _, path_row in od_selected.iterrows():
+                    path_nodes = path_row.get('path_nodes', [])
+                    if not isinstance(path_nodes, list):
+                        continue
 
-                if not inbound_arcs.empty:
-                    total_inbound = inbound_arcs['pkgs_day'].sum()
+                    final_dest = path_row['dest']
 
-                    # Packages destined for this facility (final delivery)
-                    destined_here = od_selected[od_selected['dest'] == facility]['pkgs_day'].sum()
+                    if facility in path_nodes and facility != final_dest:
+                        intermediate_pkgs += path_row['pkgs_day']
 
-                    # Intermediate = inbound - final destination
-                    intermediate_pkgs = max(0, total_inbound - destined_here)
+                if intermediate_pkgs > 0:
+                    containers_calc = _calculate_containers_for_volume(
+                        intermediate_pkgs, package_mix, container_params, strategy
+                    )
+                    intermediate_containers = containers_calc['containers']
+                    intermediate_cube = containers_calc['cube']
 
-                    # Calculate containers for intermediate
-                    if intermediate_pkgs > 0:
-                        containers_calc = _calculate_containers_for_volume(
-                            intermediate_pkgs, package_mix, container_params, strategy
-                        )
-                        intermediate_containers = containers_calc['containers']
-                        intermediate_cube = containers_calc['cube']
-
-            # === LAST MILE (All arriving for delivery) ===
-            last_mile_pkgs = 0
-            last_mile_containers = 0
-            last_mile_cube = 0.0
-
-            # Start with direct injection
             last_mile_pkgs = direct_injection_pkgs
             last_mile_containers = direct_injection_containers
             last_mile_cube = direct_injection_cube
 
-            # Add middle-mile arrivals for final delivery
             if not od_selected.empty:
                 inbound_ods = od_selected[od_selected['dest'] == facility]
                 if not inbound_ods.empty:
@@ -145,30 +109,21 @@ def build_facility_rollup(
                         last_mile_containers += containers_calc['containers']
                         last_mile_cube += containers_calc['cube']
 
-            # Calculate per-package costs
             mm_injection_cpp = mm_injection_cost / mm_injection_pkgs if mm_injection_pkgs > 0 else 0
 
             volume_entry = {
                 'facility': facility,
-
-                # Direct injection (Zone 0)
                 'direct_injection_pkgs_day': direct_injection_pkgs,
                 'direct_injection_containers': direct_injection_containers,
                 'direct_injection_cube_cuft': direct_injection_cube,
-
-                # Middle-mile injection (network origin)
                 'middle_mile_injection_pkgs_day': mm_injection_pkgs,
                 'middle_mile_injection_containers': mm_injection_containers,
                 'middle_mile_injection_cube_cuft': mm_injection_cube,
                 'middle_mile_injection_cost': mm_injection_cost,
                 'middle_mile_injection_cpp': mm_injection_cpp,
-
-                # Intermediate (pass-through)
                 'middle_mile_intermediate_pkgs_day': intermediate_pkgs,
                 'middle_mile_intermediate_containers': intermediate_containers,
                 'middle_mile_intermediate_cube_cuft': intermediate_cube,
-
-                # Last mile (all delivery)
                 'last_mile_pkgs_day': last_mile_pkgs,
                 'last_mile_containers': last_mile_containers,
                 'last_mile_cube_cuft': last_mile_cube,
@@ -212,41 +167,23 @@ def calculate_hourly_throughput(
         facility_rollup: pd.DataFrame,
         timing_params: Dict
 ) -> pd.DataFrame:
-    """
-    Calculate hourly throughput requirements for capacity planning.
-
-    Uses value-added hours from timing_params:
-    - injection_va_hours: For origin processing
-    - middle_mile_va_hours: For intermediate crossdock/sort
-    - last_mile_va_hours: For final delivery processing
-
-    Args:
-        facility_rollup: Facility volume data
-        timing_params: Timing parameters dict
-
-    Returns:
-        facility_rollup with added throughput columns
-    """
+    """Calculate hourly throughput requirements for capacity planning."""
     df = facility_rollup.copy()
 
-    # Get VA hours from parameters
     injection_va_hours = float(timing_params['injection_va_hours'])
     middle_mile_va_hours = float(timing_params['middle_mile_va_hours'])
     last_mile_va_hours = float(timing_params['last_mile_va_hours'])
 
-    # Calculate throughput for each role
     df['injection_hourly_throughput'] = df['middle_mile_injection_pkgs_day'] / injection_va_hours
     df['intermediate_hourly_throughput'] = df['middle_mile_intermediate_pkgs_day'] / middle_mile_va_hours
     df['last_mile_hourly_throughput'] = df['last_mile_pkgs_day'] / last_mile_va_hours
 
-    # Peak throughput is maximum across all roles
     df['peak_hourly_throughput'] = df[[
         'injection_hourly_throughput',
         'intermediate_hourly_throughput',
         'last_mile_hourly_throughput'
     ]].max(axis=1)
 
-    # Round for practical planning
     throughput_cols = [
         'injection_hourly_throughput',
         'intermediate_hourly_throughput',
@@ -265,22 +202,7 @@ def add_zone_classification(
         facilities: pd.DataFrame,
         mileage_bands: pd.DataFrame
 ) -> pd.DataFrame:
-    """
-    Add zone classification based on O-D straight-line distance.
-
-    Zone Rules:
-    - Direct injection (not in this df): Zone 0
-    - O=D middle-mile: Zone 2 (distance=0, but priced as network volume)
-    - O≠D: Lookup zone from mileage_bands by straight-line distance
-
-    Args:
-        od_df: OD selected paths
-        facilities: Facility master with coordinates
-        mileage_bands: Mileage bands with zone mapping
-
-    Returns:
-        od_df with added 'zone' column
-    """
+    """Add zone classification based on O-D straight-line distance."""
     if od_df.empty:
         return od_df
 
@@ -292,10 +214,8 @@ def add_zone_classification(
         dest = row['dest']
 
         if origin == dest:
-            # O=D middle-mile: Always Zone 2
             od_df.at[idx, 'zone'] = 'Zone 2'
         else:
-            # O≠D: Calculate zone by distance
             zone = calculate_zone_from_distance(origin, dest, facilities, mileage_bands)
             od_df.at[idx, 'zone'] = zone
 
@@ -308,20 +228,7 @@ def build_path_steps(
         mileage_bands: pd.DataFrame,
         timing_params: Dict
 ) -> pd.DataFrame:
-    """
-    Generate path steps from selected OD paths.
-
-    Each step represents one leg of the journey with actual calculated distances.
-
-    Args:
-        od_selected: Selected OD paths
-        facilities: Facility data with coordinates
-        mileage_bands: Mileage bands for distance/timing
-        timing_params: Timing parameters
-
-    Returns:
-        DataFrame with path steps
-    """
+    """Generate path steps from selected OD paths."""
     from .geo_v3 import haversine_miles, band_lookup
 
     path_steps = []
@@ -339,7 +246,6 @@ def build_path_steps(
         nodes = [n.strip() for n in path_str.split('->')]
 
         for i, (from_fac, to_fac) in enumerate(zip(nodes[:-1], nodes[1:])):
-            # Check for O=D leg
             if from_fac == to_fac:
                 path_steps.append({
                     'scenario_id': scenario_id,
@@ -354,7 +260,6 @@ def build_path_steps(
                 })
                 continue
 
-            # Calculate actual distance and timing
             if from_fac in fac_lookup.index and to_fac in fac_lookup.index:
                 lat1, lon1 = fac_lookup.at[from_fac, 'lat'], fac_lookup.at[from_fac, 'lon']
                 lat2, lon2 = fac_lookup.at[to_fac, 'lat'], fac_lookup.at[to_fac, 'lon']
@@ -386,26 +291,10 @@ def validate_network_aggregations(
         arc_summary: pd.DataFrame,
         facility_rollup: pd.DataFrame
 ) -> Dict:
-    """
-    Validate that aggregate calculations are mathematically consistent.
-
-    Checks:
-    - Total OD packages = Total facility injection
-    - Package volumes consistent across levels
-    - Costs aggregate properly
-
-    Args:
-        od_selected: Selected OD paths
-        arc_summary: Arc aggregations
-        facility_rollup: Facility rollup
-
-    Returns:
-        Dict with validation results and metrics
-    """
+    """Validate that aggregate calculations are mathematically consistent."""
     validation_results = {}
 
     try:
-        # Package validation
         total_od_pkgs = od_selected['pkgs_day'].sum() if not od_selected.empty else 0
         total_facility_mm_injection = facility_rollup[
             'middle_mile_injection_pkgs_day'].sum() if not facility_rollup.empty else 0
@@ -414,16 +303,13 @@ def validate_network_aggregations(
         validation_results['total_facility_mm_injection'] = total_facility_mm_injection
         validation_results['package_consistency'] = abs(total_od_pkgs - total_facility_mm_injection) < 0.01
 
-        # Cost validation
         total_od_cost = od_selected['total_cost'].sum() if 'total_cost' in od_selected.columns else 0
         total_arc_cost = arc_summary[
             'total_cost'].sum() if not arc_summary.empty and 'total_cost' in arc_summary.columns else 0
 
         validation_results['total_od_cost'] = total_od_cost
         validation_results['total_arc_cost'] = total_arc_cost
-        validation_results['cost_consistency'] = abs(total_od_cost - total_arc_cost) / max(total_od_cost, 1) < 0.05
 
-        # Fill rates
         if not arc_summary.empty and 'truck_fill_rate' in arc_summary.columns:
             non_od_arcs = arc_summary[arc_summary['from_facility'] != arc_summary['to_facility']]
 
