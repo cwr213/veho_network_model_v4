@@ -80,7 +80,6 @@ def main(input_path: str, output_dir: str):
     cost_params = CostParameters(
         injection_sort_cost_per_pkg=float(cost_params_dict["injection_sort_cost_per_pkg"]),
         intermediate_sort_cost_per_pkg=float(cost_params_dict["intermediate_sort_cost_per_pkg"]),
-        parent_hub_sort_cost_per_pkg=float(cost_params_dict["parent_hub_sort_cost_per_pkg"]),
         last_mile_sort_cost_per_pkg=float(cost_params_dict["last_mile_sort_cost_per_pkg"]),
         last_mile_delivery_cost_per_pkg=float(cost_params_dict["last_mile_delivery_cost_per_pkg"]),
         container_handling_cost=float(cost_params_dict["container_handling_cost"]),
@@ -103,9 +102,8 @@ def main(input_path: str, output_dir: str):
     print(f"✓ Path around factor: {around_factor}")
 
     if enable_sort_opt:
-        print("\n⚠️  WARNING: Sort optimization requested but not yet implemented in v3")
-        print("   Continuing with standard optimization...")
-        enable_sort_opt = False
+        print("\n✅ Sort level optimization (region/market/sort_group) ENABLED")
+        print("   Model will optimize sort level per OD pair with capacity constraints")
 
     # Process scenarios
     print(f"\n{'=' * 70}")

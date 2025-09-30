@@ -61,7 +61,6 @@ class CostParameters:
     # Sort/processing costs (per package)
     injection_sort_cost_per_pkg: float
     intermediate_sort_cost_per_pkg: float
-    parent_hub_sort_cost_per_pkg: float
     last_mile_sort_cost_per_pkg: float
     last_mile_delivery_cost_per_pkg: float
 
@@ -120,7 +119,6 @@ class RunSettings:
     sla_target_days: int  # Target service level (days)
     path_around_the_world_factor: float  # Max path distance vs. straight-line
     enable_sort_optimization: bool  # Enable multi-level sort optimization
-    enforce_parent_hub_over_miles: float  # Distance threshold for parent hub routing
 
     def __post_init__(self):
         """Validate run settings."""
@@ -129,9 +127,6 @@ class RunSettings:
 
         if self.sla_target_days < 1:
             raise ValueError(f"sla_target_days must be >= 1, got {self.sla_target_days}")
-
-        if self.enforce_parent_hub_over_miles < 0:
-            raise ValueError(f"enforce_parent_hub_over_miles must be >= 0, got {self.enforce_parent_hub_over_miles}")
 
 
 # Valid day types

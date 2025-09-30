@@ -274,7 +274,6 @@ def _validate_cost_params(df: pd.DataFrame) -> None:
     required_keys = {
         "injection_sort_cost_per_pkg",
         "intermediate_sort_cost_per_pkg",
-        "parent_hub_sort_cost_per_pkg",
         "last_mile_sort_cost_per_pkg",
         "last_mile_delivery_cost_per_pkg",
         "container_handling_cost",
@@ -374,8 +373,7 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
         "load_strategy",
         "sla_target_days",
         "path_around_the_world_factor",
-        "enable_sort_optimization",
-        "enforce_parent_hub_over_miles"
+        "enable_sort_optimization"
     }
 
     missing = required_keys - set(df["key"])
