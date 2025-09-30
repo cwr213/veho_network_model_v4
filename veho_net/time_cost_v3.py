@@ -20,7 +20,7 @@ import numpy as np
 from datetime import datetime, timedelta, time
 import pytz
 from typing import Tuple, Dict, Optional, List
-from .geo import haversine_miles, band_lookup
+from .geo_v3 import haversine_miles, band_lookup
 
 
 def _parse_hhmm(val) -> time:
@@ -459,7 +459,7 @@ def path_cost_and_time(
     """
     DEPRECATED: Legacy path-level cost and time calculation.
 
-    This function is retained ONLY for testing purposes (test_strategy_costs.py).
+    This function is retained ONLY for testing purposes .
     Production code uses MILP solver (solve_arc_pooled_path_selection) for all
     cost calculations with proper arc-level aggregation.
 
