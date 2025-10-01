@@ -79,10 +79,12 @@ def main(input_path: str, output_dir: str):
 
     enable_sort_opt = bool(run_settings_dict.get("enable_sort_optimization", False))
     around_factor = float(run_settings_dict["path_around_the_world_factor"])
+    run_id = run_settings_dict.get("run_id", datetime.now().strftime("%Y%m%d_%H%M%S"))
 
     print(f"✓ Global strategy: {global_strategy.value}")
     print(f"✓ Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
     print(f"✓ Path around factor: {around_factor}")
+    print(f"✓ Run ID: {run_id}")
 
     if enable_sort_opt:
         print("\n✅ Sort level optimization (region/market/sort_group) ENABLED")
@@ -291,7 +293,7 @@ def main(input_path: str, output_dir: str):
         print("GENERATING COMPARISON REPORTS")
         print("=" * 70)
 
-        compare_path = output_dir / "comparison.xlsx"
+        compare_path = output_dir / f"comparison_{run_id}.xlsx"
         compare_success = write_comparison_workbook(
             compare_path,
             all_results,
@@ -299,10 +301,10 @@ def main(input_path: str, output_dir: str):
         )
 
         if compare_success:
-            created_files.append("comparison.xlsx")
-            print(f"  ✓ Created: comparison.xlsx")
+            created_files.append(f"comparison_{run_id}.xlsx")
+            print(f"  ✓ Created: comparison_{run_id}.xlsx")
 
-        exec_path = output_dir / "executive_summary.xlsx"
+        exec_path = output_dir / f"executive_summary_{run_id}.xlsx"
         exec_success = write_executive_summary(
             exec_path,
             all_results,
@@ -310,8 +312,8 @@ def main(input_path: str, output_dir: str):
         )
 
         if exec_success:
-            created_files.append("executive_summary.xlsx")
-            print(f"  ✓ Created: executive_summary.xlsx")
+            created_files.append(f"executive_summary_{run_id}.xlsx")
+            print(f"  ✓ Created: executive_summary_{run_id}.xlsx")
 
     elapsed = datetime.now() - start_time
 

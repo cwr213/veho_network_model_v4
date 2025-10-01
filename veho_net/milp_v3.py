@@ -565,9 +565,7 @@ def _add_sort_capacity_constraints(
                     region_vars_for_hub.append(sort_vars['region'])
 
             if region_vars_for_hub:
-                for var in region_vars_for_hub:
-                    model.Add(hub_region_var >= var)
-                model.Add(hub_region_var <= sum(region_vars_for_hub))
+                model.AddMaxEquality(hub_region_var, region_vars_for_hub)
 
                 regional_points = int(sort_points_per_dest)
                 sort_point_terms.append(hub_region_var * regional_points)
