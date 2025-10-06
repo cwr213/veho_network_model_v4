@@ -46,6 +46,7 @@ def solve_network_optimization(
             'unload_hours': float(timing_params.get('unload_hours', 2)),
             'injection_va_hours': float(timing_params.get('injection_va_hours', 8)),
             'middle_mile_va_hours': float(timing_params.get('middle_mile_va_hours', 16)),
+            'crossdock_va_hours': float(timing_params.get('crossdock_va_hours', 3)),
             'last_mile_va_hours': float(timing_params.get('last_mile_va_hours', 4)),
             'sort_points_per_destination': float(timing_params.get('sort_points_per_destination', 1))
         })
@@ -299,10 +300,7 @@ def _extract_legs_from_path(
         facilities: pd.DataFrame,
         mileage_bands: pd.DataFrame
 ) -> List[Tuple[str, str, float, float, float]]:
-    """
-    Extract leg information from path for arc analysis.
-    Returns list of (from, to, distance, cost_per_truck, mph).
-    """
+    """Extract leg information from path for arc analysis."""
     nodes = row.get("path_nodes", None)
 
     if isinstance(nodes, list) and len(nodes) >= 2:

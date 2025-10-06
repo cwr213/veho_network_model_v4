@@ -91,12 +91,10 @@ def _validate_facilities(df: pd.DataFrame) -> None:
             f"Required: {sorted(required_cols)}"
         )
 
-    # Check for duplicates
     duplicates = df["facility_name"][df["facility_name"].duplicated()].unique()
     if len(duplicates) > 0:
         raise ValueError(f"facilities has duplicate facility_name values: {list(duplicates)}")
 
-    # Validate facility types
     valid_types = {"hub", "hybrid", "launch"}
     invalid_types = df[~df["type"].str.lower().isin(valid_types)]
     if not invalid_types.empty:
@@ -105,7 +103,6 @@ def _validate_facilities(df: pd.DataFrame) -> None:
             f"Invalid rows: {invalid_types[['facility_name', 'type']].to_dict('records')}"
         )
 
-    # Validate coordinates exist
     missing_coords = df[pd.isna(df["lat"]) | pd.isna(df["lon"])]
     if not missing_coords.empty:
         raise ValueError(
@@ -113,7 +110,6 @@ def _validate_facilities(df: pd.DataFrame) -> None:
             f"{missing_coords['facility_name'].tolist()}"
         )
 
-    # Validate sort capacity for hub/hybrid facilities
     hub_hybrid = df[df["type"].str.lower().isin(["hub", "hybrid"])]
     missing_capacity = hub_hybrid[
         pd.isna(hub_hybrid["max_sort_points_capacity"]) |
@@ -127,7 +123,6 @@ def _validate_facilities(df: pd.DataFrame) -> None:
             f"Update facilities sheet with valid capacity values."
         )
 
-    # Validate sort groups for delivery facilities
     delivery = df[df["type"].str.lower().isin(["launch", "hybrid"])]
     missing_groups = delivery[
         pd.isna(delivery["last_mile_sort_groups_count"]) |
@@ -141,7 +136,6 @@ def _validate_facilities(df: pd.DataFrame) -> None:
             f"Update facilities sheet with valid sort group counts."
         )
 
-    # Validate launch facilities are not injection nodes
     invalid_injection = df[
         (df["type"].str.lower() == "launch") &
         (df["is_injection_node"].astype(int) == 1)
@@ -166,7 +160,6 @@ def _validate_zips(df: pd.DataFrame) -> None:
     if len(duplicates) > 0:
         raise ValueError(f"zips has duplicate ZIP codes: {list(duplicates)}")
 
-    # Validate population values
     invalid_pop = df[df["population"] < 0]
     if not invalid_pop.empty:
         raise ValueError(f"zips has negative population values for ZIPs: {invalid_pop['zip'].tolist()}")
@@ -184,7 +177,6 @@ def _validate_demand(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"demand sheet missing required columns: {sorted(missing)}")
 
-    # Validate percentage shares in [0,1]
     pct_cols = [
         "offpeak_pct_of_annual", "peak_pct_of_annual",
         "middle_mile_share_offpeak", "middle_mile_share_peak"
@@ -207,7 +199,6 @@ def _validate_injection_distribution(df: pd.DataFrame) -> None:
         missing = required_cols - set(df.columns)
         raise ValueError(f"injection_distribution missing columns: {sorted(missing)}")
 
-    # Validate shares sum to positive value
     total_share = pd.to_numeric(df["absolute_share"], errors="coerce").fillna(0.0).sum()
     if total_share <= 0:
         raise ValueError("injection_distribution.absolute_share must sum > 0")
@@ -225,7 +216,6 @@ def _validate_mileage_bands(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"mileage_bands sheet missing columns: {sorted(missing)}")
 
-    # Validate band ranges are logical
     invalid_ranges = df[df["mileage_band_min"] >= df["mileage_band_max"]]
     if not invalid_ranges.empty:
         raise ValueError(
@@ -237,6 +227,8 @@ def _validate_mileage_bands(df: pd.DataFrame) -> None:
 def _validate_timing_params(df: pd.DataFrame) -> None:
     """
     Validate timing parameters - ALL REQUIRED, NO DEFAULTS.
+
+    Enhanced validation includes crossdock_va_hours for sort vs. crossdock distinction.
     """
     required_keys = {
         "hours_per_touch",
@@ -244,6 +236,7 @@ def _validate_timing_params(df: pd.DataFrame) -> None:
         "unload_hours",
         "injection_va_hours",
         "middle_mile_va_hours",
+        "crossdock_va_hours",
         "last_mile_va_hours",
         "sort_points_per_destination"
     }
@@ -252,10 +245,10 @@ def _validate_timing_params(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(
             f"timing_params missing REQUIRED keys: {sorted(missing)}\n"
-            f"All timing parameters must be specified - NO DEFAULTS."
+            f"All timing parameters must be specified - NO DEFAULTS.\n"
+            f"Note: crossdock_va_hours is required for sort vs. crossdock operations."
         )
 
-    # Validate all values are positive
     for _, row in df.iterrows():
         key = row["key"]
         if key in required_keys:
@@ -265,6 +258,13 @@ def _validate_timing_params(df: pd.DataFrame) -> None:
                     raise ValueError(f"timing_params: {key} must be positive (found: {value})")
             except (ValueError, TypeError):
                 raise ValueError(f"timing_params: {key} must be numeric (found: {row['value']})")
+
+    crossdock_hours = float(df[df["key"] == "crossdock_va_hours"]["value"].iloc[0])
+    middle_mile_hours = float(df[df["key"] == "middle_mile_va_hours"]["value"].iloc[0])
+
+    if crossdock_hours >= middle_mile_hours:
+        print(f"  ⚠️  Warning: crossdock_va_hours ({crossdock_hours}) should typically be less than "
+              f"middle_mile_va_hours ({middle_mile_hours})")
 
 
 def _validate_cost_params(df: pd.DataFrame) -> None:
@@ -289,7 +289,6 @@ def _validate_cost_params(df: pd.DataFrame) -> None:
             f"All cost parameters must be specified - NO DEFAULTS."
         )
 
-    # Validate all values are non-negative
     for _, row in df.iterrows():
         key = row["key"]
         if key in required_keys:
@@ -300,7 +299,6 @@ def _validate_cost_params(df: pd.DataFrame) -> None:
             except (ValueError, TypeError):
                 raise ValueError(f"cost_params: {key} must be numeric (found: {row['value']})")
 
-    # Validate dwell threshold in [0,1]
     dwell_row = df[df["key"] == "premium_economy_dwell_threshold"]
     if not dwell_row.empty:
         dwell_val = float(dwell_row.iloc[0]["value"])
@@ -325,11 +323,9 @@ def _validate_container_params(df: pd.DataFrame) -> None:
     if df.empty:
         raise ValueError("container_params has no rows")
 
-    # Validate gaylord row exists
     if not (df["container_type"].str.lower() == "gaylord").any():
         raise ValueError("container_params must include row with container_type='gaylord'")
 
-    # Validate pack utilization values in (0,1]
     gaylord = df[df["container_type"].str.lower() == "gaylord"].iloc[0]
 
     pack_util_container = float(gaylord["pack_utilization_container"])
@@ -351,14 +347,12 @@ def _validate_package_mix(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"package_mix missing columns: {sorted(missing)}")
 
-    # Validate shares sum to 1.0
     total_share = float(df["share_of_pkgs"].sum())
     if abs(total_share - 1.0) > 1e-6:
         raise ValueError(
             f"package_mix share_of_pkgs must sum to 1.0 (found: {total_share})"
         )
 
-    # Validate cube values are positive
     invalid_cube = df[df["avg_cube_cuft"] <= 0]
     if not invalid_cube.empty:
         raise ValueError(
@@ -383,7 +377,6 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
             f"All run settings must be specified."
         )
 
-    # Validate load_strategy value
     strategy_row = df[df["key"] == "load_strategy"]
     if not strategy_row.empty:
         strategy_val = str(strategy_row.iloc[0]["value"]).lower()
@@ -392,7 +385,6 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
                 f"load_strategy must be 'container' or 'fluid' (found: {strategy_val})"
             )
 
-    # Validate around factor is reasonable
     around_row = df[df["key"] == "path_around_the_world_factor"]
     if not around_row.empty:
         around_val = float(around_row.iloc[0]["value"])
@@ -410,7 +402,6 @@ def _validate_scenarios(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"scenarios sheet missing columns: {sorted(missing)}")
 
-    # Validate day_type values
     valid_day_types = {"peak", "offpeak"}
     invalid_days = df[~df["day_type"].str.lower().isin(valid_day_types)]
     if not invalid_days.empty:
