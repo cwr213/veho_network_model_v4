@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 from datetime import datetime
 
-from veho_net.config_v3 import (
+from veho_net.config_v4 import (
     CostParameters, TimingParameters, RunSettings,
     LoadStrategy, OUTPUT_FILE_TEMPLATE
 )
@@ -15,9 +15,13 @@ from veho_net.io_loader_v3 import load_workbook, params_to_dict
 from veho_net.validators_v3 import validate_inputs
 from veho_net.build_structures_v3 import build_od_and_direct, candidate_paths
 from veho_net.milp_v3 import solve_network_optimization
-from veho_net.reporting_v3 import (
-    build_facility_rollup,
-    calculate_hourly_throughput,
+from veho_net.reporting_v4 import (
+    build_facility_volume,
+    build_facility_network_profile,
+    calculate_network_distance_metrics,
+    calculate_network_touch_metrics,
+    calculate_network_zone_distribution,
+    calculate_network_sort_distribution,
     add_zone_classification,
     build_path_steps,
     build_sort_summary,
@@ -194,7 +198,8 @@ def main(input_path: str, output_dir: str):
                 timing_params_dict
             )
 
-            facility_rollup = build_facility_rollup(
+            # Build facility volume (operational metrics)
+            facility_volume = build_facility_volume(
                 od_selected,
                 direct_day,
                 arc_summary,
@@ -202,18 +207,38 @@ def main(input_path: str, output_dir: str):
                 dfs["container_params"],
                 global_strategy.value,
                 dfs["facilities"],
-                cost_params
-            )
-
-            facility_rollup = calculate_hourly_throughput(
-                facility_rollup,
                 timing_params_dict
             )
+
+            # Build facility network profile (zone/sort/distance/touch)
+            facility_network_profile = build_facility_network_profile(
+                od_selected,
+                dfs["facilities"],
+                dfs["mileage_bands"]
+            )
+
+            # Calculate network-level metrics
+            distance_metrics = calculate_network_distance_metrics(
+                od_selected,
+                dfs["facilities"],
+                dfs["mileage_bands"]
+            )
+
+            touch_metrics = calculate_network_touch_metrics(
+                od_selected,
+                dfs["facilities"]
+            )
+
+            zone_distribution = calculate_network_zone_distribution(od_selected)
+
+            sort_distribution = {}
+            if enable_sort_opt and not sort_summary.empty:
+                sort_distribution = calculate_network_sort_distribution(od_selected)
 
             validation_results = validate_network_aggregations(
                 od_selected,
                 arc_summary,
-                facility_rollup
+                facility_volume
             )
 
             if not validation_results.get('package_consistency', True):
@@ -232,7 +257,11 @@ def main(input_path: str, output_dir: str):
                 "cost_per_pkg": cost_per_pkg,
                 "total_packages": total_pkgs,
                 "num_ods": len(od_selected),
-                **network_kpis
+                **network_kpis,
+                **distance_metrics,
+                **touch_metrics,
+                **zone_distribution,
+                **sort_distribution
             })
 
             scenario_summary = pd.DataFrame([
@@ -266,7 +295,8 @@ def main(input_path: str, output_dir: str):
                 scenario_summary,
                 od_selected,
                 path_steps,
-                facility_rollup,
+                facility_volume,
+                facility_network_profile,
                 arc_summary,
                 kpis,
                 sort_analysis

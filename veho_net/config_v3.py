@@ -1,136 +1,83 @@
 """
-Configuration Module - Constants, Enums, and Data Classes
+Configuration Module v3 - Bridge to v4
 
-Defines all type-safe enumerations and data structures used throughout the model.
-NO DEFAULT VALUES - all parameters must come from input files.
+This is a temporary bridge file to maintain backward compatibility
+during the v3 → v4 migration. All new functionality is in config_v4.py.
+
+This file simply re-exports everything from config_v4 so existing
+imports like `from .config_v3 import ...` continue to work.
+
+TODO: After full migration, remove this file and update all imports
+to use config_v4 directly.
 """
 
-from enum import Enum
-from dataclasses import dataclass
-from typing import Optional
-from pathlib import Path
+# Re-export everything from config_v4
+from .config_v4 import (
+    # Constants
+    EARTH_RADIUS_MILES,
+    HOURS_PER_DAY,
+    MINUTES_PER_HOUR,
 
-EARTH_RADIUS_MILES = 3958.756
-HOURS_PER_DAY = 24.0
-MINUTES_PER_HOUR = 60.0
+    # Configuration classes
+    OptimizationConstants,
+    ValidationTolerances,
+    PerformanceThresholds,
 
+    # Enumerations
+    FlowType,
+    FacilityType,
+    SortLevel,
+    LoadStrategy,
+    PathType,
 
-class FlowType(Enum):
-    """Package flow types through network."""
-    DIRECT_INJECTION = "direct_injection"
-    MIDDLE_MILE = "middle_mile"
-    MIDDLE_MILE_OD = "middle_mile_od"
+    # Data classes
+    CostParameters,
+    TimingParameters,
+    RunSettings,
 
+    # Output configuration
+    DAY_TYPES,
+    OUTPUT_DIR,
+    OUTPUT_FILE_TEMPLATE,
+    COMPARE_FILE_TEMPLATE,
+    EXECUTIVE_SUMMARY_TEMPLATE,
 
-class FacilityType(Enum):
-    """Facility operational capabilities."""
-    HUB = "hub"
-    HYBRID = "hybrid"
-    LAUNCH = "launch"
+    # Helper functions
+    get_optimization_config,
+    get_validation_config,
+)
 
+__all__ = [
+    # Constants
+    'EARTH_RADIUS_MILES',
+    'HOURS_PER_DAY',
+    'MINUTES_PER_HOUR',
 
-class SortLevel(Enum):
-    """Sort granularity levels at origin facility."""
-    REGION = "region"
-    MARKET = "market"
-    SORT_GROUP = "sort_group"
+    # Configuration classes
+    'OptimizationConstants',
+    'ValidationTolerances',
+    'PerformanceThresholds',
 
+    # Enumerations
+    'FlowType',
+    'FacilityType',
+    'SortLevel',
+    'LoadStrategy',
+    'PathType',
 
-class LoadStrategy(Enum):
-    """Loading strategies for linehaul transportation."""
-    CONTAINER = "container"
-    FLUID = "fluid"
+    # Data classes
+    'CostParameters',
+    'TimingParameters',
+    'RunSettings',
 
+    # Output configuration
+    'DAY_TYPES',
+    'OUTPUT_DIR',
+    'OUTPUT_FILE_TEMPLATE',
+    'COMPARE_FILE_TEMPLATE',
+    'EXECUTIVE_SUMMARY_TEMPLATE',
 
-class PathType(Enum):
-    """Path classification by number of facilities."""
-    DIRECT = "direct"
-    ONE_TOUCH = "1_touch"
-    TWO_TOUCH = "2_touch"
-    THREE_TOUCH = "3_touch"
-    FOUR_TOUCH = "4_touch"
-
-
-@dataclass(frozen=True)
-class CostParameters:
-    """
-    Granular cost structure - ALL REQUIRED from cost_params input sheet.
-    NO DEFAULTS ALLOWED.
-    """
-    injection_sort_cost_per_pkg: float
-    intermediate_sort_cost_per_pkg: float
-    last_mile_sort_cost_per_pkg: float
-    last_mile_delivery_cost_per_pkg: float
-    container_handling_cost: float
-    premium_economy_dwell_threshold: float
-    dwell_cost_per_pkg_per_day: float
-    sla_penalty_per_touch_per_pkg: float
-
-    def __post_init__(self):
-        """Validate all costs are non-negative."""
-        for field_name, value in self.__dataclass_fields__.items():
-            field_value = getattr(self, field_name)
-            if field_value < 0:
-                raise ValueError(f"{field_name} must be non-negative, got {field_value}")
-
-
-@dataclass(frozen=True)
-class TimingParameters:
-    """
-    Timing parameters - ALL REQUIRED from timing_params input sheet.
-    NO DEFAULTS ALLOWED.
-
-    Processing Windows by Operation Type:
-    - injection_va_hours: Origin facility sort/processing (typically 8 hours)
-    - middle_mile_va_hours: Intermediate facility full sort operation (typically 16 hours)
-    - crossdock_va_hours: Intermediate facility crossdock operation (typically 3 hours)
-    - last_mile_va_hours: Destination facility final sort/staging (typically 4 hours)
-
-    The distinction between middle_mile_va_hours and crossdock_va_hours enables
-    accurate capacity planning:
-    - Sort operations require extensive conveyor/automation infrastructure
-    - Crossdock operations only need dock space and material handling equipment
-    """
-    hours_per_touch: float
-    load_hours: float
-    unload_hours: float
-    injection_va_hours: float
-    middle_mile_va_hours: float
-    crossdock_va_hours: float
-    last_mile_va_hours: float
-    sort_points_per_destination: float
-
-    def __post_init__(self):
-        """Validate all timing values are positive."""
-        for field_name, value in self.__dataclass_fields__.items():
-            field_value = getattr(self, field_name)
-            if field_value <= 0:
-                raise ValueError(f"{field_name} must be positive, got {field_value}")
-
-
-@dataclass(frozen=True)
-class RunSettings:
-    """
-    Run configuration - ALL REQUIRED from run_settings input sheet.
-    NO DEFAULTS ALLOWED.
-    """
-    load_strategy: LoadStrategy
-    sla_target_days: int
-    path_around_the_world_factor: float
-    enable_sort_optimization: bool
-
-    def __post_init__(self):
-        """Validate run settings."""
-        if self.path_around_the_world_factor < 1.0:
-            raise ValueError(f"path_around_the_world_factor must be >= 1.0, got {self.path_around_the_world_factor}")
-
-        if self.sla_target_days < 1:
-            raise ValueError(f"sla_target_days must be >= 1, got {self.sla_target_days}")
-
-
-DAY_TYPES = {"offpeak", "peak"}
-
-OUTPUT_DIR = Path("outputs")
-OUTPUT_FILE_TEMPLATE = "{scenario_id}_{strategy}.xlsx"
-COMPARE_FILE_TEMPLATE = "{scenario_id}_compare.xlsx"
-EXECUTIVE_SUMMARY_TEMPLATE = "{scenario_id}_exec_sum.xlsx"
+    # Helper functions
+    'get_optimization_config',
+    'get_validation_config',
+]
