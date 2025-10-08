@@ -18,7 +18,7 @@ import pandas as pd
 import numpy as np
 from typing import Tuple, List, Set, Dict
 
-from .geo_v4 import haversine_miles
+from .geo_v4 import haversine_miles, cached_haversine
 from .utils import (
     get_facility_lookup,
     ensure_columns_exist,
@@ -26,6 +26,88 @@ from .utils import (
     check_for_duplicates,
 )
 from .config_v4 import OptimizationConstants
+
+# Progress indicator support
+try:
+    from tqdm import tqdm
+
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+
+# ============================================================================
+# GEOGRAPHIC FILTERING HELPERS
+# ============================================================================
+
+def _in_bounding_box(
+        hub: str,
+        start: str,
+        end: str,
+        fac_lookup: pd.DataFrame,
+        buffer_degrees: float = 0.5
+) -> bool:
+    """Fast bounding box check for geographic filtering."""
+    hub_lat = float(fac_lookup.at[hub, 'lat'])
+    hub_lon = float(fac_lookup.at[hub, 'lon'])
+    start_lat = float(fac_lookup.at[start, 'lat'])
+    start_lon = float(fac_lookup.at[start, 'lon'])
+    end_lat = float(fac_lookup.at[end, 'lat'])
+    end_lon = float(fac_lookup.at[end, 'lon'])
+
+    min_lat = min(start_lat, end_lat) - buffer_degrees
+    max_lat = max(start_lat, end_lat) + buffer_degrees
+    min_lon = min(start_lon, end_lon) - buffer_degrees
+    max_lon = max(start_lon, end_lon) + buffer_degrees
+
+    return (min_lat <= hub_lat <= max_lat and
+            min_lon <= hub_lon <= max_lon)
+
+
+def _get_viable_intermediates(
+        start_node: str,
+        end_node: str,
+        candidate_hubs: List[str],
+        fac_lookup: pd.DataFrame,
+        max_detour_factor: float
+) -> List[str]:
+    """Pre-filter intermediates by geographic proximity."""
+    if start_node == end_node:
+        return []
+
+    direct_dist = cached_haversine(
+        float(fac_lookup.at[start_node, 'lat']),
+        float(fac_lookup.at[start_node, 'lon']),
+        float(fac_lookup.at[end_node, 'lat']),
+        float(fac_lookup.at[end_node, 'lon'])
+    )
+
+    max_total_dist = direct_dist * max_detour_factor
+    viable = []
+
+    for hub in candidate_hubs:
+        # Fast bounding box check first
+        if not _in_bounding_box(hub, start_node, end_node, fac_lookup):
+            continue
+
+        # Then precise distance check
+        dist_to_hub = cached_haversine(
+            float(fac_lookup.at[start_node, 'lat']),
+            float(fac_lookup.at[start_node, 'lon']),
+            float(fac_lookup.at[hub, 'lat']),
+            float(fac_lookup.at[hub, 'lon'])
+        )
+        dist_from_hub = cached_haversine(
+            float(fac_lookup.at[hub, 'lat']),
+            float(fac_lookup.at[hub, 'lon']),
+            float(fac_lookup.at[end_node, 'lat']),
+            float(fac_lookup.at[end_node, 'lon'])
+        )
+
+        if dist_to_hub + dist_from_hub <= max_total_dist:
+            viable.append(hub)
+
+    return viable
 
 
 # ============================================================================
@@ -223,7 +305,7 @@ def candidate_paths(
         DataFrame with columns:
             - origin, dest: OD pair identifiers
             - path_type: Classification (direct, 1_touch, 2_touch, etc.)
-            - path_nodes: List of facilities in path
+            - path_nodes: Tuple of facilities in path
             - path_str: String representation "O->I->D"
             - strategy_hint: Optional strategy override (None = use global)
 
@@ -269,7 +351,7 @@ def candidate_paths(
 
     def calculate_raw_distance(o: str, d: str) -> float:
         """Calculate straight-line distance between facilities."""
-        return haversine_miles(
+        return cached_haversine(
             float(fac.at[o, "lat"]), float(fac.at[o, "lon"]),
             float(fac.at[d, "lat"]), float(fac.at[d, "lon"])
         )
@@ -322,42 +404,50 @@ def candidate_paths(
                 paths.append(combined)
         else:
             # Case 2: Direct path (no intermediate)
-            direct_distance = calculate_raw_distance(start_node, end_node)
             combined = required_start + required_end
             if len(combined) == len(set(combined)):
                 paths.append(combined)
 
             # Case 3: One-touch path (with intermediate hub)
+            # PRE-FILTER intermediates by geography
             candidate_intermediates = [
                 h for h in hubs_enabled
                 if h not in required_start and h not in required_end
             ]
 
-            if candidate_intermediates:
+            # Geographic filtering before distance calculation
+            viable_intermediates = _get_viable_intermediates(
+                start_node,
+                end_node,
+                candidate_intermediates,
+                fac,
+                around_factor
+            )
+
+            if viable_intermediates:
                 # Find best intermediate hub (shortest total distance)
                 best_intermediate = min(
-                    candidate_intermediates,
+                    viable_intermediates,
                     key=lambda h: calculate_raw_distance(start_node, h) +
                                   calculate_raw_distance(h, end_node)
                 )
 
-                intermediate_distance = (
-                        calculate_raw_distance(start_node, best_intermediate) +
-                        calculate_raw_distance(best_intermediate, end_node)
-                )
-
-                # Only use intermediate if within circuity constraint
-                if intermediate_distance <= around_factor * direct_distance:
-                    intermediate_path = required_start + [best_intermediate] + required_end
-                    if len(intermediate_path) == len(set(intermediate_path)):
-                        paths.append(intermediate_path)
+                intermediate_path = required_start + [best_intermediate] + required_end
+                if len(intermediate_path) == len(set(intermediate_path)):
+                    paths.append(intermediate_path)
 
         return paths
 
     # Generate paths for all OD pairs
     rows = []
 
-    for _, od_row in od.iterrows():
+    # Progress indicator
+    if HAS_TQDM:
+        od_iterator = tqdm(od.iterrows(), total=len(od), desc="Generating paths")
+    else:
+        od_iterator = od.iterrows()
+
+    for _, od_row in od_iterator:
         origin = od_row["origin"]
         dest = od_row["dest"]
 
@@ -381,18 +471,23 @@ def candidate_paths(
                 "origin": origin,
                 "dest": dest,
                 "path_type": path_type,
-                "path_nodes": path_nodes,
+                "path_nodes": tuple(path_nodes),  # Tuple for memory efficiency
                 "path_str": "->".join(path_nodes),
                 "strategy_hint": None  # Will use global strategy
             })
 
+    # Create DataFrame from collected rows
     df = pd.DataFrame(rows)
+
     if df.empty:
         return df
 
     # Validate paths (no launch facilities as intermediates)
-    def validate_path_nodes(path_nodes: List[str]) -> bool:
+    def validate_path_nodes(path_nodes: tuple) -> bool:
         """Ensure no launch facilities in intermediate positions."""
+        if len(path_nodes) <= 2:
+            return True
+
         for node in path_nodes[1:-1]:  # Check only intermediate nodes
             if node in fac.index and fac.at[node, "type"] == "launch":
                 return False
@@ -405,11 +500,8 @@ def candidate_paths(
     if removed_count > 0:
         print(f"  Removed {removed_count} invalid paths (launch facility violations)")
 
-    # Remove duplicate paths
-    df["path_nodes_tuple"] = df["path_nodes"].apply(tuple)
-    df = df.drop_duplicates(subset=["origin", "dest", "path_nodes_tuple"]).drop(
-        columns=["path_nodes_tuple"]
-    ).reset_index(drop=True)
+    # Remove duplicate paths (path_nodes is already a tuple)
+    df = df.drop_duplicates(subset=["origin", "dest", "path_nodes"]).reset_index(drop=True)
 
     return df
 
@@ -491,8 +583,9 @@ def validate_path_structure(
     # Check all facilities in paths exist
     all_facilities_in_paths = set()
     for _, row in paths.iterrows():
-        if isinstance(row['path_nodes'], list):
-            all_facilities_in_paths.update(row['path_nodes'])
+        path_nodes = row['path_nodes']
+        if isinstance(path_nodes, (list, tuple)):
+            all_facilities_in_paths.update(path_nodes)
 
     missing_facilities = all_facilities_in_paths - set(fac.index)
     if missing_facilities:
@@ -501,8 +594,9 @@ def validate_path_structure(
 
     # Check for launch facilities as intermediates
     for _, row in paths.iterrows():
-        if isinstance(row['path_nodes'], list) and len(row['path_nodes']) > 2:
-            for node in row['path_nodes'][1:-1]:
+        path_nodes = row['path_nodes']
+        if isinstance(path_nodes, (list, tuple)) and len(path_nodes) > 2:
+            for node in path_nodes[1:-1]:
                 if node in fac.index and fac.at[node, 'type'] == 'launch':
                     results['no_launch_intermediates'] = False
                     print(f"Warning: Launch facility {node} used as intermediate in path")

@@ -11,6 +11,53 @@ import numpy as np
 from typing import Set
 
 
+def validate_referential_integrity(dfs: dict) -> None:
+    """Validate foreign key relationships across sheets."""
+
+    all_facilities = set(dfs["facilities"]["facility_name"])
+
+    # 1. Check injection_distribution facilities exist
+    if not dfs["injection_distribution"].empty:
+        inj_facilities = set(dfs["injection_distribution"]["facility_name"])
+        missing = inj_facilities - all_facilities
+        if missing:
+            raise ValueError(
+                f"injection_distribution references non-existent facilities: {sorted(missing)}\n"
+                f"Add these facilities to the facilities sheet or remove from injection_distribution."
+            )
+
+    # 2. Check zips reference valid facilities
+    if not dfs["zips"].empty:
+        zip_facilities = set(dfs["zips"]["facility_name_assigned"])
+        missing = zip_facilities - all_facilities
+        if missing:
+            raise ValueError(
+                f"zips references non-existent facilities: {sorted(missing)}\n"
+                f"Add these facilities to the facilities sheet or update zip assignments."
+            )
+
+    # 3. Check parent_hub_name references
+    parent_hubs = set(dfs["facilities"]["parent_hub_name"].dropna())
+    parent_hubs.discard("")  # Remove empty strings
+    invalid_parents = parent_hubs - all_facilities
+    if invalid_parents:
+        raise ValueError(
+            f"facilities.parent_hub_name references non-existent facilities: {sorted(invalid_parents)}\n"
+            f"Update parent_hub_name to reference valid facilities."
+        )
+
+    # 4. Check regional_sort_hub references
+    regional_hubs = set(dfs["facilities"]["regional_sort_hub"].dropna())
+    regional_hubs.discard("")
+    invalid_regional = regional_hubs - all_facilities
+    if invalid_regional:
+        raise ValueError(
+            f"facilities.regional_sort_hub references non-existent facilities: {sorted(invalid_regional)}\n"
+            f"Update regional_sort_hub to reference valid facilities."
+        )
+
+    print("✓ Referential integrity validated")
+
 def validate_inputs(dfs: dict) -> None:
     """
     Comprehensive input validation across all sheets.
@@ -57,6 +104,8 @@ def validate_inputs(dfs: dict) -> None:
 
     _validate_scenarios(dfs["scenarios"])
     print("✓ scenarios validated")
+
+    validate_referential_integrity(dfs)
 
     print("=" * 60)
     print("✅ VALIDATION COMPLETE - ALL REQUIRED FIELDS PRESENT")

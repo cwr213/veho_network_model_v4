@@ -379,3 +379,45 @@ def estimate_containers_for_packages(
     effective_container_cube = get_container_capacity(container_params)
 
     return max(1, int(np.ceil(total_cube / effective_container_cube)))
+
+
+def calculate_trucks_vectorized(
+        packages_array: np.ndarray,
+        package_mix: pd.DataFrame,
+        container_params: pd.DataFrame,
+        strategy: str,
+        dwell_threshold: float
+) -> np.ndarray:
+    """
+    Vectorized truck calculation for batch processing.
+
+    Args:
+        packages_array: Array of package volumes
+        package_mix: Package distribution
+        container_params: Container parameters
+        strategy: Loading strategy
+        dwell_threshold: Premium economy threshold
+
+    Returns:
+        Array of truck counts (integers)
+    """
+    packages_per_truck_capacity = calculate_truck_capacity(
+        package_mix, container_params, strategy
+    )
+
+    raw_trucks = packages_array / packages_per_truck_capacity
+
+    # Vectorized premium economy logic
+    fractional_part = raw_trucks - np.floor(raw_trucks)
+
+    final_trucks = np.where(
+        raw_trucks <= 1.0,
+        1,  # Always at least 1 truck
+        np.where(
+            fractional_part < dwell_threshold,
+            np.floor(raw_trucks),  # Round down
+            np.ceil(raw_trucks)  # Round up
+        )
+    )
+
+    return final_trucks.astype(int)

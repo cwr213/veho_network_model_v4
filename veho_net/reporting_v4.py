@@ -90,12 +90,16 @@ def build_facility_volume(
                             )
                             direct_containers = containers['containers']
 
-            # Middle-mile injection volumes
+            # Middle-mile injection volumes (EXCLUDE O=D to prevent double-count)
             mm_injection_pkgs = 0
             mm_injection_containers = 0
 
             if not od_selected.empty:
-                outbound = od_selected[od_selected['origin'] == facility]
+                # NEW: Exclude O=D from injection count
+                outbound = od_selected[
+                    (od_selected['origin'] == facility) &
+                    (od_selected['origin'] != od_selected['dest'])
+                    ]
                 if not outbound.empty:
                     mm_injection_pkgs = outbound['pkgs_day'].sum()
 
@@ -104,6 +108,24 @@ def build_facility_volume(
                             mm_injection_pkgs, package_mix, container_params, strategy
                         )
                         mm_injection_containers = containers['containers']
+
+            # NEW: Separate O=D handling for hybrid facilities
+            od_same_pkgs = 0
+            od_same_containers = 0
+
+            if not od_selected.empty:
+                od_same = od_selected[
+                    (od_selected['origin'] == facility) &
+                    (od_selected['dest'] == facility)
+                    ]
+                if not od_same.empty:
+                    od_same_pkgs = od_same['pkgs_day'].sum()
+
+                    if od_same_pkgs > 0:
+                        containers = _calculate_containers_for_volume(
+                            od_same_pkgs, package_mix, container_params, strategy
+                        )
+                        od_same_containers = containers['containers']
 
             # Intermediate facility operations (sort vs crossdock)
             intermediate_pkgs_sort = 0
@@ -114,8 +136,12 @@ def build_facility_volume(
             if not od_selected.empty:
                 for _, path_row in od_selected.iterrows():
                     path_nodes = path_row.get('path_nodes', [])
-                    if not isinstance(path_nodes, list):
+                    if not isinstance(path_nodes, (list, tuple)):  # CHANGED: accept tuple
                         continue
+
+                    # Convert tuple to list if needed
+                    if isinstance(path_nodes, tuple):
+                        path_nodes = list(path_nodes)
 
                     final_dest = path_row['dest']
                     path_strategy = path_row.get('effective_strategy', strategy)
@@ -150,11 +176,12 @@ def build_facility_volume(
             intermediate_pkgs = intermediate_pkgs_sort + intermediate_pkgs_crossdock
             intermediate_containers = intermediate_containers_sort + intermediate_containers_crossdock
 
-            # Last mile volumes
-            last_mile_pkgs = direct_pkgs
+            # Last mile volumes (includes both direct injection and MM arrivals)
+            last_mile_pkgs = direct_pkgs  # Direct injection
             last_mile_containers = direct_containers
 
             if not od_selected.empty:
+                # All inbound ODs (including O=D from middle-mile)
                 inbound = od_selected[od_selected['dest'] == facility]
                 if not inbound.empty:
                     mm_last_mile = inbound['pkgs_day'].sum()
@@ -166,17 +193,13 @@ def build_facility_volume(
                         )
                         last_mile_containers += containers['containers']
 
-            # Total containers (avoiding double-count for O=D)
-            total_containers = mm_injection_containers + intermediate_containers + last_mile_containers
-
-            if not od_selected.empty:
-                od_paths = od_selected[od_selected['origin'] == facility]
-                for _, od_row in od_paths.iterrows():
-                    if od_row['origin'] == od_row['dest']:
-                        od_containers = _calculate_containers_for_volume(
-                            od_row['pkgs_day'], package_mix, container_params, strategy
-                        )['containers']
-                        total_containers -= od_containers
+            # Total containers calculation
+            # For hybrid facilities with O=D: count once in injection + intermediate + last mile
+            # The O=D flow goes through injection sort, then last mile sort/delivery
+            total_containers = (mm_injection_containers +
+                                od_same_containers +  # NEW: Add O=D separately
+                                intermediate_containers +
+                                last_mile_containers)
 
             # Truck movements
             outbound_trucks = 0
@@ -202,7 +225,10 @@ def build_facility_volume(
             crossdock_va_hours = float(timing_params.get('crossdock_va_hours', 3.0))
             last_mile_va_hours = float(timing_params['last_mile_va_hours'])
 
-            injection_hourly = safe_divide(mm_injection_pkgs, injection_va_hours)
+            # NEW: Include O=D in injection throughput for hybrids
+            total_injection_pkgs = mm_injection_pkgs + od_same_pkgs
+            injection_hourly = safe_divide(total_injection_pkgs, injection_va_hours)
+
             intermediate_sort_hourly = safe_divide(intermediate_pkgs_sort, middle_mile_va_hours)
             intermediate_crossdock_hourly = safe_divide(intermediate_pkgs_crossdock, crossdock_va_hours)
             last_mile_hourly = safe_divide(last_mile_pkgs, last_mile_va_hours)
@@ -221,9 +247,13 @@ def build_facility_volume(
                 'facility': facility,
                 'facility_type': fac_type,
 
-                # Injection volumes
+                # Injection volumes (excluding O=D)
                 'injection_pkgs_day': mm_injection_pkgs,
                 'injection_containers': mm_injection_containers,
+
+                # NEW: O=D volumes for hybrid facilities
+                'od_same_pkgs_day': od_same_pkgs,
+                'od_same_containers': od_same_containers,
 
                 # Intermediate volumes (split by operation type)
                 'intermediate_sort_pkgs_day': intermediate_pkgs_sort,
@@ -263,7 +293,6 @@ def build_facility_volume(
             continue
 
     return pd.DataFrame(volume_data)
-
 
 def _determine_intermediate_operation_type(
         intermediate_facility: str,

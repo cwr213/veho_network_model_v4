@@ -12,6 +12,9 @@ xlsxwriter>=3.1.0,<4.0.0
 # Optimization solver
 ortools>=9.7.0,<10.0.0
 
+# Progress indicator
+tqdm>=4.65.0
+
 # Optional: Configuration management (for future use)
 # pyyaml>=6.0.0,<7.0.0
 

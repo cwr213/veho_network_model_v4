@@ -18,6 +18,7 @@ Distance Calculation:
 import math
 import pandas as pd
 from typing import Tuple, Optional
+from functools import lru_cache
 
 from .config_v4 import EARTH_RADIUS_MILES, OptimizationConstants
 from .utils import get_facility_lookup
@@ -90,10 +91,27 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     # Haversine formula
     a = (math.sin(dphi / 2.0) ** 2 +
          math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2)
+
+    # NEW: Numerical stability fix for antipodal points
+    a = min(1.0, a)  # Clamp to prevent sqrt of >1 due to floating point errors
+
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    return EARTH_RADIUS_MILES * c
+    distance = EARTH_RADIUS_MILES * c
 
+    # NEW: Validation
+    if not math.isfinite(distance):
+        raise ValueError(
+            f"Invalid distance calculation for coordinates: "
+            f"({lat1}, {lon1}) to ({lat2}, {lon2})"
+        )
+
+    return distance
+
+@lru_cache(maxsize=10000)
+def cached_haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Cached haversine calculation for repeated lookups."""
+    return haversine_miles(lat1, lon1, lat2, lon2)
 
 def calculate_distance_with_circuity(
         lat1: float, lon1: float,
@@ -116,6 +134,7 @@ def calculate_distance_with_circuity(
     actual_distance = straight_line * circuity
 
     return straight_line, actual_distance
+
 
 
 # ============================================================================

@@ -39,6 +39,18 @@ from .config_v4 import (
 )
 from .utils import safe_divide, get_facility_lookup
 
+# Solver safety constants
+MAX_SAFE_INT = 2**31 - 1  # CP-SAT safe integer bound
+
+def safe_int_cost(value: float, context: str = "") -> int:
+    """Convert cost to safe integer for MILP solver."""
+    int_val = int(round(value))
+    if abs(int_val) > MAX_SAFE_INT:
+        raise ValueError(
+            f"Cost overflow in {context}: {value:,.0f} exceeds solver bounds. "
+            f"Consider reducing cost values or scaling package volumes."
+        )
+    return int_val
 
 # ============================================================================
 # MAIN OPTIMIZATION FUNCTION
@@ -176,56 +188,65 @@ def solve_network_optimization(
             facilities, timing_params, cand
         )
 
-    # Build objective
-    cost_terms = []
+        # Build objective
+        cost_terms = []
 
-    # Transportation costs
-    for a_idx in range(len(arc_meta)):
-        truck_cost = int(arc_meta[a_idx]["cost_per_truck"])
-        cost_terms.append(arc_trucks[a_idx] * truck_cost)
+        # Transportation costs
+        for a_idx in range(len(arc_meta)):
+            truck_cost = safe_int_cost(
+                arc_meta[a_idx]["cost_per_truck"],
+                f"arc_{a_idx}_transport"
+            )
+            cost_terms.append(arc_trucks[a_idx] * truck_cost)
 
-    # Processing costs
-    for group_name, group_idxs in groups.items():
-        repr_idx = group_idxs[0]
-        volume = path_od_data[repr_idx]['pkgs_day']
+        # Processing costs
+        for group_name, group_idxs in groups.items():
+            repr_idx = group_idxs[0]
+            volume = path_od_data[repr_idx]['pkgs_day']
 
-        if enable_sort_optimization:
-            sort_vars = sort_decision[group_name]
+            if enable_sort_optimization:
+                sort_vars = sort_decision[group_name]
 
-            for sort_level in ['region', 'market', 'sort_group']:
-                sort_var = sort_vars.get(sort_level)
-                if sort_var is None:
-                    continue
+                for sort_level in ['region', 'market', 'sort_group']:
+                    sort_var = sort_vars.get(sort_level)
+                    if sort_var is None:
+                        continue
 
+                    for path_idx in group_idxs:
+                        strategy = path_od_data[path_idx]['effective_strategy']
+
+                        proc_cost = _calculate_processing_cost(
+                            path_od_data[path_idx], sort_level, strategy,
+                            cost_params, facilities, package_mix, container_params
+                        )
+
+                        total_cost = safe_int_cost(
+                            proc_cost * volume,
+                            f"path_{path_idx}_{sort_level}_proc"
+                        )
+
+                        cost_active = model.NewBoolVar(f"active_{path_idx}_{sort_level}")
+                        model.Add(cost_active <= x[path_idx])
+                        model.Add(cost_active <= sort_var)
+                        model.Add(cost_active >= x[path_idx] + sort_var - 1)
+
+                        cost_terms.append(cost_active * total_cost)
+            else:
                 for path_idx in group_idxs:
                     strategy = path_od_data[path_idx]['effective_strategy']
 
                     proc_cost = _calculate_processing_cost(
-                        path_od_data[path_idx], sort_level, strategy,
+                        path_od_data[path_idx], 'market', strategy,
                         cost_params, facilities, package_mix, container_params
                     )
 
-                    total_cost = int(proc_cost * volume)
+                    total_cost = safe_int_cost(
+                        proc_cost * volume,
+                        f"path_{path_idx}_proc"
+                    )
+                    cost_terms.append(x[path_idx] * total_cost)
 
-                    cost_active = model.NewBoolVar(f"active_{path_idx}_{sort_level}")
-                    model.Add(cost_active <= x[path_idx])
-                    model.Add(cost_active <= sort_var)
-                    model.Add(cost_active >= x[path_idx] + sort_var - 1)
-
-                    cost_terms.append(cost_active * total_cost)
-        else:
-            for path_idx in group_idxs:
-                strategy = path_od_data[path_idx]['effective_strategy']
-
-                proc_cost = _calculate_processing_cost(
-                    path_od_data[path_idx], 'market', strategy,
-                    cost_params, facilities, package_mix, container_params
-                )
-
-                total_cost = int(proc_cost * volume)
-                cost_terms.append(x[path_idx] * total_cost)
-
-    model.Minimize(sum(cost_terms))
+        model.Minimize(sum(cost_terms))
 
     # Solve
     solver = cp_model.CpSolver()
@@ -235,11 +256,38 @@ def solve_network_optimization(
     print(f"    Starting MILP solver...")
     status = solver.Solve(model)
 
+    # NEW: Enhanced error handling with diagnostics
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        print(f"    ❌ Solver failed: {status}")
-        return pd.DataFrame(), pd.DataFrame(), {}, pd.DataFrame()
+        error_msg = {
+            cp_model.UNKNOWN: "Solver status unknown - may need more time",
+            cp_model.MODEL_INVALID: "Model formulation invalid - check constraints",
+            cp_model.INFEASIBLE: "No feasible solution - constraints too restrictive",
+        }.get(status, f"Solver failed with status code: {status}")
 
-    print(f"    ✅ Solver completed: ${solver.ObjectiveValue():,.0f}")
+        print(f"    ❌ Solver failed: {error_msg}")
+        print(f"    Debug info:")
+        print(f"      - Paths: {len(path_keys)}")
+        print(f"      - Arcs: {len(arc_meta)}")
+        print(f"      - OD groups: {len(groups)}")
+        print(f"      - Variables: ~{len(path_keys) + len(arc_meta) * 2}")
+        print(f"      - Constraints: ~{len(groups) + len(arc_meta) * 2}")
+        print(f"      - Solve time: {solver.WallTime():.2f}s")
+
+        # Return empty results WITH diagnostics
+        empty_kpis = {
+            "solver_status": error_msg,
+            "solve_time": solver.WallTime(),
+            "num_paths": len(path_keys),
+            "num_arcs": len(arc_meta),
+            "avg_truck_fill_rate": 0.0,
+            "avg_container_fill_rate": 0.0,
+            "total_cost": 0,
+            "total_packages": 0
+        }
+
+        return pd.DataFrame(), pd.DataFrame(), empty_kpis, pd.DataFrame()
+
+    print(f"    ✅ Solver completed: ${solver.ObjectiveValue():,.0f} in {solver.WallTime():.2f}s")
 
     # Extract solution
     chosen_idx = [i for i in path_keys if solver.Value(x[i]) == 1]
@@ -249,7 +297,7 @@ def solve_network_optimization(
         for group_name in groups.keys():
             for level in ['region', 'market', 'sort_group']:
                 var = sort_decision[group_name].get(level)
-                if var and solver.Value(var) == 1:
+                if var is not None and solver.Value(var) == 1:
                     sort_decisions[group_name] = level
                     break
 
@@ -372,9 +420,10 @@ def _extract_legs(row, facilities, mileage_bands):
     """Extract legs from path."""
     nodes = row.get("path_nodes", None)
 
-    if isinstance(nodes, list) and len(nodes) >= 2:
+    if isinstance(nodes, (list, tuple)) and len(nodes) >= 2:  # CHANGED: accept tuple
+        nodes_list = list(nodes) if isinstance(nodes, tuple) else nodes
         return [_calc_arc(u, v, facilities, mileage_bands)
-                for u, v in zip(nodes[:-1], nodes[1:])]
+                for u, v in zip(nodes_list[:-1], nodes_list[1:])]
 
     return [_calc_arc(row["origin"], row["dest"], facilities, mileage_bands)]
 
@@ -485,7 +534,7 @@ def _get_valid_sort_levels(origin, dest, fac_lookup):
 
 def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                                    facilities, timing_params, cand):
-    """Add sort capacity constraints per facility."""
+    """Add sort capacity constraints per facility PER DAY TYPE."""
     fac_lookup = get_facility_lookup(facilities)
     sort_points_per_dest = timing_params.sort_points_per_destination
 
@@ -493,7 +542,14 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
         facilities['type'].str.lower().isin(['hub', 'hybrid'])
     ]['facility_name'].tolist()
 
-    for facility in hub_facilities:
+    # NEW: Group by facility AND day_type
+    facility_day_combos = set()
+    for group_name in groups.keys():
+        scenario_id, origin, dest, day_type = group_name
+        if origin in hub_facilities:
+            facility_day_combos.add((origin, day_type))
+
+    for (facility, day_type) in facility_day_combos:
         if facility not in fac_lookup.index:
             continue
 
@@ -503,14 +559,16 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
 
         max_capacity = int(max_capacity)
 
+        # Filter groups for THIS facility AND day_type
         unique_dests = set()
         dest_sort_levels = {}
         dest_to_hub = {}
 
         for group_name, group_idxs in groups.items():
-            scenario_id, origin, dest, day_type = group_name
+            scenario_id, origin, dest, group_day_type = group_name
 
-            if origin != facility:
+            # NEW: Must match both facility AND day_type
+            if origin != facility or group_day_type != day_type:
                 continue
 
             unique_dests.add(dest)
@@ -534,12 +592,15 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                 hub_to_dests[hub] = []
             hub_to_dests[hub].append(dest)
 
-        facility_points = model.NewIntVar(0, max_capacity, f"points_{facility}")
+        facility_points = model.NewIntVar(
+            0, max_capacity,
+            f"points_{facility}_{day_type}"  # NEW: Include day_type in name
+        )
 
         point_terms = []
 
         for hub, dests in hub_to_dests.items():
-            hub_region_var = model.NewBoolVar(f"hub_reg_{facility}_{hub}")
+            hub_region_var = model.NewBoolVar(f"hub_reg_{facility}_{day_type}_{hub}")
 
             region_vars = []
             for dest in dests:
