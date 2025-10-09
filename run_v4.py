@@ -1,13 +1,12 @@
 """
-Main Execution Script - v4.2 COMPLETE FIX
+Main Execution Script - v4.3 ZONE TRACKING UPDATE
 
-Fixed Issues:
-1. Timing params consistency (dict vs object)
-2. Arc summary column validation
-3. Path nodes tuple/list handling
-4. Empty result handling in all analysis sections
-5. Better error messages and validation
-6. Proper cleanup and resource handling
+Updates:
+1. Zone 0 for direct injection packages
+2. Zone 1 for middle-mile O=D
+3. Zones 2-8 from mileage bands
+4. Unknown zone flagging and warnings
+5. Comprehensive zone cost analysis including direct injection
 """
 
 import argparse
@@ -32,6 +31,7 @@ from veho_net.reporting_v4 import (
     calculate_network_zone_distribution,
     calculate_network_sort_distribution,
     add_zone_classification,
+    add_direct_injection_zone_classification,
     build_path_steps,
     build_sort_summary,
     validate_network_aggregations
@@ -144,8 +144,8 @@ def main(input_path: str, output_dir: str):
     start_time = datetime.now()
 
     print("=" * 70)
-    print("VEHO NETWORK OPTIMIZATION v4.2 COMPLETE")
-    print("Comprehensive Bug Fixes + Enhanced Validation")
+    print("VEHO NETWORK OPTIMIZATION v4.3 ZONE TRACKING")
+    print("Zone 0 (Direct Injection) + Unknown Zone Flagging")
     print("=" * 70)
 
     input_path = Path(input_path)
@@ -236,6 +236,7 @@ def main(input_path: str, output_dir: str):
     print(f"  - Global strategy: {global_strategy.value}")
     print(f"  - Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
     print(f"  - Container flow correction: ENABLED")
+    print(f"  - Zone tracking: 0-8 + Unknown")
     print(f"  - Path around factor: {around_factor}")
     print(f"  - Run ID: {run_id}")
 
@@ -299,6 +300,11 @@ def main(input_path: str, output_dir: str):
 
             direct_day["dir_pkgs_day"] = direct_day[direct_col]
 
+            # Add zone 0 classification to direct injection
+            direct_day = add_direct_injection_zone_classification(direct_day)
+            direct_pkgs_total = direct_day["dir_pkgs_day"].sum()
+            print(f"  ✓ Direct injection (Zone 0): {direct_pkgs_total:,.0f} packages")
+
             # ================================================================
             # 2. GENERATE CANDIDATE PATHS
             # ================================================================
@@ -346,7 +352,6 @@ def main(input_path: str, output_dir: str):
                 print("─" * 70)
 
                 try:
-                    # Run comparison - NOW RETURNS optimized results
                     comparison_summary, detailed_comparison, facility_comparison, optimized_results = (
                         run_sort_strategy_comparison(
                             candidates=paths,
@@ -378,7 +383,7 @@ def main(input_path: str, output_dir: str):
                             comparison_summary, facility_comparison
                         ))
 
-                    # CRITICAL FIX: Reuse optimized results
+                    # Reuse optimized results
                     if optimized_results is not None:
                         print(f"\n{'─' * 70}")
                         print("✓ USING OPTIMIZED RESULTS FROM COMPARISON")
@@ -388,7 +393,6 @@ def main(input_path: str, output_dir: str):
                         od_selected, arc_summary_original, network_kpis, sort_summary = optimized_results
 
                     else:
-                        # Fallback: solve if comparison didn't return results
                         print(f"\n{'─' * 70}")
                         print("⚠️  Comparison didn't return results, solving again...")
                         print("─" * 70)
@@ -404,7 +408,7 @@ def main(input_path: str, output_dir: str):
                                 cost_params,
                                 timing_params_dict,
                                 global_strategy,
-                                True  # enable_sort_optimization
+                                True
                             )
                         )
 
@@ -413,7 +417,6 @@ def main(input_path: str, output_dir: str):
                     import traceback
                     traceback.print_exc()
 
-                    # Fallback to direct optimization
                     print(f"\n{'─' * 70}")
                     print("Running optimization without comparison...")
                     print("─" * 70)
@@ -429,12 +432,11 @@ def main(input_path: str, output_dir: str):
                             cost_params,
                             timing_params_dict,
                             global_strategy,
-                            True  # enable_sort_optimization
+                            True
                         )
                     )
 
             else:
-                # No comparison needed, run optimization once
                 print("\n3. Running MILP optimization...")
 
                 try:
@@ -447,7 +449,7 @@ def main(input_path: str, output_dir: str):
                         cost_params,
                         timing_params_dict,
                         global_strategy,
-                        False  # enable_sort_optimization
+                        False
                     )
                 except Exception as e:
                     print(f"  ❌ Optimization failed: {e}")
@@ -469,17 +471,38 @@ def main(input_path: str, output_dir: str):
             od_selected = normalize_path_nodes(od_selected)
 
             # ================================================================
-            # 5. CONTAINER FLOW CORRECTION (continues as before)
+            # 5. ADD ZONE CLASSIFICATION
             # ================================================================
 
-            print("\n4. Applying container flow correction...")
+            print("\n4. Adding zone classification...")
 
-            # Validate original arc summary
+            # Add zone classification to middle-mile flows (zones 1-8)
+            od_selected = add_zone_classification(
+                od_selected,
+                dfs["facilities"],
+                dfs["mileage_bands"]
+            )
+
+            # Check for unknown zones
+            unknown_zones = od_selected[od_selected['zone'] == 'unknown']
+            if not unknown_zones.empty:
+                unknown_pkgs = unknown_zones['pkgs_day'].sum()
+                unknown_pct = (unknown_pkgs / od_selected['pkgs_day'].sum()) * 100
+                print(f"  ⚠️  WARNING: {unknown_pct:.1f}% of packages in unknown zone")
+                print(f"     {len(unknown_zones)} OD pairs affected")
+            else:
+                print(f"  ✓ All OD pairs successfully classified")
+
+            # ================================================================
+            # 6. CONTAINER FLOW CORRECTION
+            # ================================================================
+
+            print("\n5. Applying container flow correction...")
+
             if not validate_arc_summary(arc_summary_original, "Original"):
                 print("  ⚠️  Original arc summary invalid, proceeding with correction anyway...")
 
             try:
-                # Build container map
                 od_selected = build_od_container_map(
                     od_selected,
                     dfs["package_mix"],
@@ -488,7 +511,6 @@ def main(input_path: str, output_dir: str):
                 )
                 print("  ✓ Container map built")
 
-                # Recalculate arc summary with container flow
                 arc_summary_corrected = recalculate_arc_summary_with_container_flow(
                     od_selected,
                     dfs["package_mix"],
@@ -498,14 +520,12 @@ def main(input_path: str, output_dir: str):
                 )
                 print("  ✓ Arc summary recalculated")
 
-                # Validate corrected arc summary
                 if validate_arc_summary(arc_summary_corrected, "Corrected"):
                     print("  ✓ Corrected arc summary validated")
                 else:
                     print("  ⚠️  Corrected arc summary validation failed, using original")
                     arc_summary_corrected = arc_summary_original
 
-                # Analyze sort level container impact
                 sort_container_impact = analyze_sort_level_container_impact(
                     od_selected,
                     dfs["package_mix"],
@@ -513,7 +533,6 @@ def main(input_path: str, output_dir: str):
                     dfs["facilities"]
                 )
 
-                # Create diagnostic
                 diagnostic = create_container_flow_diagnostic(
                     od_selected,
                     arc_summary_original,
@@ -526,7 +545,6 @@ def main(input_path: str, output_dir: str):
                     print("\n📊 Sort Level Container Analysis:")
                     print(sort_container_impact.to_string(index=False))
 
-                # Use corrected version
                 arc_summary = arc_summary_corrected
 
             except Exception as e:
@@ -538,30 +556,20 @@ def main(input_path: str, output_dir: str):
                 sort_container_impact = pd.DataFrame()
 
             # ================================================================
-            # 6. GENERATE OUTPUTS
+            # 7. GENERATE OUTPUTS
             # ================================================================
 
-            print("\n5. Generating outputs...")
+            print("\n6. Generating outputs...")
 
-            try:
-                # Add zone classification
-                od_selected = add_zone_classification(
-                    od_selected,
-                    dfs["facilities"],
-                    dfs["mileage_bands"]
-                )
-                print("  ✓ Zone classification added")
-            except Exception as e:
-                print(f"  ⚠️  Zone classification failed: {e}")
-
-            # Zone cost analysis
+            # Zone cost analysis (including direct injection = zone 0)
             zone_cost_analysis = pd.DataFrame()
             try:
-                print("\n5a. Calculating zone cost analysis...")
+                print("\n6a. Calculating zone cost analysis (including Zone 0)...")
                 zone_cost_analysis = calculate_zone_cost_analysis(
                     od_selected,
                     dfs["facilities"],
-                    dfs["mileage_bands"]
+                    dfs["mileage_bands"],
+                    direct_day  # Pass direct injection for zone 0
                 )
 
                 if not zone_cost_analysis.empty:
@@ -648,6 +656,11 @@ def main(input_path: str, output_dir: str):
 
                 if not validation_results.get('package_consistency', True):
                     print("  ⚠️  Warning: Package volume inconsistency detected")
+
+                # Report unknown zones
+                if validation_results.get('unknown_zone_pct', 0) > 0:
+                    print(f"  ⚠️  {validation_results['unknown_zone_pct']:.1f}% of packages in unknown zone")
+
             except Exception as e:
                 print(f"  ⚠️  Validation check failed: {e}")
 
@@ -665,6 +678,8 @@ def main(input_path: str, output_dir: str):
                 "total_cost": total_cost,
                 "cost_per_pkg": cost_per_pkg,
                 "total_packages": total_pkgs,
+                "direct_injection_packages": direct_pkgs_total,
+                "middle_mile_packages": total_pkgs,
                 "num_ods": len(od_selected),
                 **network_kpis,
                 **distance_metrics,
@@ -681,13 +696,15 @@ def main(input_path: str, output_dir: str):
                 {"key": "strategy", "value": global_strategy.value},
                 {"key": "total_cost", "value": total_cost},
                 {"key": "cost_per_pkg", "value": cost_per_pkg},
-                {"key": "total_packages", "value": total_pkgs},
+                {"key": "middle_mile_packages", "value": total_pkgs},
+                {"key": "direct_injection_packages", "value": direct_pkgs_total},
+                {"key": "total_packages", "value": total_pkgs + direct_pkgs_total},
                 {"key": "container_flow_corrected", "value": True},
-                {"key": "zone_sort_distributions_fixed", "value": True}
+                {"key": "zone_tracking", "value": "0-8 + Unknown"}
             ])
 
             # ================================================================
-            # 7. WRITE OUTPUT FILES
+            # 8. WRITE OUTPUT FILES
             # ================================================================
 
             output_filename = OUTPUT_FILE_TEMPLATE.format(
@@ -775,7 +792,6 @@ def main(input_path: str, output_dir: str):
         print("=" * 70)
 
         try:
-            # Validate required columns
             required_for_fluid = ['origin', 'dest', 'pkgs_day', 'effective_strategy']
             missing_cols = [col for col in required_for_fluid if col not in od_selected.columns]
 
@@ -797,7 +813,6 @@ def main(input_path: str, output_dir: str):
                 if not fluid_opportunities.empty:
                     print(create_fluid_load_summary_report(fluid_opportunities))
 
-                    # Calculate sort point savings
                     try:
                         sort_point_savings = calculate_sort_point_savings(
                             fluid_opportunities,
@@ -812,7 +827,6 @@ def main(input_path: str, output_dir: str):
                         print(f"  ⚠️  Sort point savings calculation failed: {e}")
                         sort_point_savings = pd.DataFrame()
 
-                    # Save results
                     try:
                         fluid_output = output_dir / f"fluid_opportunities_{run_id}.xlsx"
                         with pd.ExcelWriter(fluid_output, engine='xlsxwriter') as writer:
@@ -892,7 +906,8 @@ def main(input_path: str, output_dir: str):
     print(f"📋 Processed: {len(all_results)} scenarios")
     print(f"📄 Created files: {len(created_files)}")
     print(f"✅ Container flow correction: APPLIED")
-    print(f"✅ Zone/sort distributions: FIXED")
+    print(f"✅ Zone tracking: 0 (DI) + 1-8 + Unknown")
+    print(f"✅ Unknown zone flagging: ACTIVE")
     print(f"✅ Enhanced error handling: ACTIVE")
 
     if created_files:
@@ -907,12 +922,18 @@ def main(input_path: str, output_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Veho Network Optimization v4.2 COMPLETE",
+        description="Veho Network Optimization v4.3 ZONE TRACKING",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python run_v4.py --input data/input.xlsx --output_dir outputs/
   python run_v4.py --input data/input.xlsx --output_dir outputs/test_run/
+
+Zone Classification:
+  - Zone 0: Direct injection (no middle-mile transport)
+  - Zone 1: Middle-mile O=D (same origin/dest with injection sort)
+  - Zones 2-8: Distance-based from mileage_bands
+  - Unknown: Classification failed (data quality flag)
 
 For input file validation, run the diagnostic script first:
   python diagnostic_runner.py data/input.xlsx

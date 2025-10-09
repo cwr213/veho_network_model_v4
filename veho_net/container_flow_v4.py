@@ -1,9 +1,6 @@
 """
-Container Flow Tracking Module v4.1
+Container Flow Tracking Module v4.4
 
-Updates:
-1. Arc summary now uses 'trucks' column name (not 'trucks_needed')
-2. Added all required columns for downstream compatibility
 """
 
 import pandas as pd
@@ -31,6 +28,8 @@ def calculate_origin_containers_by_sort_level(
 ) -> Dict[str, float]:
     """
     Calculate containers created at origin based on chosen sort level.
+
+    Container fill rate = cube / (containers × raw_container_cube)
     """
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = packages * w_cube
@@ -40,8 +39,8 @@ def calculate_origin_containers_by_sort_level(
         ].iloc[0]
 
     raw_container_cube = float(gaylord_row["usable_cube_cuft"])
-    pack_util = float(gaylord_row["pack_utilization_container"])
-    effective_container_cube = raw_container_cube * pack_util
+    pack_util_container = float(gaylord_row["pack_utilization_container"])
+    effective_container_cube = raw_container_cube * pack_util_container
 
     fac_lookup = get_facility_lookup(facilities)
 
@@ -61,13 +60,17 @@ def calculate_origin_containers_by_sort_level(
         sort_destinations = 1
 
     cube_per_destination = total_cube / sort_destinations
+
+    # Containers needed: pack util determines quantity
     containers_per_destination = max(1, int(np.ceil(
         cube_per_destination / effective_container_cube
     )))
 
     total_containers = containers_per_destination * sort_destinations
 
-    avg_fill_rate = safe_divide(
+    # Container fill rate = actual cube / (containers × RAW cube)
+    # No pack util in fill rate calculation
+    container_fill_rate = safe_divide(
         cube_per_destination,
         containers_per_destination * raw_container_cube
     )
@@ -77,7 +80,7 @@ def calculate_origin_containers_by_sort_level(
         'sort_destinations': sort_destinations,
         'containers_per_destination': containers_per_destination,
         'avg_pkgs_per_container': safe_divide(packages, total_containers),
-        'container_fill_rate': min(1.0, avg_fill_rate),
+        'container_fill_rate': min(1.0, container_fill_rate),
         'total_cube': total_cube
     }
 
@@ -117,10 +120,23 @@ def calculate_arc_containers_from_flows(
         container_params: pd.DataFrame,
         facilities: pd.DataFrame
 ) -> Dict:
-    """Calculate containers on an arc by summing from all OD flows."""
+    """
+    Calculate containers on an arc by summing from all OD flows.
+
+    CORRECT FORMULA:
+    Truck Fill Rate = Total Cube / (Trucks × Trailer Air Cube)
+
+    Pack utilization is NOT in the denominator.
+    """
     containers_per_truck = get_containers_per_truck(container_params)
     raw_trailer_cube = get_raw_trailer_cube(container_params)
     w_cube = weighted_pkg_cube(package_mix)
+
+    # Get raw container cube for container fill rate
+    gaylord_row = container_params[
+        container_params["container_type"].str.lower() == "gaylord"
+        ].iloc[0]
+    raw_container_cube = float(gaylord_row["usable_cube_cuft"])
 
     total_containers = 0
     total_cube = 0
@@ -144,7 +160,15 @@ def calculate_arc_containers_from_flows(
         container_fill_rates.append(container_data['container_fill_rate'])
 
     trucks_needed = max(1, int(np.ceil(total_containers / containers_per_truck)))
-    truck_fill_rate = safe_divide(total_cube, trucks_needed * raw_trailer_cube)
+
+    # CORRECT: Truck fill rate = total_cube / (trucks × raw_trailer_cube)
+    # NO pack utilization in fill rate calculation
+    truck_fill_rate = safe_divide(
+        total_cube,
+        trucks_needed * raw_trailer_cube
+    )
+
+    # Average container fill across all flows on this arc
     avg_container_fill = np.mean(container_fill_rates) if container_fill_rates else 0
 
     return {
@@ -168,7 +192,7 @@ def recalculate_arc_summary_with_container_flow(
     """
     Rebuild arc summary with correct container flow tracking.
 
-    FIXED: Now includes all required columns with correct names.
+    CORRECT: Fill Rate = Total Cube / (Trucks × Raw Trailer Cube)
     """
     od_with_containers = build_od_container_map(
         od_selected, package_mix, container_params, facilities
@@ -207,7 +231,7 @@ def recalculate_arc_summary_with_container_flow(
     for arc_key, od_flows_list in arc_flows.items():
         from_fac, to_fac = arc_key
 
-        # Calculate arc metrics
+        # Calculate arc metrics with CORRECT fill rates
         arc_metrics = calculate_arc_containers_from_flows(
             od_flows_list, package_mix, container_params, facilities
         )
@@ -244,7 +268,7 @@ def recalculate_arc_summary_with_container_flow(
             'distance_miles': round(distance_miles, 1),
             'pkgs_day': int(arc_metrics['total_packages']),
             'pkg_cube_cuft': round(arc_metrics['total_cube'], 2),
-            'trucks': arc_metrics['trucks_needed'],  # FIXED: Use 'trucks' not 'trucks_needed'
+            'trucks': arc_metrics['trucks_needed'],
             'physical_containers': arc_metrics['total_containers'],
             'packages_per_truck': round(packages_per_truck, 1),
             'cube_per_truck': round(cube_per_truck, 1),
@@ -318,7 +342,7 @@ def create_container_flow_diagnostic(
     """Create diagnostic report comparing original vs corrected fill rates."""
     lines = []
     lines.append("=" * 100)
-    lines.append("CONTAINER FLOW DIAGNOSTIC - Original vs Corrected Fill Rates")
+    lines.append("CONTAINER FLOW DIAGNOSTIC - Fill Rate Correction Applied")
     lines.append("=" * 100)
     lines.append("")
 
@@ -327,9 +351,16 @@ def create_container_flow_diagnostic(
     corr_avg_fill = arc_summary_corrected['truck_fill_rate'].mean()
 
     lines.append(f"Network Average Truck Fill Rate:")
-    lines.append(f"  Original (WRONG): {orig_avg_fill:.1%}")
-    lines.append(f"  Corrected:        {corr_avg_fill:.1%}")
-    lines.append(f"  Difference:       {(corr_avg_fill - orig_avg_fill):.1%}")
+    lines.append(f"  Original (MILP):      {orig_avg_fill:.1%}")
+    lines.append(f"  Corrected (Arc-Flow): {corr_avg_fill:.1%}")
+    lines.append(f"  Difference:           {(corr_avg_fill - orig_avg_fill):+.1%}")
+    lines.append("")
+
+    # Explain the correction
+    lines.append("Correction Applied:")
+    lines.append("  - Fill rate = Total Cube / (Trucks × Raw Trailer Cube)")
+    lines.append("  - Pack utilization NOT used in fill rate denominator")
+    lines.append("  - Pack util only determines truck quantity needed")
     lines.append("")
 
     lines.append("Sort Level Impact on Containers:")

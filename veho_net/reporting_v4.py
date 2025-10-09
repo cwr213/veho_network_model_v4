@@ -1,10 +1,10 @@
 """
 Reporting Module
 
-Key Fixes:
-1. Facility network profile now correctly calculates zone/sort distributions
-2. Helper functions properly weight by packages
-3. All metrics use package-weighted averages
+ZONE 0 FIX:
+- Zone 0 is ONLY for direct injection (tracked separately in direct_day)
+- Middle-mile O=D uses zone from mileage_bands for distance=0
+- Zone distribution includes both od_selected AND direct_day
 """
 
 import pandas as pd
@@ -15,6 +15,41 @@ from .geo_v4 import calculate_zone_from_distance, haversine_miles, band_lookup
 from .containers_v4 import weighted_pkg_cube
 from .utils import safe_divide, get_facility_lookup
 from .config_v4 import OptimizationConstants
+
+
+# ============================================================================
+# HELPER: NORMALIZE ZONE VALUE
+# ============================================================================
+
+def _normalize_zone_value(zone_val) -> str:
+    """
+    Normalize zone value to string format for comparison.
+
+    Handles: int, float, str, NaN
+    Returns: "0", "1", "2", etc. or "unknown"
+    """
+    if pd.isna(zone_val):
+        return "unknown"
+
+    # Convert to string and strip
+    zone_str = str(zone_val).strip()
+
+    # Remove "Zone " prefix if present
+    if zone_str.lower().startswith("zone "):
+        zone_str = zone_str[5:].strip()
+
+    # Try to convert to int then back to string (handles "1.0" -> "1")
+    try:
+        zone_int = int(float(zone_str))
+        return str(zone_int)
+    except (ValueError, TypeError):
+        pass
+
+    # Return as-is if already a clean string
+    if zone_str.lower() in ['unknown', '']:
+        return "unknown"
+
+    return zone_str
 
 
 # ============================================================================
@@ -303,18 +338,21 @@ def _calculate_containers_for_volume(
 
 
 # ============================================================================
-# FACILITY NETWORK PROFILE (NETWORK CHARACTERISTICS) - FIXED
+# FACILITY NETWORK PROFILE (NETWORK CHARACTERISTICS)
 # ============================================================================
 
 def build_facility_network_profile(
         od_selected: pd.DataFrame,
         facilities: pd.DataFrame,
-        mileage_bands: pd.DataFrame
+        mileage_bands: pd.DataFrame,
+        direct_day: pd.DataFrame = None
 ) -> pd.DataFrame:
     """
     Build facility network profile with zone/sort/distance/touch characteristics.
 
-    FIXED: Now properly calculates zone and sort distributions per facility.
+    FIXED: Now includes direct injection (zone 0) in zone distribution.
+
+    Includes zones 0-8 and unknown zone tracking.
     """
     if od_selected.empty:
         return pd.DataFrame()
@@ -338,10 +376,10 @@ def build_facility_network_profile(
 
             touch_metrics = _calculate_touch_metrics_for_ods(origin_ods, facilities)
 
-            # FIXED: Calculate zone distribution
-            zone_dist = _calculate_zone_distribution_for_ods(origin_ods)
+            # FIXED: Calculate zone distribution including direct injection
+            zone_dist = _calculate_zone_distribution_for_ods(origin_ods, direct_day, origin)
 
-            # FIXED: Calculate sort level distribution
+            # Calculate sort level distribution
             sort_dist = _calculate_sort_level_distribution_for_ods(origin_ods)
 
             fac_type = fac_lookup.at[origin, 'type'] if origin in fac_lookup.index else 'unknown'
@@ -359,10 +397,10 @@ def build_facility_network_profile(
                 # Touch metrics
                 **touch_metrics,
 
-                # Zone distribution (FIXED)
+                # Zone distribution (0-8 + unknown) - includes direct injection
                 **zone_dist,
 
-                # Sort level distribution (FIXED)
+                # Sort level distribution
                 **sort_dist,
             }
 
@@ -467,35 +505,65 @@ def _calculate_touch_metrics_for_ods(
     }
 
 
-def _calculate_zone_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, float]:
+def _calculate_zone_distribution_for_ods(
+        ods: pd.DataFrame,
+        direct_day: pd.DataFrame = None,
+        facility: str = None
+) -> Dict[str, float]:
     """
-    FIXED: Calculate zone distribution for OD set.
+    FIXED: Calculate zone distribution including direct injection.
 
-    Returns dict with zone_1_pct through zone_8_pct based on package volumes.
+    Returns dict with:
+    - zone_0_pct: Direct injection (no middle-mile) - from direct_day
+    - zone_1_pct through zone_8_pct: Mileage-based zones - from ods
+    - zone_unknown_pct: Unclassified zones (data quality flag)
     """
-    if 'zone' not in ods.columns:
-        return {f'zone_{i}_pct': 0.0 for i in range(1, 9)}
+    # Start with middle-mile OD zones
+    total_pkgs = 0
+    zone_pkgs = {str(i): 0 for i in range(9)}
+    zone_pkgs['unknown'] = 0
 
-    total_pkgs = ods['pkgs_day'].sum()
+    # Add middle-mile packages
+    if not ods.empty and 'zone' in ods.columns:
+        total_pkgs += ods['pkgs_day'].sum()
 
-    if total_pkgs == 0:
-        return {f'zone_{i}_pct': 0.0 for i in range(1, 9)}
+        # Normalize all zone values
+        normalized_zones = ods['zone'].apply(_normalize_zone_value)
 
+        for zone_num in range(9):
+            zone_str = str(zone_num)
+            zone_mask = normalized_zones == zone_str
+            zone_pkgs[zone_str] += ods[zone_mask]['pkgs_day'].sum()
+
+        # Unknown
+        unknown_mask = normalized_zones == 'unknown'
+        zone_pkgs['unknown'] += ods[unknown_mask]['pkgs_day'].sum()
+
+    # Add direct injection packages (zone 0)
+    if direct_day is not None and not direct_day.empty and facility is not None:
+        direct_col = 'dir_pkgs_day'
+        if direct_col in direct_day.columns and 'dest' in direct_day.columns:
+            # Direct injection where THIS facility is the destination
+            facility_direct = direct_day[direct_day['dest'] == facility]
+            if not facility_direct.empty:
+                direct_pkgs = facility_direct[direct_col].sum()
+                zone_pkgs['0'] += direct_pkgs
+                total_pkgs += direct_pkgs
+
+    # Calculate percentages
     zone_dist = {}
-
-    for zone_num in range(1, 9):
+    for zone_num in range(9):
         zone_str = str(zone_num)
-        # FIXED: Handle both string and numeric zone values
-        zone_mask = ods['zone'].astype(str).str.strip() == zone_str
-        zone_pkgs = ods[zone_mask]['pkgs_day'].sum()
-        zone_dist[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs, total_pkgs) * 100, 2)
+        zone_dist[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs) * 100, 2)
+
+    zone_dist['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs) * 100, 2)
 
     return zone_dist
 
 
 def _calculate_sort_level_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, float]:
     """
-    FIXED: Calculate sort level distribution for OD set.
+    Calculate sort level distribution for OD set.
 
     Returns dict with sort level percentages by packages and destinations.
     """
@@ -562,25 +630,52 @@ def calculate_network_touch_metrics(
     return _calculate_touch_metrics_for_ods(od_selected, facilities)
 
 
-def calculate_network_zone_distribution(od_selected: pd.DataFrame) -> Dict:
-    """Calculate network-level zone distribution."""
+def calculate_network_zone_distribution(
+        od_selected: pd.DataFrame,
+        direct_day: pd.DataFrame = None
+) -> Dict:
+    """
+    Calculate network-level zone distribution.
+
+    FIXED: Includes direct injection (zone 0) from direct_day.
+    """
     result = {}
 
-    if od_selected.empty or 'zone' not in od_selected.columns:
-        for i in range(1, 9):
-            result[f'zone_{i}_pkgs'] = 0
-            result[f'zone_{i}_pct'] = 0.0
-        return result
+    # Initialize
+    zone_pkgs = {str(i): 0 for i in range(9)}
+    zone_pkgs['unknown'] = 0
+    total_pkgs = 0
 
-    total_pkgs = od_selected['pkgs_day'].sum()
+    # Add middle-mile packages
+    if not od_selected.empty and 'zone' in od_selected.columns:
+        total_pkgs += od_selected['pkgs_day'].sum()
 
-    for zone_num in range(1, 9):
+        normalized_zones = od_selected['zone'].apply(_normalize_zone_value)
+
+        for zone_num in range(9):
+            zone_str = str(zone_num)
+            zone_mask = normalized_zones == zone_str
+            zone_pkgs[zone_str] += od_selected[zone_mask]['pkgs_day'].sum()
+
+        unknown_mask = normalized_zones == 'unknown'
+        zone_pkgs['unknown'] += od_selected[unknown_mask]['pkgs_day'].sum()
+
+    # Add direct injection packages (zone 0)
+    if direct_day is not None and not direct_day.empty:
+        direct_col = 'dir_pkgs_day'
+        if direct_col in direct_day.columns:
+            direct_pkgs = direct_day[direct_col].sum()
+            zone_pkgs['0'] += direct_pkgs
+            total_pkgs += direct_pkgs
+
+    # Calculate results
+    for zone_num in range(9):
         zone_str = str(zone_num)
-        zone_mask = od_selected['zone'].astype(str).str.strip() == zone_str
-        zone_pkgs = od_selected[zone_mask]['pkgs_day'].sum()
+        result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs[zone_str])
+        result[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs) * 100, 2)
 
-        result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs)
-        result[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs, total_pkgs) * 100, 2)
+    result['zone_unknown_pkgs'] = int(zone_pkgs['unknown'])
+    result['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs) * 100, 2)
 
     return result
 
@@ -630,7 +725,16 @@ def add_zone_classification(
         facilities: pd.DataFrame,
         mileage_bands: pd.DataFrame
 ) -> pd.DataFrame:
-    """Add zone classification based on O-D straight-line distance."""
+    """
+    Add zone classification based on distance from mileage_bands.
+
+    FIXED: O=D flows now use mileage_bands for distance=0 (not hardcoded zone 1).
+
+    Zone Assignment Rules:
+    - For ALL flows (including O=D): Use mileage_bands for distance
+    - Zone 0 is ONLY for direct injection (handled separately)
+    - Unknown: Classification failed (data quality issue)
+    """
     if od_df.empty:
         return od_df
 
@@ -641,13 +745,35 @@ def add_zone_classification(
         origin = row['origin']
         dest = row['dest']
 
-        if origin == dest:
-            od_df.at[idx, 'zone'] = '1'
-        else:
-            zone = calculate_zone_from_distance(origin, dest, facilities, mileage_bands)
-            od_df.at[idx, 'zone'] = zone
+        # ALL middle-mile flows (including O=D) use distance-based zone from mileage_bands
+        zone = calculate_zone_from_distance(origin, dest, facilities, mileage_bands)
+        od_df.at[idx, 'zone'] = zone
 
     return od_df
+
+
+def add_direct_injection_zone_classification(
+        direct_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Add zone 0 classification to direct injection flows.
+
+    Direct injection = packages injected at destination without middle-mile transport.
+    These are ALWAYS zone 0.
+
+    Args:
+        direct_df: Direct injection DataFrame with 'dest' column
+
+    Returns:
+        DataFrame with added 'zone' column set to '0'
+    """
+    if direct_df.empty:
+        return direct_df
+
+    direct_df = direct_df.copy()
+    direct_df['zone'] = '0'
+
+    return direct_df
 
 
 # ============================================================================
@@ -774,7 +900,7 @@ def validate_network_aggregations(
         arc_summary: pd.DataFrame,
         facility_volume: pd.DataFrame
 ) -> Dict:
-    """Validate aggregate calculations."""
+    """Validate aggregate calculations and flag data quality issues."""
     validation_results = {}
 
     try:
@@ -814,6 +940,21 @@ def validate_network_aggregations(
                 validation_results['network_avg_truck_fill'] = 0
         else:
             validation_results['network_avg_truck_fill'] = 0
+
+        # Check for unknown zones (data quality flag)
+        if not od_selected.empty and 'zone' in od_selected.columns:
+            normalized_zones = od_selected['zone'].apply(_normalize_zone_value)
+            unknown_zone_pkgs = od_selected[normalized_zones == 'unknown']['pkgs_day'].sum()
+
+            total_pkgs = od_selected['pkgs_day'].sum()
+            unknown_zone_pct = safe_divide(unknown_zone_pkgs, total_pkgs) * 100
+
+            validation_results['unknown_zone_packages'] = int(unknown_zone_pkgs)
+            validation_results['unknown_zone_pct'] = round(unknown_zone_pct, 2)
+
+            if unknown_zone_pct > 1.0:
+                print(f"  ⚠️  WARNING: {unknown_zone_pct:.1f}% of packages have unknown zone classification")
+                print(f"     Check mileage_bands coverage and facility coordinates")
 
     except Exception as e:
         validation_results['validation_error'] = str(e)
