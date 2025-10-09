@@ -1,6 +1,10 @@
 """
-Container Flow Tracking Module v4.4
+Container Flow Tracking Module v4.5
 
+Critical Fix: Robust path_nodes extraction for arc aggregation
+- Handles tuple/list/string formats
+- Falls back to path_str parsing if needed
+- Ensures arc flow sums all OD flows correctly
 """
 
 import pandas as pd
@@ -17,6 +21,42 @@ from .utils import safe_divide, get_facility_lookup
 from .config_v4 import OptimizationConstants
 
 
+def _extract_path_nodes_robust(row: pd.Series) -> List[str]:
+    """
+    ROBUST path_nodes extraction with multiple fallback strategies.
+
+    Critical fix for arc aggregation bug where path_nodes was being
+    set to [origin, dest] instead of full path including intermediates.
+
+    Tries in order:
+    1. path_nodes column (if list/tuple)
+    2. Parse from path_str (if contains "->")
+    3. Fallback to [origin, dest]
+    """
+    # Try path_nodes column first
+    nodes = row.get("path_nodes", None)
+
+    # Handle tuple
+    if isinstance(nodes, tuple):
+        nodes = list(nodes)
+        if len(nodes) >= 2:
+            return nodes
+
+    # Handle list
+    if isinstance(nodes, list) and len(nodes) >= 2:
+        return nodes
+
+    # Fallback: Parse from path_str
+    path_str = row.get("path_str", "")
+    if isinstance(path_str, str) and "->" in path_str:
+        parsed = [n.strip() for n in path_str.split("->")]
+        if len(parsed) >= 2:
+            return parsed
+
+    # Last resort: direct path
+    return [row.get("origin", ""), row.get("dest", "")]
+
+
 def calculate_origin_containers_by_sort_level(
         origin: str,
         dest: str,
@@ -28,8 +68,6 @@ def calculate_origin_containers_by_sort_level(
 ) -> Dict[str, float]:
     """
     Calculate containers created at origin based on chosen sort level.
-
-    Container fill rate = cube / (containers × raw_container_cube)
     """
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = packages * w_cube
@@ -61,15 +99,12 @@ def calculate_origin_containers_by_sort_level(
 
     cube_per_destination = total_cube / sort_destinations
 
-    # Containers needed: pack util determines quantity
     containers_per_destination = max(1, int(np.ceil(
         cube_per_destination / effective_container_cube
     )))
 
     total_containers = containers_per_destination * sort_destinations
 
-    # Container fill rate = actual cube / (containers × RAW cube)
-    # No pack util in fill rate calculation
     container_fill_rate = safe_divide(
         cube_per_destination,
         containers_per_destination * raw_container_cube
@@ -125,14 +160,11 @@ def calculate_arc_containers_from_flows(
 
     CORRECT FORMULA:
     Truck Fill Rate = Total Cube / (Trucks × Trailer Air Cube)
-
-    Pack utilization is NOT in the denominator.
     """
     containers_per_truck = get_containers_per_truck(container_params)
     raw_trailer_cube = get_raw_trailer_cube(container_params)
     w_cube = weighted_pkg_cube(package_mix)
 
-    # Get raw container cube for container fill rate
     gaylord_row = container_params[
         container_params["container_type"].str.lower() == "gaylord"
         ].iloc[0]
@@ -161,14 +193,11 @@ def calculate_arc_containers_from_flows(
 
     trucks_needed = max(1, int(np.ceil(total_containers / containers_per_truck)))
 
-    # CORRECT: Truck fill rate = total_cube / (trucks × raw_trailer_cube)
-    # NO pack utilization in fill rate calculation
     truck_fill_rate = safe_divide(
         total_cube,
         trucks_needed * raw_trailer_cube
     )
 
-    # Average container fill across all flows on this arc
     avg_container_fill = np.mean(container_fill_rates) if container_fill_rates else 0
 
     return {
@@ -190,13 +219,26 @@ def recalculate_arc_summary_with_container_flow(
         mileage_bands: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Rebuild arc summary with correct container flow tracking.
+    Rebuild arc summary with CORRECT container flow tracking.
 
-    CORRECT: Fill Rate = Total Cube / (Trucks × Raw Trailer Cube)
+    CRITICAL FIX: Uses robust path_nodes extraction to ensure all OD flows
+    are properly aggregated to their arcs.
     """
     od_with_containers = build_od_container_map(
         od_selected, package_mix, container_params, facilities
     )
+
+    # CRITICAL FIX: Parse path_nodes from path_str if corrupted
+    print("    Validating path_nodes for arc aggregation...")
+    nodes_fixed = 0
+    for idx, row in od_with_containers.iterrows():
+        nodes = _extract_path_nodes_robust(row)
+        if len(nodes) != len(row.get('path_nodes', [])):
+            od_with_containers.at[idx, 'path_nodes'] = nodes
+            nodes_fixed += 1
+
+    if nodes_fixed > 0:
+        print(f"    Fixed {nodes_fixed} path_nodes entries from path_str")
 
     # Get facility coordinates for distance calculations
     fac = facilities.set_index('facility_name')[['lat', 'lon']].astype(float)
@@ -204,13 +246,10 @@ def recalculate_arc_summary_with_container_flow(
     arc_flows = {}
 
     for _, od_row in od_with_containers.iterrows():
-        path_nodes = od_row.get('path_nodes', [od_row['origin'], od_row['dest']])
+        # Use robust extraction
+        path_nodes = _extract_path_nodes_robust(od_row)
 
-        if not isinstance(path_nodes, (list, tuple)):
-            path_nodes = [od_row['origin'], od_row['dest']]
-        if isinstance(path_nodes, tuple):
-            path_nodes = list(path_nodes)
-
+        # Aggregate flows to arcs
         for i in range(len(path_nodes) - 1):
             from_fac = path_nodes[i]
             to_fac = path_nodes[i + 1]
@@ -226,6 +265,9 @@ def recalculate_arc_summary_with_container_flow(
                 'sort_level': od_row.get('chosen_sort_level', 'market')
             })
 
+    print(f"    Aggregated flows to {len(arc_flows)} unique arcs")
+
+    # Build corrected arc summary
     corrected_arcs = []
 
     for arc_key, od_flows_list in arc_flows.items():
@@ -280,7 +322,18 @@ def recalculate_arc_summary_with_container_flow(
             'num_od_flows': len(od_flows_list)
         })
 
-    return pd.DataFrame(corrected_arcs)
+    result_df = pd.DataFrame(corrected_arcs)
+
+    # Diagnostic: Check major arcs
+    print("\n    Arc Aggregation Diagnostic (top 5 by packages):")
+    if not result_df.empty:
+        top_arcs = result_df.nlargest(5, 'pkgs_day')
+        for _, arc in top_arcs.iterrows():
+            print(f"      {arc['from_facility']}→{arc['to_facility']}: "
+                  f"{arc['pkgs_day']:>6,} pkgs, {arc['num_od_flows']:>3} OD flows, "
+                  f"{arc['trucks']:>2} trucks, {arc['truck_fill_rate']:.1%} fill")
+
+    return result_df
 
 
 def analyze_sort_level_container_impact(
@@ -356,7 +409,6 @@ def create_container_flow_diagnostic(
     lines.append(f"  Difference:           {(corr_avg_fill - orig_avg_fill):+.1%}")
     lines.append("")
 
-    # Explain the correction
     lines.append("Correction Applied:")
     lines.append("  - Fill rate = Total Cube / (Trucks × Raw Trailer Cube)")
     lines.append("  - Pack utilization NOT used in fill rate denominator")

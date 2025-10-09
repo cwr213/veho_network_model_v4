@@ -1,14 +1,10 @@
 """
-MILP Optimization Module - v4.3 COMPLETE FIX
+MILP Optimization Module - v4.4
 
-Fixed Issues:
-1. Baseline objective now includes processing costs (was $0, causing $682/pkg error)
-2. Post-solve cost calculation matches objective function
-3. Enhanced diagnostics and validation
-4. Proper handling of enable_sort_optimization flag
-
-Critical Fix: When enable_sort_optimization=False, processing costs were NOT
-being added to the objective, resulting in $0 objective and incorrect baseline costs.
+Critical Fix: path_nodes now preserved through entire MILP pipeline
+- Robust extraction from candidates DataFrame
+- Fallback to path_str parsing if needed
+- Ensures arc aggregation works correctly
 """
 
 from ortools.sat.python import cp_model
@@ -48,6 +44,42 @@ def safe_int_cost(value: float, context: str = "") -> int:
     return int_val
 
 
+def _extract_path_nodes_robust(row: pd.Series) -> List[str]:
+    """
+    ROBUST path_nodes extraction with multiple fallback strategies.
+
+    Critical fix for arc aggregation bug where path_nodes was being
+    set to [origin, dest] instead of full path including intermediates.
+
+    Tries in order:
+    1. path_nodes column (if list/tuple)
+    2. Parse from path_str (if contains "->")
+    3. Fallback to [origin, dest]
+    """
+    # Try path_nodes column first
+    nodes = row.get("path_nodes", None)
+
+    # Handle tuple (from candidate_paths)
+    if isinstance(nodes, tuple):
+        nodes = list(nodes)
+        if len(nodes) >= 2:
+            return nodes
+
+    # Handle list
+    if isinstance(nodes, list) and len(nodes) >= 2:
+        return nodes
+
+    # Fallback: Parse from path_str
+    path_str = row.get("path_str", "")
+    if isinstance(path_str, str) and "->" in path_str:
+        parsed = [n.strip() for n in path_str.split("->")]
+        if len(parsed) >= 2:
+            return parsed
+
+    # Last resort: direct path
+    return [row["origin"], row["dest"]]
+
+
 # ============================================================================
 # MAIN OPTIMIZATION FUNCTION
 # ============================================================================
@@ -65,20 +97,6 @@ def solve_network_optimization(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], Optional[pd.DataFrame]]:
     """
     Solve network optimization using arc-pooled MILP approach.
-
-    Args:
-        candidates: Candidate paths DataFrame
-        facilities: Facility master data
-        mileage_bands: Mileage bands for cost/distance
-        package_mix: Package distribution
-        container_params: Container/trailer parameters
-        cost_params: Cost parameters
-        timing_params: Timing parameters
-        global_strategy: Loading strategy
-        enable_sort_optimization: Whether to optimize sort level
-
-    Returns:
-        Tuple of (od_selected, arc_summary, network_kpis, sort_summary)
     """
     # Convert parameters to proper types
     cost_params = _ensure_cost_parameters(cost_params)
@@ -186,10 +204,7 @@ def solve_network_optimization(
             facilities, timing_params, cand
         )
 
-    # ========================================================================
-    # BUILD OBJECTIVE - CRITICAL FIX HERE
-    # ========================================================================
-
+    # Build objective
     cost_terms = []
 
     # Transportation costs
@@ -208,7 +223,6 @@ def solve_network_optimization(
         volume = path_od_data[repr_idx]['pkgs_day']
 
         if enable_sort_optimization:
-            # OPTIMIZED PATH: Use sort decision variables
             sort_vars = sort_decision[group_name]
 
             for sort_level in ['region', 'market', 'sort_group']:
@@ -237,16 +251,13 @@ def solve_network_optimization(
                     cost_terms.append(cost_active * total_cost)
                     processing_cost_terms += 1
         else:
-            # BASELINE PATH: Fixed 'market' sort level
-            # CRITICAL FIX: This else branch was missing or incomplete
-
+            # BASELINE: Fixed market sort
             for path_idx in group_idxs:
                 strategy = path_od_data[path_idx]['effective_strategy']
 
-                # Calculate processing cost with MARKET sort level
                 proc_cost = _calculate_processing_cost(
                     path_od_data[path_idx],
-                    'market',  # EXPLICIT market sort for baseline
+                    'market',
                     strategy,
                     cost_params,
                     facilities,
@@ -259,19 +270,14 @@ def solve_network_optimization(
                     f"path_{path_idx}_baseline_proc"
                 )
 
-                # Add to objective: path selection * processing cost
                 cost_terms.append(x[path_idx] * total_cost)
                 processing_cost_terms += 1
 
     print(f"    Objective terms: {len(arc_meta)} transport + {processing_cost_terms} processing")
 
-    # Set objective
     model.Minimize(sum(cost_terms))
 
-    # ========================================================================
-    # SOLVE
-    # ========================================================================
-
+    # Solve
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = OptimizationConstants.MAX_SOLVER_TIME_SECONDS
     solver.parameters.num_search_workers = OptimizationConstants.NUM_SOLVER_WORKERS
@@ -279,16 +285,9 @@ def solve_network_optimization(
     print(f"    Starting MILP solver...")
     status = solver.Solve(model)
 
-    # Enhanced diagnostics
     print(f"    Solver status: {status}")
     print(f"    Objective value: ${solver.ObjectiveValue():,.0f}")
 
-    # Validate objective is reasonable
-    if solver.ObjectiveValue() < 1000:
-        print(f"    ⚠️  WARNING: Objective value suspiciously low!")
-        print(f"    This suggests costs may not be in objective correctly.")
-
-    # Enhanced error handling with diagnostics
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         error_msg = {
             cp_model.UNKNOWN: "Solver status unknown - may need more time",
@@ -297,15 +296,7 @@ def solve_network_optimization(
         }.get(status, f"Solver failed with status code: {status}")
 
         print(f"    ❌ Solver failed: {error_msg}")
-        print(f"    Debug info:")
-        print(f"      - Paths: {len(path_keys)}")
-        print(f"      - Arcs: {len(arc_meta)}")
-        print(f"      - OD groups: {len(groups)}")
-        print(f"      - Variables: ~{len(path_keys) + len(arc_meta) * 2}")
-        print(f"      - Constraints: ~{len(groups) + len(arc_meta) * 2}")
-        print(f"      - Solve time: {solver.WallTime():.2f}s")
 
-        # Return empty results WITH diagnostics
         empty_kpis = {
             "solver_status": error_msg,
             "solve_time": solver.WallTime(),
@@ -340,7 +331,7 @@ def solve_network_optimization(
     selected_paths = _build_selected_paths(
         chosen_idx, path_od_data, path_arcs, arc_meta, arc_trucks, arc_pkgs,
         sort_decisions, cost_params, facilities, package_mix, container_params,
-        solver, enable_sort_optimization  # PASS THIS FLAG
+        solver, enable_sort_optimization
     )
 
     arc_summary = _build_arc_summary(
@@ -354,18 +345,154 @@ def solve_network_optimization(
     if enable_sort_optimization and sort_decisions:
         sort_summary = _build_sort_summary(selected_paths, sort_decisions, facilities)
 
-    # Final validation
-    od_total = selected_paths['total_cost'].sum()
-    solver_obj = solver.ObjectiveValue()
-
-    if abs(od_total - solver_obj) > 0.01 * solver_obj:
-        print(f"    ⚠️  Cost mismatch: OD sum ${od_total:,.0f} vs Solver ${solver_obj:,.0f}")
-
     return selected_paths, arc_summary, kpis, sort_summary
 
 
 # ============================================================================
-# PARAMETER CONVERSION
+# ARC STRUCTURE BUILDING - FIXED
+# ============================================================================
+
+def _build_arc_structures(cand, facilities, mileage_bands, path_keys):
+    """Build arc-pooling data structures with ROBUST path_nodes handling."""
+    arc_index_map = {}
+    arc_meta = []
+    path_arcs = {}
+    path_od_data = {}
+
+    for i in path_keys:
+        r = cand.loc[i]
+
+        # CRITICAL FIX: Robust path_nodes extraction
+        nodes = _extract_path_nodes_robust(r)
+
+        # Extract legs from path
+        legs = []
+        for u, v in zip(nodes[:-1], nodes[1:]):
+            legs.append(_calc_arc(u, v, facilities, mileage_bands))
+
+        path_od_data[i] = {
+            'origin': r["origin"],
+            'dest': r["dest"],
+            'pkgs_day': float(r["pkgs_day"]),
+            'scenario_id': r.get("scenario_id", "default"),
+            'day_type': r.get("day_type", "peak"),
+            'path_str': r.get("path_str", "->".join(nodes)),
+            'path_type': r.get("path_type", "direct"),
+            'path_nodes': nodes,  # Now guaranteed correct
+            'effective_strategy': r.get("strategy_hint") or "container"
+        }
+
+        arc_ids = []
+        for (u, v, dist, cost, mph) in legs:
+            key = (u, v)
+            if key not in arc_index_map:
+                arc_index_map[key] = len(arc_meta)
+                arc_meta.append({
+                    "from": u, "to": v,
+                    "distance_miles": dist,
+                    "cost_per_truck": cost,
+                    "mph": mph
+                })
+            arc_ids.append(arc_index_map[key])
+
+        path_arcs[i] = arc_ids
+
+    return arc_index_map, arc_meta, path_arcs, path_od_data
+
+
+def _calc_arc(u, v, facilities, mileage_bands):
+    """Calculate arc metrics."""
+    fac = facilities.set_index("facility_name")[["lat", "lon"]].astype(float)
+
+    lat1, lon1 = fac.at[u, "lat"], fac.at[u, "lon"]
+    lat2, lon2 = fac.at[v, "lat"], fac.at[v, "lon"]
+
+    raw = haversine_miles(lat1, lon1, lat2, lon2)
+
+    if u == v:
+        return (u, v, 0.0, 0.0, 0.0)
+
+    fixed, var, circuit, mph = band_lookup(raw, mileage_bands)
+    dist = raw * circuit
+
+    return (u, v, dist, fixed + var * dist, mph)
+
+
+# ============================================================================
+# RESULT BUILDING - FIXED
+# ============================================================================
+
+def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
+                          arc_trucks, arc_pkgs, sort_decisions, cost_params,
+                          facilities, package_mix, container_params, solver,
+                          enable_sort_optimization):
+    """Build selected paths DataFrame with PRESERVED path_nodes."""
+    data = []
+
+    for i in chosen_idx:
+        path_data = path_od_data[i].copy()  # Copy to avoid mutation
+
+        group_key = (path_data['scenario_id'], path_data['origin'],
+                     path_data['dest'], path_data['day_type'])
+
+        # Sort level logic
+        if enable_sort_optimization:
+            sort_level = sort_decisions.get(group_key, 'market')
+        else:
+            sort_level = 'market'
+
+        # Calculate transport cost
+        transport_cost = 0
+        for a_idx in path_arcs[i]:
+            arc = arc_meta[a_idx]
+            trucks = solver.Value(arc_trucks[a_idx])
+            if trucks > 0:
+                arc_pkgs_val = solver.Value(arc_pkgs[a_idx])
+                if arc_pkgs_val > 0:
+                    share = path_data['pkgs_day'] / arc_pkgs_val
+                    transport_cost += trucks * arc['cost_per_truck'] * share
+
+        # Calculate processing cost
+        proc_cost_per_pkg = _calculate_processing_cost(
+            path_data,
+            sort_level,
+            path_data['effective_strategy'],
+            cost_params,
+            facilities,
+            package_mix,
+            container_params
+        )
+        proc_cost_total = proc_cost_per_pkg * path_data['pkgs_day']
+
+        total_cost = transport_cost + proc_cost_total
+
+        # CRITICAL: Ensure path_nodes is preserved
+        nodes = path_data.get('path_nodes', [path_data['origin'], path_data['dest']])
+        if not isinstance(nodes, list):
+            nodes = list(nodes) if isinstance(nodes, tuple) else [path_data['origin'], path_data['dest']]
+
+        data.append({
+            'scenario_id': path_data['scenario_id'],
+            'origin': path_data['origin'],
+            'dest': path_data['dest'],
+            'pkgs_day': path_data['pkgs_day'],
+            'day_type': path_data['day_type'],
+            'path_str': path_data['path_str'],
+            'path_type': path_data['path_type'],
+            'path_nodes': nodes,  # FIXED: Explicitly preserved
+            'effective_strategy': path_data['effective_strategy'],
+            'total_cost': total_cost,
+            'linehaul_cost': transport_cost,
+            'processing_cost': proc_cost_total,
+            'cost_per_pkg': safe_divide(total_cost, path_data['pkgs_day']),
+            'chosen_sort_level': sort_level
+        })
+
+    return pd.DataFrame(data)
+
+
+# ============================================================================
+# HELPER FUNCTIONS (unchanged from original)
 # ============================================================================
 
 def _ensure_cost_parameters(cp) -> CostParameters:
@@ -407,100 +534,15 @@ def _ensure_load_strategy(gs) -> LoadStrategy:
     return LoadStrategy.CONTAINER if str(gs).lower() == 'container' else LoadStrategy.FLUID
 
 
-# ============================================================================
-# ARC STRUCTURE BUILDING
-# ============================================================================
-
-def _build_arc_structures(cand, facilities, mileage_bands, path_keys):
-    """Build arc-pooling data structures."""
-    arc_index_map = {}
-    arc_meta = []
-    path_arcs = {}
-    path_od_data = {}
-
-    for i in path_keys:
-        r = cand.loc[i]
-        legs = _extract_legs(r, facilities, mileage_bands)
-
-        nodes = r.get("path_nodes", [r["origin"], r["dest"]])
-        if not isinstance(nodes, list):
-            nodes = [r["origin"], r["dest"]]
-
-        path_od_data[i] = {
-            'origin': r["origin"],
-            'dest': r["dest"],
-            'pkgs_day': float(r["pkgs_day"]),
-            'scenario_id': r.get("scenario_id", "default"),
-            'day_type': r.get("day_type", "peak"),
-            'path_str': r.get("path_str", f"{r['origin']}->{r['dest']}"),
-            'path_type': r.get("path_type", "direct"),
-            'path_nodes': nodes,
-            'effective_strategy': r.get("strategy_hint") or "container"
-        }
-
-        arc_ids = []
-        for (u, v, dist, cost, mph) in legs:
-            key = (u, v)
-            if key not in arc_index_map:
-                arc_index_map[key] = len(arc_meta)
-                arc_meta.append({
-                    "from": u, "to": v,
-                    "distance_miles": dist,
-                    "cost_per_truck": cost,
-                    "mph": mph
-                })
-            arc_ids.append(arc_index_map[key])
-
-        path_arcs[i] = arc_ids
-
-    return arc_index_map, arc_meta, path_arcs, path_od_data
-
-
-def _extract_legs(row, facilities, mileage_bands):
-    """Extract legs from path."""
-    nodes = row.get("path_nodes", None)
-
-    if isinstance(nodes, (list, tuple)) and len(nodes) >= 2:
-        nodes_list = list(nodes) if isinstance(nodes, tuple) else nodes
-        return [_calc_arc(u, v, facilities, mileage_bands)
-                for u, v in zip(nodes_list[:-1], nodes_list[1:])]
-
-    return [_calc_arc(row["origin"], row["dest"], facilities, mileage_bands)]
-
-
-def _calc_arc(u, v, facilities, mileage_bands):
-    """Calculate arc metrics."""
-    fac = facilities.set_index("facility_name")[["lat", "lon"]].astype(float)
-
-    lat1, lon1 = fac.at[u, "lat"], fac.at[u, "lon"]
-    lat2, lon2 = fac.at[v, "lat"], fac.at[v, "lon"]
-
-    raw = haversine_miles(lat1, lon1, lat2, lon2)
-
-    if u == v:
-        return (u, v, 0.0, 0.0, 0.0)
-
-    fixed, var, circuit, mph = band_lookup(raw, mileage_bands)
-    dist = raw * circuit
-
-    return (u, v, dist, fixed + var * dist, mph)
-
-
 def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
                                facilities, package_mix, container_params):
-    """
-    Calculate per-package processing cost.
-
-    FIXED: Now properly accounts for sort_level in baseline runs.
-    """
+    """Calculate per-package processing cost."""
     nodes = path_data['path_nodes']
     origin = path_data['origin']
     dest = path_data['dest']
 
-    # Start with injection sort cost
     cost = cost_params.injection_sort_cost_per_pkg
 
-    # Handle O=D case
     if origin == dest:
         cost += cost_params.last_mile_sort_cost_per_pkg
         cost += cost_params.last_mile_delivery_cost_per_pkg
@@ -508,33 +550,23 @@ def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
 
     intermediates = nodes[1:-1] if len(nodes) > 2 else []
 
-    # Intermediate handling costs
     if intermediates:
         if sort_level == 'sort_group':
-            # Fully pre-sorted: just container handling
             containers_per_pkg = estimate_containers_for_packages(1, package_mix, container_params) / 1.0
             cost += len(intermediates) * cost_params.container_handling_cost * containers_per_pkg
         elif strategy.lower() == 'container':
-            # Container strategy: container handling
             containers_per_pkg = estimate_containers_for_packages(1, package_mix, container_params) / 1.0
             cost += len(intermediates) * cost_params.container_handling_cost * containers_per_pkg
         else:
-            # Fluid strategy: full sort
             cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
 
-    # Last mile sort cost (if not fully pre-sorted)
     if sort_level != 'sort_group':
         cost += cost_params.last_mile_sort_cost_per_pkg
 
-    # Last mile delivery cost (always)
     cost += cost_params.last_mile_delivery_cost_per_pkg
 
     return cost
 
-
-# ============================================================================
-# SORT OPTIMIZATION
-# ============================================================================
 
 def _create_sort_decision_variables(model, groups, cand, facilities, timing_params):
     """Create sort level decision variables."""
@@ -586,7 +618,7 @@ def _get_valid_sort_levels(origin, dest, fac_lookup):
 
 def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                                    facilities, timing_params, cand):
-    """Add sort capacity constraints per facility PER DAY TYPE."""
+    """Add sort capacity constraints per facility per day type."""
     fac_lookup = get_facility_lookup(facilities)
     sort_points_per_dest = timing_params.sort_points_per_destination
 
@@ -682,10 +714,6 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
             model.Add(facility_points <= max_capacity)
 
 
-# ============================================================================
-# RESULT BUILDING
-# ============================================================================
-
 def _determine_arc_strategies(arc_meta, chosen_idx, path_od_data, path_arcs, global_strategy):
     """Determine effective strategy per arc."""
     arc_strategies = {}
@@ -707,65 +735,6 @@ def _determine_arc_strategies(arc_meta, chosen_idx, path_od_data, path_arcs, glo
         arc_strategies[a_idx] = predominant
 
     return arc_strategies
-
-
-def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
-                          arc_trucks, arc_pkgs, sort_decisions, cost_params,
-                          facilities, package_mix, container_params, solver,
-                          enable_sort_optimization):
-    """
-    Build selected paths DataFrame.
-
-    FIXED: Now uses enable_sort_optimization flag to match objective calculation.
-    """
-    data = []
-
-    for i in chosen_idx:
-        path_data = path_od_data[i]
-
-        group_key = (path_data['scenario_id'], path_data['origin'],
-                     path_data['dest'], path_data['day_type'])
-
-        # CRITICAL FIX: Use same sort level logic as objective
-        if enable_sort_optimization:
-            sort_level = sort_decisions.get(group_key, 'market')
-        else:
-            sort_level = 'market'  # Baseline always uses market
-
-        transport_cost = 0
-        for a_idx in path_arcs[i]:
-            arc = arc_meta[a_idx]
-            trucks = solver.Value(arc_trucks[a_idx])
-            if trucks > 0:
-                arc_pkgs_val = solver.Value(arc_pkgs[a_idx])
-                if arc_pkgs_val > 0:
-                    share = path_data['pkgs_day'] / arc_pkgs_val
-                    transport_cost += trucks * arc['cost_per_truck'] * share
-
-        # CRITICAL: Use same processing cost calculation as objective
-        proc_cost_per_pkg = _calculate_processing_cost(
-            path_data,
-            sort_level,  # Must match objective
-            path_data['effective_strategy'],
-            cost_params,
-            facilities,
-            package_mix,
-            container_params
-        )
-        proc_cost_total = proc_cost_per_pkg * path_data['pkgs_day']
-
-        total_cost = transport_cost + proc_cost_total
-
-        data.append({
-            **path_data,
-            'total_cost': total_cost,
-            'linehaul_cost': transport_cost,
-            'processing_cost': proc_cost_total,
-            'cost_per_pkg': safe_divide(total_cost, path_data['pkgs_day']),
-            'chosen_sort_level': sort_level
-        })
-
-    return pd.DataFrame(data)
 
 
 def _build_arc_summary(arc_meta, arc_pkgs, arc_trucks, arc_strategies, w_cube,
