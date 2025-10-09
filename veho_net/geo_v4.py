@@ -13,6 +13,11 @@ Distance Calculation:
     Uses Haversine formula for great-circle distance on a sphere.
     Suitable for transportation network planning where accuracy within
     0.5% is acceptable (ignores Earth's ellipsoid shape).
+
+CRITICAL FIX v4.5:
+    - O=D flows now use mileage_bands for distance=0 (not hardcoded)
+    - Enhanced validation and error messages
+    - Zone values cleaned and normalized
 """
 
 import math
@@ -92,14 +97,14 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     a = (math.sin(dphi / 2.0) ** 2 +
          math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2.0) ** 2)
 
-    # NEW: Numerical stability fix for antipodal points
+    # Numerical stability fix for antipodal points
     a = min(1.0, a)  # Clamp to prevent sqrt of >1 due to floating point errors
 
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     distance = EARTH_RADIUS_MILES * c
 
-    # NEW: Validation
+    # Validation
     if not math.isfinite(distance):
         raise ValueError(
             f"Invalid distance calculation for coordinates: "
@@ -108,10 +113,12 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
 
     return distance
 
+
 @lru_cache(maxsize=10000)
 def cached_haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Cached haversine calculation for repeated lookups."""
     return haversine_miles(lat1, lon1, lat2, lon2)
+
 
 def calculate_distance_with_circuity(
         lat1: float, lon1: float,
@@ -134,7 +141,6 @@ def calculate_distance_with_circuity(
     actual_distance = straight_line * circuity
 
     return straight_line, actual_distance
-
 
 
 # ============================================================================
@@ -242,7 +248,7 @@ def get_mileage_band_for_distance(
 
 
 # ============================================================================
-# ZONE CLASSIFICATION
+# ZONE CLASSIFICATION - FIXED v4.5
 # ============================================================================
 
 def calculate_zone_from_distance(
@@ -252,22 +258,25 @@ def calculate_zone_from_distance(
         mileage_bands: pd.DataFrame
 ) -> str:
     """
-    Calculate zone classification based on straight-line distance between facilities.
+    Calculate zone classification based on straight-line distance.
 
-    Zone Classification Business Logic:
-    ------------------------------------
-    Zones drive shipper pricing tiers and should reflect geographic service
-    areas, NOT carrier routing decisions. Therefore:
+    CRITICAL FIX v4.5:
+    - O=D flows now use mileage_bands for distance=0 (not hardcoded)
+    - All middle-mile flows use mileage_bands consistently
+    - Enhanced validation and error messages
 
-    - Use O-D straight-line distance (Haversine, no circuity)
-    - This ensures consistent zone assignment regardless of routing
-    - Example: NYC→Boston is same zone whether routed direct or via Hartford
+    Zone Assignment Logic:
+    ----------------------
+    ALL middle-mile flows (including O=D) use mileage_bands lookup:
+    - Calculate haversine distance (O=D returns 0.0)
+    - Look up zone in mileage_bands based on distance
+    - Zone 0 is ONLY for direct injection (handled separately)
 
     Zone classification typically maps to pricing structures:
-    - Zone 1: Local (< 50 miles)
-    - Zone 2: Regional (50-150 miles)
+    - Zone 1: Local (0-50 miles) - may include O=D if band starts at 0
+    - Zone 2: Regional (50-150 miles) - typically includes O=D
     - Zone 3: Inter-regional (150-500 miles)
-    - Zone 4: National (500+ miles)
+    - Zone 4+: National (500+ miles)
 
     Args:
         origin: Origin facility name
@@ -276,12 +285,17 @@ def calculate_zone_from_distance(
         mileage_bands: Mileage bands with 'zone' column
 
     Returns:
-        Zone string (e.g., "Zone 2", "1", etc.) from mileage_bands
+        Zone string (e.g., "2", "3", etc.) from mileage_bands
         Returns 'unknown' if facilities not found or calculation fails
 
     Example:
-        >>> zone = calculate_zone_from_distance('HUB1', 'LAUNCH5', facilities, bands)
-        >>> # Returns 'Zone 2' for 120-mile distance
+        >>> # O=D flow
+        >>> zone = calculate_zone_from_distance('DFW02', 'DFW02', facilities, bands)
+        >>> # Returns '2' if mileage_bands has band starting at 0 with zone=2
+
+        >>> # Long-haul flow
+        >>> zone = calculate_zone_from_distance('DFW02', 'SEA01', facilities, bands)
+        >>> # Returns '8' for ~2000 mile distance
     """
     try:
         fac_lookup = get_facility_lookup(facilities)
@@ -306,32 +320,79 @@ def calculate_zone_from_distance(
             print(f"Warning: Invalid coordinates for {origin} or {dest}")
             return 'unknown'
 
-        # Calculate straight-line distance (no circuity for zone classification)
+        # Calculate straight-line distance (NO circuity for zone classification)
         raw_distance = haversine_miles(o_lat, o_lon, d_lat, d_lon)
 
-        # Look up zone from mileage bands
+        # CRITICAL: For O=D, distance is 0.0
+        # Let mileage_bands handle this - should have band starting at 0
+
+        # Validate mileage_bands has zone column
         if 'zone' not in mileage_bands.columns:
             print("Warning: 'zone' column not found in mileage_bands")
             return 'unknown'
 
+        # Find matching band by distance
         matching_band = mileage_bands[
             (mileage_bands['mileage_band_min'] <= raw_distance) &
             (raw_distance <= mileage_bands['mileage_band_max'])
             ]
 
         if not matching_band.empty:
-            zone = str(matching_band.iloc[0]['zone'])
-            return zone if zone and zone.lower() != 'nan' else 'unknown'
+            zone_val = matching_band.iloc[0]['zone']
+
+            # Clean zone value
+            if pd.isna(zone_val):
+                return 'unknown'
+
+            zone_str = str(zone_val).strip()
+
+            # Remove "Zone " prefix if present, return just number
+            if zone_str.lower().startswith("zone "):
+                zone_str = zone_str[5:].strip()
+
+            # Validate it's a valid zone (0-8)
+            try:
+                zone_int = int(float(zone_str))
+                if 0 <= zone_int <= 8:
+                    return str(zone_int)
+                else:
+                    print(f"Warning: Zone {zone_int} outside valid range (0-8) for {origin}→{dest}")
+                    return 'unknown'
+            except (ValueError, TypeError):
+                print(f"Warning: Invalid zone value '{zone_str}' for {origin}→{dest}")
+                return 'unknown'
 
         # Distance exceeds all bands - use last band's zone
         if raw_distance > mileage_bands['mileage_band_max'].max():
-            zone = str(mileage_bands.iloc[-1]['zone'])
-            return zone if zone and zone.lower() != 'nan' else 'unknown'
+            zone_val = mileage_bands.iloc[-1]['zone']
 
+            if pd.isna(zone_val):
+                return 'unknown'
+
+            zone_str = str(zone_val).strip()
+            if zone_str.lower().startswith("zone "):
+                zone_str = zone_str[5:].strip()
+
+            try:
+                zone_int = int(float(zone_str))
+                if 0 <= zone_int <= 8:
+                    return str(zone_int)
+            except (ValueError, TypeError):
+                pass
+
+            return 'unknown'
+
+        # Distance below all bands - should not happen if bands start at 0
+        min_band = mileage_bands['mileage_band_min'].min()
+        print(f"Warning: Distance {raw_distance:.1f} miles below all mileage bands for {origin}→{dest}")
+        print(f"  Minimum band starts at: {min_band}")
+        print(f"  Ensure mileage_bands has a band starting at 0 for O=D flows")
         return 'unknown'
 
     except Exception as e:
         print(f"Warning: Could not calculate zone for {origin}→{dest}: {e}")
+        import traceback
+        traceback.print_exc()
         return 'unknown'
 
 
@@ -363,7 +424,15 @@ def calculate_zone_from_coordinates(
             ]
 
         if not matching_band.empty:
-            return str(matching_band.iloc[0]['zone'])
+            zone_val = matching_band.iloc[0]['zone']
+            if pd.isna(zone_val):
+                return 'unknown'
+
+            zone_str = str(zone_val).strip()
+            if zone_str.lower().startswith("zone "):
+                zone_str = zone_str[5:].strip()
+
+            return zone_str
 
         return 'unknown'
 
@@ -385,6 +454,7 @@ def validate_mileage_bands(mileage_bands: pd.DataFrame) -> bool:
         - No overlapping ranges (except at boundaries)
         - min < max for all bands
         - Positive cost/speed values
+        - Band starts at 0 for O=D support
 
     Args:
         mileage_bands: Mileage bands DataFrame
@@ -413,6 +483,15 @@ def validate_mileage_bands(mileage_bands: pd.DataFrame) -> bool:
         raise ValueError(
             f"Invalid mileage band ranges (min >= max):\n"
             f"{invalid_ranges[['mileage_band_min', 'mileage_band_max']]}"
+        )
+
+    # Check first band starts at 0 (for O=D support)
+    min_band = mileage_bands['mileage_band_min'].min()
+    if min_band > OptimizationConstants.EPSILON:
+        print(
+            f"Warning: First mileage band starts at {min_band} miles, not 0.\n"
+            f"  O=D flows (0 miles) may not be classified correctly.\n"
+            f"  Consider adding a band starting at 0."
         )
 
     # Check for gaps (optional - warn only)

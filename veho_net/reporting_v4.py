@@ -1,10 +1,16 @@
 """
-Reporting Module
+Reporting Module - v4.5
 
 ZONE 0 FIX:
 - Zone 0 is ONLY for direct injection (tracked separately in direct_day)
 - Middle-mile O=D uses zone from mileage_bands for distance=0
 - Zone distribution includes both od_selected AND direct_day
+
+Updates:
+1. facility_network_profile now includes direct injection for zone 0
+2. zone_cost_analysis uses consistent zone normalization
+3. All percentages as decimals (not multiplied by 100)
+4. Added zone_miles to od_selected for validation
 """
 
 import pandas as pd
@@ -513,10 +519,11 @@ def _calculate_zone_distribution_for_ods(
     """
     FIXED: Calculate zone distribution including direct injection.
 
+    Returns DECIMALS not percentages (0.25 not 25.0)
+
     Returns dict with:
-    - zone_0_pct: Direct injection (no middle-mile) - from direct_day
-    - zone_1_pct through zone_8_pct: Mileage-based zones - from ods
-    - zone_unknown_pct: Unclassified zones (data quality flag)
+    - zone_0_pct through zone_8_pct (as decimals 0-1)
+    - zone_unknown_pct (as decimal)
     """
     # Start with middle-mile OD zones
     total_pkgs = 0
@@ -550,13 +557,13 @@ def _calculate_zone_distribution_for_ods(
                 zone_pkgs['0'] += direct_pkgs
                 total_pkgs += direct_pkgs
 
-    # Calculate percentages
+    # Calculate percentages as DECIMALS
     zone_dist = {}
     for zone_num in range(9):
         zone_str = str(zone_num)
-        zone_dist[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs) * 100, 2)
+        zone_dist[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs), 4)
 
-    zone_dist['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs) * 100, 2)
+    zone_dist['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs), 4)
 
     return zone_dist
 
@@ -591,8 +598,8 @@ def _calculate_sort_level_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, f
         pkgs = level_ods['pkgs_day'].sum()
         dests = len(level_ods)
 
-        result[f'{sort_level}_pct_pkgs'] = round(safe_divide(pkgs, total_pkgs) * 100, 2)
-        result[f'{sort_level}_pct_dests'] = round(safe_divide(dests, total_dests) * 100, 2)
+        result[f'{sort_level}_pct_pkgs'] = round(safe_divide(pkgs, total_pkgs), 4)
+        result[f'{sort_level}_pct_dests'] = round(safe_divide(dests, total_dests), 4)
 
     return result
 
@@ -668,14 +675,14 @@ def calculate_network_zone_distribution(
             zone_pkgs['0'] += direct_pkgs
             total_pkgs += direct_pkgs
 
-    # Calculate results
+    # Calculate results as decimals
     for zone_num in range(9):
         zone_str = str(zone_num)
         result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs[zone_str])
-        result[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs) * 100, 2)
+        result[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs), 4)
 
     result['zone_unknown_pkgs'] = int(zone_pkgs['unknown'])
-    result['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs) * 100, 2)
+    result['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs), 4)
 
     return result
 
@@ -710,8 +717,8 @@ def calculate_network_sort_distribution(od_selected: pd.DataFrame) -> Dict:
         dests = len(level_ods)
 
         result[f'{sort_level}_pkgs'] = int(pkgs)
-        result[f'{sort_level}_pct_pkgs'] = round(safe_divide(pkgs, total_pkgs) * 100, 2)
-        result[f'{sort_level}_pct_dests'] = round(safe_divide(dests, total_dests) * 100, 2)
+        result[f'{sort_level}_pct_pkgs'] = round(safe_divide(pkgs, total_pkgs), 4)
+        result[f'{sort_level}_pct_dests'] = round(safe_divide(dests, total_dests), 4)
 
     return result
 
@@ -774,6 +781,39 @@ def add_direct_injection_zone_classification(
     direct_df['zone'] = '0'
 
     return direct_df
+
+
+def add_zone_miles_to_od_selected(
+        od_df: pd.DataFrame,
+        facilities: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Add zone_miles column for validation.
+
+    This allows validation of zone classification by showing actual O-D distance.
+    """
+    if od_df.empty:
+        return od_df
+
+    od_df = od_df.copy()
+    fac_lookup = get_facility_lookup(facilities)
+
+    od_df['zone_miles'] = 0.0
+
+    for idx, row in od_df.iterrows():
+        origin = row['origin']
+        dest = row['dest']
+
+        if origin in fac_lookup.index and dest in fac_lookup.index:
+            o_lat = fac_lookup.at[origin, 'lat']
+            o_lon = fac_lookup.at[origin, 'lon']
+            d_lat = fac_lookup.at[dest, 'lat']
+            d_lon = fac_lookup.at[dest, 'lon']
+
+            zone_miles = haversine_miles(o_lat, o_lon, d_lat, d_lon)
+            od_df.at[idx, 'zone_miles'] = round(zone_miles, 1)
+
+    return od_df
 
 
 # ============================================================================

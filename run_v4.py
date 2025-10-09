@@ -7,6 +7,8 @@ Updates:
 3. Zones 2-8 from mileage bands
 4. Unknown zone flagging and warnings
 5. Comprehensive zone cost analysis including direct injection
+6. FIXED: Zone miles validation column added
+7. FIXED: Percentages as decimals for Excel formatting
 """
 
 import argparse
@@ -32,6 +34,7 @@ from veho_net.reporting_v4 import (
     calculate_network_sort_distribution,
     add_zone_classification,
     add_direct_injection_zone_classification,
+    add_zone_miles_to_od_selected,
     build_path_steps,
     build_sort_summary,
     validate_network_aggregations
@@ -237,6 +240,7 @@ def main(input_path: str, output_dir: str):
     print(f"  - Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
     print(f"  - Container flow correction: ENABLED")
     print(f"  - Zone tracking: 0-8 + Unknown")
+    print(f"  - Zone miles validation: ENABLED")
     print(f"  - Path around factor: {around_factor}")
     print(f"  - Run ID: {run_id}")
 
@@ -483,6 +487,12 @@ def main(input_path: str, output_dir: str):
                 dfs["mileage_bands"]
             )
 
+            # NEW: Add zone_miles column for validation
+            od_selected = add_zone_miles_to_od_selected(
+                od_selected,
+                dfs["facilities"]
+            )
+
             # Check for unknown zones
             unknown_zones = od_selected[od_selected['zone'] == 'unknown']
             if not unknown_zones.empty:
@@ -490,6 +500,11 @@ def main(input_path: str, output_dir: str):
                 unknown_pct = (unknown_pkgs / od_selected['pkgs_day'].sum()) * 100
                 print(f"  ⚠️  WARNING: {unknown_pct:.1f}% of packages in unknown zone")
                 print(f"     {len(unknown_zones)} OD pairs affected")
+
+                # Print examples for debugging
+                print(f"\n     Example unknown zone ODs:")
+                for _, row in unknown_zones.head(5).iterrows():
+                    print(f"     {row['origin']} -> {row['dest']}: {row['zone_miles']:.1f} miles")
             else:
                 print(f"  ✓ All OD pairs successfully classified")
 
@@ -609,12 +624,13 @@ def main(input_path: str, output_dir: str):
                 traceback.print_exc()
                 facility_volume = pd.DataFrame()
 
-            # Facility network profile
+            # Facility network profile - FIXED: Pass direct_day
             try:
                 facility_network_profile = build_facility_network_profile(
                     od_selected,
                     dfs["facilities"],
-                    dfs["mileage_bands"]
+                    dfs["mileage_bands"],
+                    direct_day  # FIXED: Pass direct_day for zone 0
                 )
                 print("  ✓ Facility network profile built")
             except Exception as e:
@@ -632,7 +648,7 @@ def main(input_path: str, output_dir: str):
                     od_selected,
                     dfs["facilities"]
                 )
-                zone_distribution = calculate_network_zone_distribution(od_selected)
+                zone_distribution = calculate_network_zone_distribution(od_selected, direct_day)
 
                 sort_distribution = {}
                 if enable_sort_opt and not sort_summary.empty:
@@ -700,7 +716,8 @@ def main(input_path: str, output_dir: str):
                 {"key": "direct_injection_packages", "value": direct_pkgs_total},
                 {"key": "total_packages", "value": total_pkgs + direct_pkgs_total},
                 {"key": "container_flow_corrected", "value": True},
-                {"key": "zone_tracking", "value": "0-8 + Unknown"}
+                {"key": "zone_tracking", "value": "0-8 + Unknown"},
+                {"key": "zone_miles_validation", "value": True}
             ])
 
             # ================================================================
@@ -907,6 +924,8 @@ def main(input_path: str, output_dir: str):
     print(f"📄 Created files: {len(created_files)}")
     print(f"✅ Container flow correction: APPLIED")
     print(f"✅ Zone tracking: 0 (DI) + 1-8 + Unknown")
+    print(f"✅ Zone miles validation: ADDED")
+    print(f"✅ Percentage decimals: FIXED")
     print(f"✅ Unknown zone flagging: ACTIVE")
     print(f"✅ Enhanced error handling: ACTIVE")
 
@@ -931,9 +950,13 @@ Examples:
 
 Zone Classification:
   - Zone 0: Direct injection (no middle-mile transport)
-  - Zone 1: Middle-mile O=D (same origin/dest with injection sort)
-  - Zones 2-8: Distance-based from mileage_bands
+  - Zone 1-8: Distance-based from mileage_bands (includes O=D)
   - Unknown: Classification failed (data quality flag)
+
+Zone Validation:
+  - Check zone_miles column in od_selected_paths
+  - Verify against mileage_band ranges
+  - O=D flows should show 0.0 miles
 
 For input file validation, run the diagnostic script first:
   python diagnostic_runner.py data/input.xlsx
