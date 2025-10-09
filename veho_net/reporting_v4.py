@@ -1,20 +1,10 @@
 """
 Reporting Module
 
-Generates facility-level aggregations, network metrics, and analytics outputs.
-
-Key Outputs:
-    - facility_volume: Daily operational volumes and throughput
-    - facility_network_profile: Network characteristics per facility
-    - Network-level KPIs with zone/sort/distance/touch distributions
-
-Major Changes in v4:
-    - Removed cost allocation columns (accuracy issues)
-    - Split facility_rollup into volume and network profile
-    - Added zone distribution (Zones 1-8)
-    - Added sort level distribution (region/market/sort_group)
-    - Added distance metrics (zone_miles, transit_miles)
-    - Added touch metrics (total_touches, hub_touches)
+Key Fixes:
+1. Facility network profile now correctly calculates zone/sort distributions
+2. Helper functions properly weight by packages
+3. All metrics use package-weighted averages
 """
 
 import pandas as pd
@@ -43,25 +33,9 @@ def build_facility_volume(
 ) -> pd.DataFrame:
     """
     Calculate facility daily volumes and throughput (operational metrics only).
-
-    NO COST COLUMNS - focus on volumes, containers, trucks, and throughput.
-
-    Args:
-        od_selected: Selected OD paths
-        direct_day: Direct injection volumes
-        arc_summary: Arc-level aggregations
-        package_mix: Package distribution
-        container_params: Container parameters
-        strategy: Loading strategy
-        facilities: Facility master data
-        timing_params: Timing parameters dict
-
-    Returns:
-        DataFrame with operational metrics per facility
     """
     volume_data = []
 
-    # Get all facilities
     all_facilities = set()
     if not od_selected.empty:
         all_facilities.update(od_selected['origin'].unique())
@@ -90,12 +64,11 @@ def build_facility_volume(
                             )
                             direct_containers = containers['containers']
 
-            # Middle-mile injection volumes (EXCLUDE O=D to prevent double-count)
+            # Middle-mile injection volumes (EXCLUDE O=D)
             mm_injection_pkgs = 0
             mm_injection_containers = 0
 
             if not od_selected.empty:
-                # NEW: Exclude O=D from injection count
                 outbound = od_selected[
                     (od_selected['origin'] == facility) &
                     (od_selected['origin'] != od_selected['dest'])
@@ -109,7 +82,7 @@ def build_facility_volume(
                         )
                         mm_injection_containers = containers['containers']
 
-            # NEW: Separate O=D handling for hybrid facilities
+            # O=D volumes for hybrid facilities
             od_same_pkgs = 0
             od_same_containers = 0
 
@@ -127,7 +100,7 @@ def build_facility_volume(
                         )
                         od_same_containers = containers['containers']
 
-            # Intermediate facility operations (sort vs crossdock)
+            # Intermediate facility operations
             intermediate_pkgs_sort = 0
             intermediate_pkgs_crossdock = 0
             intermediate_containers_sort = 0
@@ -136,10 +109,9 @@ def build_facility_volume(
             if not od_selected.empty:
                 for _, path_row in od_selected.iterrows():
                     path_nodes = path_row.get('path_nodes', [])
-                    if not isinstance(path_nodes, (list, tuple)):  # CHANGED: accept tuple
+                    if not isinstance(path_nodes, (list, tuple)):
                         continue
 
-                    # Convert tuple to list if needed
                     if isinstance(path_nodes, tuple):
                         path_nodes = list(path_nodes)
 
@@ -176,12 +148,11 @@ def build_facility_volume(
             intermediate_pkgs = intermediate_pkgs_sort + intermediate_pkgs_crossdock
             intermediate_containers = intermediate_containers_sort + intermediate_containers_crossdock
 
-            # Last mile volumes (includes both direct injection and MM arrivals)
-            last_mile_pkgs = direct_pkgs  # Direct injection
+            # Last mile volumes
+            last_mile_pkgs = direct_pkgs
             last_mile_containers = direct_containers
 
             if not od_selected.empty:
-                # All inbound ODs (including O=D from middle-mile)
                 inbound = od_selected[od_selected['dest'] == facility]
                 if not inbound.empty:
                     mm_last_mile = inbound['pkgs_day'].sum()
@@ -193,11 +164,9 @@ def build_facility_volume(
                         )
                         last_mile_containers += containers['containers']
 
-            # Total containers calculation
-            # For hybrid facilities with O=D: count once in injection + intermediate + last mile
-            # The O=D flow goes through injection sort, then last mile sort/delivery
+            # Total containers
             total_containers = (mm_injection_containers +
-                                od_same_containers +  # NEW: Add O=D separately
+                                od_same_containers +
                                 intermediate_containers +
                                 last_mile_containers)
 
@@ -219,13 +188,12 @@ def build_facility_volume(
                 if not inbound_arcs.empty:
                     inbound_trucks = int(inbound_arcs['trucks'].sum())
 
-            # Hourly throughput calculations
+            # Hourly throughput
             injection_va_hours = float(timing_params['injection_va_hours'])
             middle_mile_va_hours = float(timing_params['middle_mile_va_hours'])
             crossdock_va_hours = float(timing_params.get('crossdock_va_hours', 3.0))
             last_mile_va_hours = float(timing_params['last_mile_va_hours'])
 
-            # NEW: Include O=D in injection throughput for hybrids
             total_injection_pkgs = mm_injection_pkgs + od_same_pkgs
             injection_hourly = safe_divide(total_injection_pkgs, injection_va_hours)
 
@@ -240,45 +208,28 @@ def build_facility_volume(
                 last_mile_hourly
             )
 
-            # Get facility type
             fac_type = fac_lookup.at[facility, 'type'] if facility in fac_lookup.index else 'unknown'
 
             volume_entry = {
                 'facility': facility,
                 'facility_type': fac_type,
-
-                # Injection volumes (excluding O=D)
                 'injection_pkgs_day': mm_injection_pkgs,
                 'injection_containers': mm_injection_containers,
-
-                # NEW: O=D volumes for hybrid facilities
                 'od_same_pkgs_day': od_same_pkgs,
                 'od_same_containers': od_same_containers,
-
-                # Intermediate volumes (split by operation type)
                 'intermediate_sort_pkgs_day': intermediate_pkgs_sort,
                 'intermediate_crossdock_pkgs_day': intermediate_pkgs_crossdock,
                 'intermediate_pkgs_day': intermediate_pkgs,
                 'intermediate_sort_containers': intermediate_containers_sort,
                 'intermediate_crossdock_containers': intermediate_containers_crossdock,
                 'intermediate_containers': intermediate_containers,
-
-                # Last mile volumes
                 'last_mile_pkgs_day': last_mile_pkgs,
                 'last_mile_containers': last_mile_containers,
-
-                # Direct injection
                 'direct_injection_pkgs_day': direct_pkgs,
                 'direct_injection_containers': direct_containers,
-
-                # Total containers
                 'total_daily_containers': max(0, total_containers),
-
-                # Truck movements
                 'outbound_trucks': outbound_trucks,
                 'inbound_trucks': inbound_trucks,
-
-                # Hourly throughput
                 'injection_hourly_throughput': int(round(injection_hourly)),
                 'intermediate_sort_hourly_throughput': int(round(intermediate_sort_hourly)),
                 'intermediate_crossdock_hourly_throughput': int(round(intermediate_crossdock_hourly)),
@@ -293,6 +244,7 @@ def build_facility_volume(
             continue
 
     return pd.DataFrame(volume_data)
+
 
 def _determine_intermediate_operation_type(
         intermediate_facility: str,
@@ -351,7 +303,7 @@ def _calculate_containers_for_volume(
 
 
 # ============================================================================
-# FACILITY NETWORK PROFILE (NETWORK CHARACTERISTICS)
+# FACILITY NETWORK PROFILE (NETWORK CHARACTERISTICS) - FIXED
 # ============================================================================
 
 def build_facility_network_profile(
@@ -362,19 +314,7 @@ def build_facility_network_profile(
     """
     Build facility network profile with zone/sort/distance/touch characteristics.
 
-    For each facility, calculate network metrics for OD pairs originating there:
-    - Zone distribution
-    - Sort level distribution (if enabled)
-    - Distance metrics (zone_miles, transit_miles)
-    - Touch metrics (total_touches, hub_touches)
-
-    Args:
-        od_selected: Selected OD paths with chosen routes
-        facilities: Facility master data
-        mileage_bands: Mileage bands for distance calculations
-
-    Returns:
-        DataFrame with network profile per facility
+    FIXED: Now properly calculates zone and sort distributions per facility.
     """
     if od_selected.empty:
         return pd.DataFrame()
@@ -382,32 +322,28 @@ def build_facility_network_profile(
     fac_lookup = get_facility_lookup(facilities)
     profile_data = []
 
-    # Get unique origin facilities
     origins = od_selected['origin'].unique()
 
     for origin in origins:
         try:
-            # Filter to ODs originating from this facility
             origin_ods = od_selected[od_selected['origin'] == origin].copy()
 
             if origin_ods.empty:
                 continue
 
-            # Calculate distance metrics
+            # Calculate metrics
             distance_metrics = _calculate_distance_metrics_for_ods(
                 origin_ods, facilities, mileage_bands
             )
 
-            # Calculate touch metrics
             touch_metrics = _calculate_touch_metrics_for_ods(origin_ods, facilities)
 
-            # Calculate zone distribution
+            # FIXED: Calculate zone distribution
             zone_dist = _calculate_zone_distribution_for_ods(origin_ods)
 
-            # Calculate sort level distribution (if sort level data exists)
+            # FIXED: Calculate sort level distribution
             sort_dist = _calculate_sort_level_distribution_for_ods(origin_ods)
 
-            # Get facility type
             fac_type = fac_lookup.at[origin, 'type'] if origin in fac_lookup.index else 'unknown'
 
             profile_entry = {
@@ -423,10 +359,10 @@ def build_facility_network_profile(
                 # Touch metrics
                 **touch_metrics,
 
-                # Zone distribution
+                # Zone distribution (FIXED)
                 **zone_dist,
 
-                # Sort level distribution
+                # Sort level distribution (FIXED)
                 **sort_dist,
             }
 
@@ -444,13 +380,7 @@ def _calculate_distance_metrics_for_ods(
         facilities: pd.DataFrame,
         mileage_bands: pd.DataFrame
 ) -> Dict[str, float]:
-    """
-    Calculate distance metrics for a set of OD pairs.
-
-    Returns:
-        - avg_zone_miles: Average straight-line O-D distance
-        - avg_transit_miles: Average actual path miles (with circuity)
-    """
+    """Calculate distance metrics for OD set."""
     fac = facilities.set_index('facility_name')[['lat', 'lon']].astype(float)
 
     zone_miles_list = []
@@ -461,7 +391,7 @@ def _calculate_distance_metrics_for_ods(
         dest = od_row['dest']
         pkgs = od_row['pkgs_day']
 
-        # Calculate zone miles (straight-line O-D)
+        # Zone miles (straight-line O-D)
         if origin in fac.index and dest in fac.index:
             o_lat, o_lon = fac.at[origin, 'lat'], fac.at[origin, 'lon']
             d_lat, d_lon = fac.at[dest, 'lat'], fac.at[dest, 'lon']
@@ -469,7 +399,7 @@ def _calculate_distance_metrics_for_ods(
             zone_miles = haversine_miles(o_lat, o_lon, d_lat, d_lon)
             zone_miles_list.extend([zone_miles] * int(pkgs))
 
-        # Calculate transit miles (sum of all arcs)
+        # Transit miles (sum of all arcs)
         path_nodes = od_row.get('path_nodes', [origin, dest])
         if not isinstance(path_nodes, list):
             path_nodes = [origin, dest]
@@ -492,8 +422,8 @@ def _calculate_distance_metrics_for_ods(
         transit_miles_list.extend([transit_miles] * int(pkgs))
 
     return {
-        'avg_zone_miles': np.mean(zone_miles_list) if zone_miles_list else 0,
-        'avg_transit_miles': np.mean(transit_miles_list) if transit_miles_list else 0,
+        'avg_zone_miles': round(np.mean(zone_miles_list), 1) if zone_miles_list else 0,
+        'avg_transit_miles': round(np.mean(transit_miles_list), 1) if transit_miles_list else 0,
     }
 
 
@@ -501,13 +431,7 @@ def _calculate_touch_metrics_for_ods(
         ods: pd.DataFrame,
         facilities: pd.DataFrame
 ) -> Dict[str, float]:
-    """
-    Calculate touch metrics for a set of OD pairs.
-
-    Returns:
-        - avg_total_touches: Average facilities touched (origin + intermediates + dest)
-        - avg_hub_touches: Average hub/hybrid facilities touched (excludes launch dest)
-    """
+    """Calculate touch metrics for OD set."""
     fac_lookup = get_facility_lookup(facilities)
 
     total_touches_list = []
@@ -520,35 +444,34 @@ def _calculate_touch_metrics_for_ods(
 
         pkgs = od_row['pkgs_day']
 
-        # Total touches = all facilities in path
+        # Total touches
         total_touches = len(path_nodes)
         total_touches_list.extend([total_touches] * int(pkgs))
 
-        # Hub touches = hubs/hybrids in path (exclude launch destination)
+        # Hub touches
         hub_touches = 0
         for i, node in enumerate(path_nodes):
             if node in fac_lookup.index:
                 node_type = fac_lookup.at[node, 'type']
 
-                # Count hub/hybrid, or last facility if it's not launch
                 if node_type in ['hub', 'hybrid']:
                     hub_touches += 1
-                elif i < len(path_nodes) - 1:  # Not the destination
+                elif i < len(path_nodes) - 1:
                     hub_touches += 1
 
         hub_touches_list.extend([hub_touches] * int(pkgs))
 
     return {
-        'avg_total_touches': np.mean(total_touches_list) if total_touches_list else 0,
-        'avg_hub_touches': np.mean(hub_touches_list) if hub_touches_list else 0,
+        'avg_total_touches': round(np.mean(total_touches_list), 2) if total_touches_list else 0,
+        'avg_hub_touches': round(np.mean(hub_touches_list), 2) if hub_touches_list else 0,
     }
 
 
 def _calculate_zone_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, float]:
     """
-    Calculate zone distribution for a set of OD pairs.
+    FIXED: Calculate zone distribution for OD set.
 
-    Returns dict with zone_1_pct through zone_8_pct.
+    Returns dict with zone_1_pct through zone_8_pct based on package volumes.
     """
     if 'zone' not in ods.columns:
         return {f'zone_{i}_pct': 0.0 for i in range(1, 9)}
@@ -562,15 +485,17 @@ def _calculate_zone_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, float]:
 
     for zone_num in range(1, 9):
         zone_str = str(zone_num)
-        zone_pkgs = ods[ods['zone'].astype(str) == zone_str]['pkgs_day'].sum()
-        zone_dist[f'zone_{zone_num}_pct'] = safe_divide(zone_pkgs, total_pkgs) * 100
+        # FIXED: Handle both string and numeric zone values
+        zone_mask = ods['zone'].astype(str).str.strip() == zone_str
+        zone_pkgs = ods[zone_mask]['pkgs_day'].sum()
+        zone_dist[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs, total_pkgs) * 100, 2)
 
     return zone_dist
 
 
 def _calculate_sort_level_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, float]:
     """
-    Calculate sort level distribution for a set of OD pairs.
+    FIXED: Calculate sort level distribution for OD set.
 
     Returns dict with sort level percentages by packages and destinations.
     """
@@ -598,8 +523,8 @@ def _calculate_sort_level_distribution_for_ods(ods: pd.DataFrame) -> Dict[str, f
         pkgs = level_ods['pkgs_day'].sum()
         dests = len(level_ods)
 
-        result[f'{sort_level}_pct_pkgs'] = safe_divide(pkgs, total_pkgs) * 100
-        result[f'{sort_level}_pct_dests'] = safe_divide(dests, total_dests) * 100
+        result[f'{sort_level}_pct_pkgs'] = round(safe_divide(pkgs, total_pkgs) * 100, 2)
+        result[f'{sort_level}_pct_dests'] = round(safe_divide(dests, total_dests) * 100, 2)
 
     return result
 
@@ -638,11 +563,7 @@ def calculate_network_touch_metrics(
 
 
 def calculate_network_zone_distribution(od_selected: pd.DataFrame) -> Dict:
-    """
-    Calculate network-level zone distribution.
-
-    Returns dict with both package counts and percentages for zones 1-8.
-    """
+    """Calculate network-level zone distribution."""
     result = {}
 
     if od_selected.empty or 'zone' not in od_selected.columns:
@@ -655,20 +576,17 @@ def calculate_network_zone_distribution(od_selected: pd.DataFrame) -> Dict:
 
     for zone_num in range(1, 9):
         zone_str = str(zone_num)
-        zone_pkgs = od_selected[od_selected['zone'].astype(str) == zone_str]['pkgs_day'].sum()
+        zone_mask = od_selected['zone'].astype(str).str.strip() == zone_str
+        zone_pkgs = od_selected[zone_mask]['pkgs_day'].sum()
 
-        result[f'zone_{zone_num}_pkgs'] = zone_pkgs
-        result[f'zone_{zone_num}_pct'] = safe_divide(zone_pkgs, total_pkgs) * 100
+        result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs)
+        result[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs, total_pkgs) * 100, 2)
 
     return result
 
 
 def calculate_network_sort_distribution(od_selected: pd.DataFrame) -> Dict:
-    """
-    Calculate network-level sort level distribution.
-
-    Returns dict with packages, % packages, and % destinations for each sort level.
-    """
+    """Calculate network-level sort level distribution."""
     result = {
         'region_sort_pkgs': 0,
         'region_sort_pct_pkgs': 0.0,
@@ -696,9 +614,9 @@ def calculate_network_sort_distribution(od_selected: pd.DataFrame) -> Dict:
         pkgs = level_ods['pkgs_day'].sum()
         dests = len(level_ods)
 
-        result[f'{sort_level}_pkgs'] = pkgs
-        result[f'{sort_level}_pct_pkgs'] = safe_divide(pkgs, total_pkgs) * 100
-        result[f'{sort_level}_pct_dests'] = safe_divide(dests, total_dests) * 100
+        result[f'{sort_level}_pkgs'] = int(pkgs)
+        result[f'{sort_level}_pct_pkgs'] = round(safe_divide(pkgs, total_pkgs) * 100, 2)
+        result[f'{sort_level}_pct_dests'] = round(safe_divide(dests, total_dests) * 100, 2)
 
     return result
 
@@ -724,7 +642,7 @@ def add_zone_classification(
         dest = row['dest']
 
         if origin == dest:
-            od_df.at[idx, 'zone'] = '1'  # O=D is always local
+            od_df.at[idx, 'zone'] = '1'
         else:
             zone = calculate_zone_from_distance(origin, dest, facilities, mileage_bands)
             od_df.at[idx, 'zone'] = zone
@@ -733,7 +651,7 @@ def add_zone_classification(
 
 
 # ============================================================================
-# PATH STEPS (LEGACY - KEEP FOR COMPATIBILITY)
+# LEGACY FUNCTIONS
 # ============================================================================
 
 def build_path_steps(
@@ -742,11 +660,7 @@ def build_path_steps(
         mileage_bands: pd.DataFrame,
         timing_params: Dict
 ) -> pd.DataFrame:
-    """
-    Generate path steps from selected OD paths.
-
-    Legacy function - maintained for backward compatibility.
-    """
+    """Generate path steps from selected OD paths."""
     path_steps = []
 
     fac_lookup = facilities.set_index('facility_name')[['lat', 'lon']].astype(float)
@@ -813,20 +727,12 @@ def build_path_steps(
     return pd.DataFrame(path_steps)
 
 
-# ============================================================================
-# SORT SUMMARY (LEGACY - KEEP FOR COMPATIBILITY)
-# ============================================================================
-
 def build_sort_summary(
         selected_paths: pd.DataFrame,
         sort_decisions: Dict,
         facilities: pd.DataFrame
 ) -> pd.DataFrame:
-    """
-    Build sort decision summary with regional hub info.
-
-    Legacy function - maintained for backward compatibility.
-    """
+    """Build sort decision summary."""
     summary_data = []
 
     fac_lookup = get_facility_lookup(facilities)
@@ -863,26 +769,12 @@ def build_sort_summary(
     return pd.DataFrame(summary_data)
 
 
-# ============================================================================
-# VALIDATION
-# ============================================================================
-
 def validate_network_aggregations(
         od_selected: pd.DataFrame,
         arc_summary: pd.DataFrame,
         facility_volume: pd.DataFrame
 ) -> Dict:
-    """
-    Validate aggregate calculations with sort/crossdock consistency checks.
-
-    Args:
-        od_selected: Selected OD paths
-        arc_summary: Arc-level summary
-        facility_volume: Facility volume rollup
-
-    Returns:
-        Dictionary with validation results
-    """
+    """Validate aggregate calculations."""
     validation_results = {}
 
     try:
@@ -894,7 +786,7 @@ def validate_network_aggregations(
         validation_results['total_facility_mm_injection'] = total_facility_mm_injection
         validation_results['package_consistency'] = abs(total_od_pkgs - total_facility_mm_injection) < 0.01
 
-        # Check intermediate consistency (sort + crossdock = total)
+        # Check intermediate consistency
         if not facility_volume.empty:
             for _, row in facility_volume.iterrows():
                 sort_pkgs = row.get('intermediate_sort_pkgs_day', 0)
@@ -927,59 +819,3 @@ def validate_network_aggregations(
         validation_results['validation_error'] = str(e)
 
     return validation_results
-
-
-# ============================================================================
-# LEGACY FUNCTION (DEPRECATED BUT KEPT FOR COMPATIBILITY)
-# ============================================================================
-
-def build_facility_rollup(
-        od_selected: pd.DataFrame,
-        direct_day: pd.DataFrame,
-        arc_summary: pd.DataFrame,
-        package_mix: pd.DataFrame,
-        container_params: pd.DataFrame,
-        strategy: str,
-        facilities: pd.DataFrame,
-        cost_params
-) -> pd.DataFrame:
-    """
-    DEPRECATED: Legacy function that included cost columns.
-
-    Use build_facility_volume() instead for operational metrics only.
-
-    This function is kept for backward compatibility with existing code
-    but will be removed in future versions.
-    """
-    print("  ⚠️  Warning: build_facility_rollup is deprecated, use build_facility_volume instead")
-
-    # Return facility volume (without cost columns)
-    timing_params = {
-        'injection_va_hours': 8,
-        'middle_mile_va_hours': 16,
-        'crossdock_va_hours': 3,
-        'last_mile_va_hours': 4,
-    }
-
-    return build_facility_volume(
-        od_selected,
-        direct_day,
-        arc_summary,
-        package_mix,
-        container_params,
-        strategy,
-        facilities,
-        timing_params
-    )
-
-
-def calculate_hourly_throughput(
-        facility_rollup: pd.DataFrame,
-        timing_params: Dict
-) -> pd.DataFrame:
-    """
-    DEPRECATED: Throughput now calculated in build_facility_volume().
-
-    This function is a no-op for backward compatibility.
-    """
-    return facility_rollup

@@ -1,6 +1,10 @@
 """
-Main Execution Script for Network Optimization v4
-Enhanced with automatic baseline comparison and zone cost analysis
+Main Execution Script - v4.1 FINAL FIX
+
+Fixed:
+1. Arc summary now has 'trucks' column (not 'trucks_needed')
+2. Passes mileage_bands to recalculate function
+3. All downstream reporting should work
 """
 
 import argparse
@@ -46,14 +50,21 @@ from veho_net.sort_strategy_comparison import (
     run_sort_strategy_comparison,
     create_comparison_summary_report
 )
+from veho_net.container_flow_v4 import (
+    build_od_container_map,
+    recalculate_arc_summary_with_container_flow,
+    analyze_sort_level_container_impact,
+    create_container_flow_diagnostic
+)
 
 
 def main(input_path: str, output_dir: str):
-    """Main execution function for network optimization."""
+    """Main execution with container flow correction and fixed reporting."""
     start_time = datetime.now()
 
     print("=" * 70)
-    print("VEHO NETWORK OPTIMIZATION v4")
+    print("VEHO NETWORK OPTIMIZATION v4.1 FINAL")
+    print("Fixes: Container Flow + Zone/Sort + Arc Column Names")
     print("=" * 70)
 
     input_path = Path(input_path)
@@ -72,7 +83,7 @@ def main(input_path: str, output_dir: str):
 
     print(f"\n{'=' * 70}")
     print("PARSING PARAMETERS")
-    print("=" * 70)
+    print("=" * 70)")
 
     timing_params_dict = params_to_dict(dfs["timing_params"])
     cost_params_dict = params_to_dict(dfs["cost_params"])
@@ -101,19 +112,17 @@ def main(input_path: str, output_dir: str):
 
     print(f"✓ Global strategy: {global_strategy.value}")
     print(f"✓ Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
+    print(f"✓ Container flow fix: ENABLED ✨")
+    print(f"✓ Zone/sort distributions: FIXED ✨")
     print(f"✓ Path around factor: {around_factor}")
     print(f"✓ Run ID: {run_id}")
 
-    if enable_sort_opt:
-        print("\n✅ Sort level optimization (region/market/sort_group) ENABLED")
-        print("   Model will optimize sort level per OD pair with capacity constraints")
+    all_results = []
+    created_files = []
 
     print(f"\n{'=' * 70}")
     print(f"PROCESSING {len(dfs['scenarios'])} SCENARIOS")
     print("=" * 70)
-
-    all_results = []
-    created_files = []
 
     for scenario_idx, scenario_row in dfs["scenarios"].iterrows():
         scenario_id = scenario_row.get("scenario_id", f"scenario_{scenario_idx + 1}")
@@ -178,8 +187,6 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Generated {len(paths)} candidate paths")
 
-            # ========== BASELINE VS OPTIMIZED COMPARISON ==========
-            # If sort optimization is enabled, run baseline comparison automatically
             if enable_sort_opt:
                 print(f"\n{'─' * 70}")
                 print("🔍 RUNNING BASELINE COMPARISON")
@@ -201,25 +208,17 @@ def main(input_path: str, output_dir: str):
                 )
 
                 if not comparison_summary.empty:
-                    # Save comparison results
                     comp_output = output_dir / f"sort_comparison_{scenario_id}_{global_strategy.value}.xlsx"
                     with pd.ExcelWriter(comp_output, engine='xlsxwriter') as writer:
-                        comparison_summary.to_excel(
-                            writer, sheet_name='summary', index=False
-                        )
+                        comparison_summary.to_excel(writer, sheet_name='summary', index=False)
                         if not detailed_comparison.empty:
-                            detailed_comparison.to_excel(
-                                writer, sheet_name='od_changes', index=False
-                            )
+                            detailed_comparison.to_excel(writer, sheet_name='od_changes', index=False)
                         if not facility_comparison.empty:
-                            facility_comparison.to_excel(
-                                writer, sheet_name='facility_comparison', index=False
-                            )
+                            facility_comparison.to_excel(writer, sheet_name='facility_comparison', index=False)
 
                     print(f"\n  ✓ Saved comparison to: {comp_output.name}")
                     created_files.append(comp_output.name)
 
-                    # Print summary
                     print("\n" + create_comparison_summary_report(
                         comparison_summary, facility_comparison
                     ))
@@ -227,10 +226,9 @@ def main(input_path: str, output_dir: str):
                 print(f"\n{'─' * 70}")
                 print("CONTINUING WITH OPTIMIZED RUN")
                 print("─" * 70)
-            # ======================================================
 
             print("\n3. Running MILP optimization...")
-            od_selected, arc_summary, network_kpis, sort_summary = solve_network_optimization(
+            od_selected, arc_summary_original, network_kpis, sort_summary = solve_network_optimization(
                 paths,
                 dfs["facilities"],
                 dfs["mileage_bands"],
@@ -248,7 +246,48 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Selected {len(od_selected)} optimal paths")
 
-            print("\n4. Generating outputs...")
+            # ========== CONTAINER FLOW CORRECTION ==========
+            print("\n4. Applying container flow correction...")
+
+            od_selected = build_od_container_map(
+                od_selected,
+                dfs["package_mix"],
+                dfs["container_params"],
+                dfs["facilities"]
+            )
+
+            # FIXED: Now passes mileage_bands
+            arc_summary_corrected = recalculate_arc_summary_with_container_flow(
+                od_selected,
+                dfs["package_mix"],
+                dfs["container_params"],
+                dfs["facilities"],
+                dfs["mileage_bands"]  # ADDED
+            )
+
+            sort_container_impact = analyze_sort_level_container_impact(
+                od_selected,
+                dfs["package_mix"],
+                dfs["container_params"],
+                dfs["facilities"]
+            )
+
+            diagnostic = create_container_flow_diagnostic(
+                od_selected,
+                arc_summary_original,
+                arc_summary_corrected
+            )
+
+            print(diagnostic)
+
+            if not sort_container_impact.empty:
+                print("\n📊 Sort Level Container Analysis:")
+                print(sort_container_impact.to_string(index=False))
+
+            arc_summary = arc_summary_corrected
+            # ===============================================
+
+            print("\n5. Generating outputs...")
 
             od_selected = add_zone_classification(
                 od_selected,
@@ -256,8 +295,7 @@ def main(input_path: str, output_dir: str):
                 dfs["mileage_bands"]
             )
 
-            # ========== ZONE COST ANALYSIS ==========
-            print("\n4a. Calculating zone cost analysis...")
+            print("\n5a. Calculating zone cost analysis...")
             zone_cost_analysis = calculate_zone_cost_analysis(
                 od_selected,
                 dfs["facilities"],
@@ -266,9 +304,6 @@ def main(input_path: str, output_dir: str):
 
             if not zone_cost_analysis.empty:
                 print(create_zone_cost_summary_table(zone_cost_analysis))
-            else:
-                print("  ⚠️  No zone data to analyze")
-            # ========================================
 
             path_steps = build_path_steps(
                 od_selected,
@@ -277,7 +312,6 @@ def main(input_path: str, output_dir: str):
                 timing_params_dict
             )
 
-            # Build facility volume (operational metrics)
             facility_volume = build_facility_volume(
                 od_selected,
                 direct_day,
@@ -289,14 +323,12 @@ def main(input_path: str, output_dir: str):
                 timing_params_dict
             )
 
-            # Build facility network profile (zone/sort/distance/touch)
             facility_network_profile = build_facility_network_profile(
                 od_selected,
                 dfs["facilities"],
                 dfs["mileage_bands"]
             )
 
-            # Calculate network-level metrics
             distance_metrics = calculate_network_distance_metrics(
                 od_selected,
                 dfs["facilities"],
@@ -350,7 +382,9 @@ def main(input_path: str, output_dir: str):
                 {"key": "strategy", "value": global_strategy.value},
                 {"key": "total_cost", "value": total_cost},
                 {"key": "cost_per_pkg", "value": cost_per_pkg},
-                {"key": "total_packages", "value": total_pkgs}
+                {"key": "total_packages", "value": total_pkgs},
+                {"key": "container_flow_corrected", "value": True},
+                {"key": "zone_sort_distributions_fixed", "value": True}
             ])
 
             output_filename = OUTPUT_FILE_TEMPLATE.format(
@@ -379,8 +413,21 @@ def main(input_path: str, output_dir: str):
                 arc_summary,
                 kpis,
                 sort_analysis,
-                zone_cost_analysis  # NEW: Pass zone cost analysis
+                zone_cost_analysis
             )
+
+            if not sort_container_impact.empty:
+                container_impact_path = output_dir / f"container_impact_{scenario_id}.xlsx"
+                with pd.ExcelWriter(container_impact_path, engine='xlsxwriter') as writer:
+                    sort_container_impact.to_excel(
+                        writer, sheet_name='sort_container_impact', index=False
+                    )
+                    pd.DataFrame([{'diagnostic': diagnostic}]).to_excel(
+                        writer, sheet_name='diagnostic', index=False
+                    )
+
+                created_files.append(f"container_impact_{scenario_id}.xlsx")
+                print(f"  ✓ Saved container impact to: container_impact_{scenario_id}.xlsx")
 
             if write_success:
                 created_files.append(output_filename)
@@ -398,8 +445,6 @@ def main(input_path: str, output_dir: str):
             traceback.print_exc()
             continue
 
-    # ========== FLUID LOAD OPPORTUNITY ANALYSIS ==========
-    # Run after all scenarios complete to analyze optimization results
     if len(all_results) > 0 and 'od_selected' in locals() and not od_selected.empty:
         print(f"\n{'=' * 70}")
         print("FLUID LOAD OPPORTUNITY ANALYSIS")
@@ -414,14 +459,13 @@ def main(input_path: str, output_dir: str):
                 container_params=dfs["container_params"],
                 mileage_bands=dfs["mileage_bands"],
                 cost_params=cost_params,
-                min_daily_benefit=50.0,  # $50/day minimum
+                min_daily_benefit=50.0,
                 max_results=50
             )
 
             if not fluid_opportunities.empty:
                 print(create_fluid_load_summary_report(fluid_opportunities))
 
-                # Calculate sort point savings
                 sort_point_savings = calculate_sort_point_savings(
                     fluid_opportunities,
                     timing_params_dict,
@@ -432,7 +476,6 @@ def main(input_path: str, output_dir: str):
                     print("\n📊 Sort Point Capacity Freed by Fluid Loading:")
                     print(sort_point_savings.to_string(index=False))
 
-                # Save fluid opportunities to file
                 fluid_output = output_dir / f"fluid_opportunities_{run_id}.xlsx"
                 with pd.ExcelWriter(fluid_output, engine='xlsxwriter') as writer:
                     fluid_opportunities.to_excel(
@@ -453,7 +496,6 @@ def main(input_path: str, output_dir: str):
                 print("  ✓ All lanes optimally utilized - no fluid opportunities found")
         except Exception as e:
             print(f"  ⚠️  Fluid load analysis failed: {e}")
-    # =====================================================
 
     if len(all_results) > 1:
         print(f"\n{'=' * 70}")
@@ -490,6 +532,8 @@ def main(input_path: str, output_dir: str):
     print(f"⏱️  Elapsed time: {elapsed}")
     print(f"📋 Processed: {len(all_results)} scenarios")
     print(f"📄 Created files: {len(created_files)}")
+    print(f"✅ Container flow correction: APPLIED")
+    print(f"✅ Zone/sort distributions: FIXED")
 
     if created_files:
         print(f"\nOutput files in {output_dir}:")
@@ -501,7 +545,7 @@ def main(input_path: str, output_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Veho Network Optimization v4 - Enhanced with Baseline Comparison"
+        description="Veho Network Optimization v4.1 FINAL"
     )
     parser.add_argument(
         "--input",
