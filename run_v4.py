@@ -1,5 +1,6 @@
 """
 Main Execution Script for Network Optimization v4
+Enhanced with automatic baseline comparison and zone cost analysis
 """
 
 import argparse
@@ -32,6 +33,19 @@ from veho_net.write_outputs_v4 import (
     write_comparison_workbook,
     write_executive_summary
 )
+from veho_net.zone_cost_analysis import (
+    calculate_zone_cost_analysis,
+    create_zone_cost_summary_table
+)
+from veho_net.fluid_load_analysis import (
+    analyze_fluid_load_opportunities,
+    create_fluid_load_summary_report,
+    calculate_sort_point_savings
+)
+from veho_net.sort_strategy_comparison import (
+    run_sort_strategy_comparison,
+    create_comparison_summary_report
+)
 
 
 def main(input_path: str, output_dir: str):
@@ -39,7 +53,7 @@ def main(input_path: str, output_dir: str):
     start_time = datetime.now()
 
     print("=" * 70)
-    print("VEHO NETWORK OPTIMIZATION v3")
+    print("VEHO NETWORK OPTIMIZATION v4")
     print("=" * 70)
 
     input_path = Path(input_path)
@@ -164,6 +178,57 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Generated {len(paths)} candidate paths")
 
+            # ========== BASELINE VS OPTIMIZED COMPARISON ==========
+            # If sort optimization is enabled, run baseline comparison automatically
+            if enable_sort_opt:
+                print(f"\n{'─' * 70}")
+                print("🔍 RUNNING BASELINE COMPARISON")
+                print("   (Market Sort vs. Optimized Sort Level)")
+                print("─" * 70)
+
+                comparison_summary, detailed_comparison, facility_comparison = (
+                    run_sort_strategy_comparison(
+                        candidates=paths,
+                        facilities=dfs["facilities"],
+                        mileage_bands=dfs["mileage_bands"],
+                        package_mix=dfs["package_mix"],
+                        container_params=dfs["container_params"],
+                        cost_params=cost_params,
+                        timing_params=timing_params_dict,
+                        global_strategy=global_strategy,
+                        scenario_id=scenario_id
+                    )
+                )
+
+                if not comparison_summary.empty:
+                    # Save comparison results
+                    comp_output = output_dir / f"sort_comparison_{scenario_id}_{global_strategy.value}.xlsx"
+                    with pd.ExcelWriter(comp_output, engine='xlsxwriter') as writer:
+                        comparison_summary.to_excel(
+                            writer, sheet_name='summary', index=False
+                        )
+                        if not detailed_comparison.empty:
+                            detailed_comparison.to_excel(
+                                writer, sheet_name='od_changes', index=False
+                            )
+                        if not facility_comparison.empty:
+                            facility_comparison.to_excel(
+                                writer, sheet_name='facility_comparison', index=False
+                            )
+
+                    print(f"\n  ✓ Saved comparison to: {comp_output.name}")
+                    created_files.append(comp_output.name)
+
+                    # Print summary
+                    print("\n" + create_comparison_summary_report(
+                        comparison_summary, facility_comparison
+                    ))
+
+                print(f"\n{'─' * 70}")
+                print("CONTINUING WITH OPTIMIZED RUN")
+                print("─" * 70)
+            # ======================================================
+
             print("\n3. Running MILP optimization...")
             od_selected, arc_summary, network_kpis, sort_summary = solve_network_optimization(
                 paths,
@@ -190,6 +255,20 @@ def main(input_path: str, output_dir: str):
                 dfs["facilities"],
                 dfs["mileage_bands"]
             )
+
+            # ========== ZONE COST ANALYSIS ==========
+            print("\n4a. Calculating zone cost analysis...")
+            zone_cost_analysis = calculate_zone_cost_analysis(
+                od_selected,
+                dfs["facilities"],
+                dfs["mileage_bands"]
+            )
+
+            if not zone_cost_analysis.empty:
+                print(create_zone_cost_summary_table(zone_cost_analysis))
+            else:
+                print("  ⚠️  No zone data to analyze")
+            # ========================================
 
             path_steps = build_path_steps(
                 od_selected,
@@ -299,7 +378,8 @@ def main(input_path: str, output_dir: str):
                 facility_network_profile,
                 arc_summary,
                 kpis,
-                sort_analysis
+                sort_analysis,
+                zone_cost_analysis  # NEW: Pass zone cost analysis
             )
 
             if write_success:
@@ -317,6 +397,63 @@ def main(input_path: str, output_dir: str):
             import traceback
             traceback.print_exc()
             continue
+
+    # ========== FLUID LOAD OPPORTUNITY ANALYSIS ==========
+    # Run after all scenarios complete to analyze optimization results
+    if len(all_results) > 0 and 'od_selected' in locals() and not od_selected.empty:
+        print(f"\n{'=' * 70}")
+        print("FLUID LOAD OPPORTUNITY ANALYSIS")
+        print("=" * 70)
+
+        try:
+            fluid_opportunities = analyze_fluid_load_opportunities(
+                od_selected=od_selected,
+                arc_summary=arc_summary,
+                facilities=dfs["facilities"],
+                package_mix=dfs["package_mix"],
+                container_params=dfs["container_params"],
+                mileage_bands=dfs["mileage_bands"],
+                cost_params=cost_params,
+                min_daily_benefit=50.0,  # $50/day minimum
+                max_results=50
+            )
+
+            if not fluid_opportunities.empty:
+                print(create_fluid_load_summary_report(fluid_opportunities))
+
+                # Calculate sort point savings
+                sort_point_savings = calculate_sort_point_savings(
+                    fluid_opportunities,
+                    timing_params_dict,
+                    dfs["facilities"]
+                )
+
+                if not sort_point_savings.empty:
+                    print("\n📊 Sort Point Capacity Freed by Fluid Loading:")
+                    print(sort_point_savings.to_string(index=False))
+
+                # Save fluid opportunities to file
+                fluid_output = output_dir / f"fluid_opportunities_{run_id}.xlsx"
+                with pd.ExcelWriter(fluid_output, engine='xlsxwriter') as writer:
+                    fluid_opportunities.to_excel(
+                        writer,
+                        sheet_name='opportunities',
+                        index=False
+                    )
+                    if not sort_point_savings.empty:
+                        sort_point_savings.to_excel(
+                            writer,
+                            sheet_name='sort_point_savings',
+                            index=False
+                        )
+
+                print(f"\n✓ Saved fluid opportunities to: {fluid_output.name}")
+                created_files.append(fluid_output.name)
+            else:
+                print("  ✓ All lanes optimally utilized - no fluid opportunities found")
+        except Exception as e:
+            print(f"  ⚠️  Fluid load analysis failed: {e}")
+    # =====================================================
 
     if len(all_results) > 1:
         print(f"\n{'=' * 70}")
@@ -364,7 +501,7 @@ def main(input_path: str, output_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Veho Network Optimization v3 - Consolidated Model"
+        description="Veho Network Optimization v4 - Enhanced with Baseline Comparison"
     )
     parser.add_argument(
         "--input",
@@ -384,5 +521,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n❌ FATAL ERROR: {e}")
         import traceback
+
         traceback.print_exc()
         exit(1)

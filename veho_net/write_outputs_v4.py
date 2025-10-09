@@ -7,6 +7,7 @@ Major Changes in v4:
     - Two facility sheets: facility_volume and facility_network_profile
     - Added network-level zone/sort/distance/touch metrics
     - Enhanced comparison and executive summary
+    - Added zone cost analysis sheet
 """
 
 import pandas as pd
@@ -23,7 +24,8 @@ def write_workbook(
         facility_network_profile: pd.DataFrame,
         arc_summary: pd.DataFrame,
         kpis: pd.Series,
-        sort_summary: Optional[pd.DataFrame] = None
+        sort_summary: Optional[pd.DataFrame] = None,
+        zone_cost_analysis: Optional[pd.DataFrame] = None
 ) -> bool:
     """
     Write main scenario output workbook with v4 structure.
@@ -32,22 +34,24 @@ def write_workbook(
     1. scenario_summary - Key metadata
     2. od_selected_paths - Optimal OD paths with costs
     3. path_steps_selected - Leg-by-leg breakdown
-    4. facility_volume - Daily operational volumes (NEW: no cost columns)
-    5. facility_network_profile - Network characteristics (NEW)
+    4. facility_volume - Daily operational volumes
+    5. facility_network_profile - Network characteristics
     6. arc_summary - Lane-level aggregations
-    7. kpis - Network performance metrics (ENHANCED: zone/sort/distance/touch)
+    7. kpis - Network performance metrics
     8. sort_analysis - Sort level decisions (if provided)
+    9. zone_cost_analysis - Per-zone cost breakdown (NEW)
 
     Args:
         path: Output file path
         scenario_summary: Scenario metadata
         od_selected: Selected OD paths
         path_steps: Path step details
-        facility_volume: Facility operational metrics (NEW)
-        facility_network_profile: Facility network characteristics (NEW)
+        facility_volume: Facility operational metrics
+        facility_network_profile: Facility network characteristics
         arc_summary: Arc/lane summary
-        kpis: KPI metrics (ENHANCED)
+        kpis: KPI metrics
         sort_summary: Sort analysis (optional)
+        zone_cost_analysis: Zone cost breakdown (optional, NEW)
 
     Returns:
         True if successful, False otherwise
@@ -79,7 +83,7 @@ def write_workbook(
                     writer, sheet_name="path_steps_selected", index=False
                 )
 
-            # 4. Facility Volume (NEW - operational metrics only)
+            # 4. Facility Volume (operational metrics only)
             if not facility_volume.empty:
                 facility_volume.to_excel(writer, sheet_name="facility_volume", index=False)
             else:
@@ -87,7 +91,7 @@ def write_workbook(
                     writer, sheet_name="facility_volume", index=False
                 )
 
-            # 5. Facility Network Profile (NEW - zone/sort/distance/touch)
+            # 5. Facility Network Profile (zone/sort/distance/touch)
             if not facility_network_profile.empty:
                 facility_network_profile.to_excel(writer, sheet_name="facility_network_profile", index=False)
             else:
@@ -103,7 +107,7 @@ def write_workbook(
                     writer, sheet_name="arc_summary", index=False
                 )
 
-            # 7. KPIs (ENHANCED with zone/sort/distance/touch)
+            # 7. KPIs (with zone/sort/distance/touch)
             if kpis is not None and not kpis.empty:
                 kpis.to_frame("value").to_excel(writer, sheet_name="kpis")
             else:
@@ -114,6 +118,10 @@ def write_workbook(
             # 8. Sort Analysis (optional)
             if sort_summary is not None and not sort_summary.empty:
                 sort_summary.to_excel(writer, sheet_name="sort_analysis", index=False)
+
+            # 9. Zone Cost Analysis (NEW)
+            if zone_cost_analysis is not None and not zone_cost_analysis.empty:
+                zone_cost_analysis.to_excel(writer, sheet_name="zone_cost_analysis", index=False)
 
         return True
 
