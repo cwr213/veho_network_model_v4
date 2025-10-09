@@ -1,7 +1,7 @@
 """
-Container Flow Tracking Module v4.1 - FIXED
+Container Flow Tracking Module v4.1
 
-Critical fixes:
+Updates:
 1. Arc summary now uses 'trucks' column name (not 'trucks_needed')
 2. Added all required columns for downstream compatibility
 """

@@ -2,15 +2,14 @@
 Sort Strategy Comparison Module
 
 Runs two optimization scenarios:
-1. Baseline: All destinations sorted to market level (fixed)
+1. Baseline: All destinations sorted to market level
 2. Optimized: Model freely chooses optimal sort level per OD
 
-Compares cost, sort point utilization, and identifies tradeoffs.
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from copy import deepcopy
 
 from .milp_v4 import solve_network_optimization
@@ -27,9 +26,12 @@ def run_sort_strategy_comparison(
         timing_params: Dict,
         global_strategy,
         scenario_id: str = "comparison"
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[Tuple]]:
     """
     Run baseline (market sort) vs. optimized (free choice) comparison.
+
+    CRITICAL FIX: Now returns optimized results as 4th tuple element
+    for reuse in main optimization flow.
 
     Args:
         candidates: Candidate paths
@@ -47,6 +49,8 @@ def run_sort_strategy_comparison(
             - comparison_summary: High-level comparison metrics
             - detailed_comparison: OD-level differences
             - facility_comparison: Facility-level sort point comparison
+            - optimized_results: (od_selected, arc_summary, kpis, sort_summary)
+                                 from optimized run for reuse
     """
     print(f"\n{'=' * 70}")
     print("SORT STRATEGY COMPARISON")
@@ -71,7 +75,7 @@ def run_sort_strategy_comparison(
 
     if baseline_od.empty:
         print("  ❌ Baseline optimization failed")
-        return pd.DataFrame(), pd.DataFrame(), {}
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
 
     baseline_cost = baseline_kpis.get('total_cost', 0)
     baseline_pkgs = baseline_kpis.get('total_packages', 0)
@@ -98,7 +102,7 @@ def run_sort_strategy_comparison(
 
     if optimized_od.empty:
         print("  ❌ Optimized optimization failed")
-        return pd.DataFrame(), pd.DataFrame(), {}
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None
 
     optimized_cost = optimized_kpis.get('total_cost', 0)
     optimized_pkgs = optimized_kpis.get('total_packages', 0)
@@ -168,7 +172,13 @@ def run_sort_strategy_comparison(
     print("COMPARISON COMPLETE")
     print("=" * 70)
 
-    return comparison_summary, detailed_comparison, facility_comparison
+    # CRITICAL FIX: Return optimized results for reuse
+    return (
+        comparison_summary,
+        detailed_comparison,
+        facility_comparison,
+        optimized_results  # This avoids duplicate optimization!
+    )
 
 
 def _build_od_comparison(
