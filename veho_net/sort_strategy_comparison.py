@@ -1,10 +1,15 @@
 """
-Sort Strategy Comparison Module
+Sort Strategy Comparison Module - v4.9
 
 Runs two optimization scenarios:
-1. Baseline: All destinations sorted to market level
-2. Optimized: Model freely chooses optimal sort level per OD
+1. Baseline: All destinations sorted to market level (CONSTRAINED)
+2. Optimized: Model freely chooses optimal sort level per OD (UNRESTRICTED)
 
+IMPROVED MESSAGING v4.9:
+- Clearly shows baseline is constrained, optimized is free
+- Emphasizes that both are genuine optimizations (not fed targets)
+- Better explanation of where savings come from
+- Warns if results are unexpected (optimized worse than baseline)
 """
 
 import pandas as pd
@@ -33,6 +38,11 @@ def run_sort_strategy_comparison(
     CRITICAL FIX: Now returns optimized results as 4th tuple element
     for reuse in main optimization flow.
 
+    Both runs use the SAME MILP solver to find minimum cost networks.
+    The difference is the constraints:
+    - Baseline: Forced to use market sort for all OD pairs
+    - Optimized: Free to choose region/market/sort_group per OD pair
+
     Args:
         candidates: Candidate paths
         facilities: Facility master
@@ -54,10 +64,17 @@ def run_sort_strategy_comparison(
     """
     print(f"\n{'=' * 70}")
     print("SORT STRATEGY COMPARISON")
+    print("Comparing constrained baseline vs. unrestricted optimization")
     print("=" * 70)
+    print("\nBoth runs find minimum-cost solutions using MILP solver.")
+    print("Difference: baseline CONSTRAINS sort levels, optimized is FREE.")
 
     # ========== RUN 1: BASELINE (Market Sort) ==========
-    print("\n1. Running BASELINE optimization (market sort only)...")
+    print(f"\n{'─' * 70}")
+    print("[1/2] BASELINE: Market Sort (CONSTRAINED)")
+    print("─" * 70)
+    print("Constraint: All OD pairs MUST use market-level sort")
+    print("Finding: Minimum cost network given this constraint...")
 
     baseline_results = solve_network_optimization(
         candidates=candidates,
@@ -81,10 +98,17 @@ def run_sort_strategy_comparison(
     baseline_pkgs = baseline_kpis.get('total_packages', 0)
     baseline_cpp = safe_divide(baseline_cost, baseline_pkgs)
 
-    print(f"  ✓ Baseline: ${baseline_cost:,.0f} (${baseline_cpp:.3f}/pkg)")
+    print(f"\n  ✓ Baseline (constrained) result:")
+    print(f"    Total cost: ${baseline_cost:,.0f}")
+    print(f"    Cost/pkg: ${baseline_cpp:.3f}")
+    print(f"    Sort strategy: Market sort for all {len(baseline_od)} OD pairs")
 
     # ========== RUN 2: OPTIMIZED (Free Choice) ==========
-    print("\n2. Running OPTIMIZED optimization (sort level optimization)...")
+    print(f"\n{'─' * 70}")
+    print("[2/2] OPTIMIZED: Free Sort Choice (UNRESTRICTED)")
+    print("─" * 70)
+    print("Constraint: NONE - model chooses optimal sort level per OD")
+    print("Finding: Global minimum cost across all sort level combinations...")
 
     optimized_results = solve_network_optimization(
         candidates=candidates,
@@ -108,17 +132,36 @@ def run_sort_strategy_comparison(
     optimized_pkgs = optimized_kpis.get('total_packages', 0)
     optimized_cpp = safe_divide(optimized_cost, optimized_pkgs)
 
-    print(f"  ✓ Optimized: ${optimized_cost:,.0f} (${optimized_cpp:.3f}/pkg)")
+    print(f"\n  ✓ Optimized (unrestricted) result:")
+    print(f"    Total cost: ${optimized_cost:,.0f}")
+    print(f"    Cost/pkg: ${optimized_cpp:.3f}")
 
     # ========== COMPARISON ANALYSIS ==========
-    print("\n3. Analyzing differences...")
+    print(f"\n{'═' * 70}")
+    print("COMPARISON RESULTS")
+    print("═" * 70)
 
     cost_savings = baseline_cost - optimized_cost
     cost_savings_pct = safe_divide(cost_savings, baseline_cost) * 100
     cpp_delta = baseline_cpp - optimized_cpp
+    cpp_delta_pct = safe_divide(cpp_delta, baseline_cpp) * 100
 
-    print(f"\n  💰 Cost Savings: ${cost_savings:,.0f} ({cost_savings_pct:.1f}%)")
-    print(f"  📦 CPP Delta: ${cpp_delta:.4f}")
+    print(f"\n  Baseline (market sort):      ${baseline_cost:>12,.0f}  @ ${baseline_cpp:.4f}/pkg")
+    print(f"  Optimized (free choice):     ${optimized_cost:>12,.0f}  @ ${optimized_cpp:.4f}/pkg")
+    print(f"  {'-' * 70}")
+    print(f"  Savings from optimization:   ${cost_savings:>12,.0f}  (${cpp_delta:+.4f}/pkg)")
+    print(f"  Improvement:                 {cost_savings_pct:>11.2f}%")
+
+    # Sanity checks and warnings
+    if cost_savings < 0:
+        print(f"\n  ⚠️  WARNING: Optimized is MORE expensive than baseline!")
+        print(f"     This suggests a potential model issue - optimized should")
+        print(f"     always be <= baseline cost (since baseline is a valid solution).")
+    elif abs(cost_savings) < baseline_cost * 0.001:  # Less than 0.1% savings
+        print(f"\n  ℹ️  Baseline is already near-optimal (< 0.1% improvement possible)")
+        print(f"     Market sort is effectively optimal for this network.")
+    else:
+        print(f"\n  ✓ Optimization identified cost reduction opportunities")
 
     # High-level comparison summary
     comparison_summary = pd.DataFrame([
@@ -134,7 +177,7 @@ def run_sort_strategy_comparison(
             'baseline_market': f"${baseline_cpp:.4f}",
             'optimized': f"${optimized_cpp:.4f}",
             'delta': f"${cpp_delta:.4f}",
-            'delta_pct': f"{safe_divide(cpp_delta, baseline_cpp) * 100:.2f}%"
+            'delta_pct': f"{cpp_delta_pct:.2f}%"
         },
         {
             'metric': 'Avg Truck Fill Rate',
@@ -146,9 +189,16 @@ def run_sort_strategy_comparison(
     ])
 
     # OD-level detailed comparison (where sort level changed)
+    print(f"\n{'─' * 70}")
+    print("Analyzing OD-level sort decisions...")
     detailed_comparison = _build_od_comparison(
         baseline_od, optimized_od, facilities, timing_params
     )
+
+    if not detailed_comparison.empty:
+        print(f"  Found {len(detailed_comparison)} OD pairs where sort level changed")
+    else:
+        print(f"  All OD pairs use same sort level in both scenarios")
 
     # Facility-level sort point comparison
     facility_comparison = _build_facility_sort_comparison(
@@ -159,18 +209,26 @@ def run_sort_strategy_comparison(
     sort_dist_baseline = _calculate_sort_distribution(baseline_od)
     sort_dist_optimized = _calculate_sort_distribution(optimized_od)
 
-    print("\n  Sort Level Distribution:")
-    print(f"    {'Level':<15} {'Baseline %':<15} {'Optimized %':<15} {'Delta':<15}")
-    print(f"    {'-' * 60}")
+    print(f"\n{'─' * 70}")
+    print("Sort Level Distribution:")
+    print("─" * 70)
+    print(f"  {'Level':<15} {'Baseline':<15} {'Optimized':<15} {'Change':<15}")
+    print(f"  {'-' * 60}")
     for level in ['region', 'market', 'sort_group']:
         base_pct = sort_dist_baseline.get(f'{level}_pct', 0)
         opt_pct = sort_dist_optimized.get(f'{level}_pct', 0)
         delta = opt_pct - base_pct
-        print(f"    {level.title():<15} {base_pct:>12.1f}%  {opt_pct:>12.1f}%  {delta:>+12.1f}%")
+        print(f"  {level.title():<15} {base_pct:>12.1f}%  {opt_pct:>12.1f}%  {delta:>+12.1f}%")
 
-    print(f"\n{'=' * 70}")
+    print(f"\n{'═' * 70}")
     print("COMPARISON COMPLETE")
-    print("=" * 70)
+    print("═" * 70)
+    print("\nKey Insight:")
+    if cost_savings > 0:
+        print("  Unrestricted sort optimization finds lower-cost network")
+        print("  configuration by matching sort granularity to lane economics.")
+    else:
+        print("  Market sort is already optimal for this network.")
 
     # CRITICAL FIX: Return optimized results for reuse
     return (
