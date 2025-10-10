@@ -147,8 +147,8 @@ def main(input_path: str, output_dir: str):
     start_time = datetime.now()
 
     print("=" * 70)
-    print("VEHO NETWORK OPTIMIZATION v4.3 ZONE TRACKING")
-    print("Zone 0 (Direct Injection) + Unknown Zone Flagging")
+    print("VEHO NETWORK OPTIMIZATION")
+    print("Network Flows & Capacity Analysis")
     print("=" * 70)
 
     input_path = Path(input_path)
@@ -391,7 +391,6 @@ def main(input_path: str, output_dir: str):
                     if optimized_results is not None:
                         print(f"\n{'─' * 70}")
                         print("✓ USING OPTIMIZED RESULTS FROM COMPARISON")
-                        print("  (Saved 10 minutes by reusing results)")
                         print("─" * 70)
 
                         od_selected, arc_summary_original, network_kpis, sort_summary = optimized_results
@@ -941,7 +940,7 @@ def main(input_path: str, output_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Veho Network Optimization v4.3 ZONE TRACKING",
+        description="Veho Network Optimization",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

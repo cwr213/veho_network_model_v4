@@ -324,9 +324,6 @@ def create_fluid_load_summary_report(opportunities: pd.DataFrame) -> str:
         return "No fluid load opportunities identified (all lanes optimally utilized)"
 
     lines = []
-    lines.append("=" * 120)
-    lines.append("FLUID LOAD OPPORTUNITY ANALYSIS")
-    lines.append("=" * 120)
     lines.append("")
     lines.append(f"Found {len(opportunities)} opportunities with daily savings >= minimum threshold")
     lines.append("")

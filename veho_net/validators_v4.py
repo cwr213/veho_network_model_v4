@@ -12,8 +12,14 @@ from typing import Set
 
 
 def validate_referential_integrity(dfs: dict) -> None:
-    """Validate foreign key relationships across sheets."""
+    """
+    Validate foreign key relationships across sheets.
 
+    ENHANCED v4.7:
+    - Check injection facilities have is_injection_node=1
+    - Check injection facilities are hub/hybrid
+    - Verify mileage_bands start at 0
+    """
     all_facilities = set(dfs["facilities"]["facility_name"])
 
     # 1. Check injection_distribution facilities exist
@@ -23,7 +29,7 @@ def validate_referential_integrity(dfs: dict) -> None:
         if missing:
             raise ValueError(
                 f"injection_distribution references non-existent facilities: {sorted(missing)}\n"
-                f"Add these facilities to the facilities sheet or remove from injection_distribution."
+                f"Fix: Add these facilities to facilities sheet or remove from injection_distribution"
             )
 
     # 2. Check zips reference valid facilities
@@ -33,17 +39,17 @@ def validate_referential_integrity(dfs: dict) -> None:
         if missing:
             raise ValueError(
                 f"zips references non-existent facilities: {sorted(missing)}\n"
-                f"Add these facilities to the facilities sheet or update zip assignments."
+                f"Fix: Add these facilities to facilities sheet or update zip assignments"
             )
 
     # 3. Check parent_hub_name references
     parent_hubs = set(dfs["facilities"]["parent_hub_name"].dropna())
-    parent_hubs.discard("")  # Remove empty strings
+    parent_hubs.discard("")
     invalid_parents = parent_hubs - all_facilities
     if invalid_parents:
         raise ValueError(
             f"facilities.parent_hub_name references non-existent facilities: {sorted(invalid_parents)}\n"
-            f"Update parent_hub_name to reference valid facilities."
+            f"Fix: Update parent_hub_name to reference valid facilities"
         )
 
     # 4. Check regional_sort_hub references
@@ -53,7 +59,56 @@ def validate_referential_integrity(dfs: dict) -> None:
     if invalid_regional:
         raise ValueError(
             f"facilities.regional_sort_hub references non-existent facilities: {sorted(invalid_regional)}\n"
-            f"Update regional_sort_hub to reference valid facilities."
+            f"Fix: Update regional_sort_hub to reference valid facilities"
+        )
+
+    # 5. NEW: Verify injection distribution facilities exist and are hub/hybrid
+    if not dfs["injection_distribution"].empty:
+        injection_facs = set(dfs["injection_distribution"]["facility_name"])
+
+        for fac in injection_facs:
+            fac_row = dfs["facilities"][
+                dfs["facilities"]["facility_name"] == fac
+                ].iloc[0]
+
+            fac_type = str(fac_row['type']).lower()
+
+            # Must be hub or hybrid (can receive middle-mile volume)
+            if fac_type not in ['hub', 'hybrid']:
+                raise ValueError(
+                    f"injection_distribution facility '{fac}' must be hub or hybrid.\n"
+                    f"Found type: {fac_type}\n"
+                    f"Fix: Change type to 'hub' or 'hybrid', or remove from injection_distribution\n"
+                    f"Note: Launch facilities cannot receive middle-mile injection"
+                )
+
+            # NOTE: is_injection_node=1 is NOT required here
+            # injection_distribution allocates middle-mile volume to hubs
+            # is_injection_node=1 means the facility accepts client injections
+            # A facility can receive allocated volume without being a client injection point
+
+    # 6. NEW: Verify mileage_bands start at 0
+    min_band = dfs["mileage_bands"]["mileage_band_min"].min()
+    if min_band > 0.001:
+        raise ValueError(
+            f"mileage_bands MUST include band starting at 0 (for O=D flows).\n"
+            f"Current minimum: {min_band}\n"
+            f"Fix: Add row with mileage_band_min=0"
+        )
+
+    # 7. NEW: Verify mileage_bands have integer zones
+    try:
+        zones = dfs["mileage_bands"]['zone'].astype(int)
+        invalid = zones[(zones < 0) | (zones > 8)]
+        if len(invalid) > 0:
+            raise ValueError(
+                f"mileage_bands.zone must be integers 0-8.\n"
+                f"Found invalid: {invalid.unique()}"
+            )
+    except Exception as e:
+        raise ValueError(
+            f"mileage_bands.zone must be integers 0-8.\n"
+            f"Error: {e}"
         )
 
     print("✓ Referential integrity validated")
@@ -254,7 +309,13 @@ def _validate_injection_distribution(df: pd.DataFrame) -> None:
 
 
 def _validate_mileage_bands(df: pd.DataFrame) -> None:
-    """Validate mileage band cost structure and zone mapping."""
+    """
+    Validate mileage band cost structure and zone mapping.
+
+    ENHANCED v4.7:
+    - Zone must be integer 0-8 (no strings allowed)
+    - Must have band starting at 0 for O=D flows
+    """
     required_cols = {
         "mileage_band_min", "mileage_band_max",
         "fixed_cost_per_truck", "variable_cost_per_mile",
@@ -265,6 +326,34 @@ def _validate_mileage_bands(df: pd.DataFrame) -> None:
     if missing:
         raise ValueError(f"mileage_bands sheet missing columns: {sorted(missing)}")
 
+    # STRICT: zone must be integer 0-8
+    try:
+        zones = df['zone'].astype(int)
+    except:
+        raise ValueError(
+            f"mileage_bands.zone must be integer 0-8.\n"
+            f"Found non-integer values: {df['zone'].unique()}\n"
+            f"Fix: Ensure zone column contains only integers (no text, no decimals)"
+        )
+
+    invalid_zones = zones[(zones < 0) | (zones > 8)]
+    if len(invalid_zones) > 0:
+        raise ValueError(
+            f"mileage_bands.zone must be 0-8.\n"
+            f"Found invalid zones: {invalid_zones.unique()}\n"
+            f"Valid zones: 0 (direct injection), 1-8 (distance-based)"
+        )
+
+    # Require band starting at 0 for O=D flows
+    min_start = df['mileage_band_min'].min()
+    if min_start > 0.001:
+        raise ValueError(
+            f"mileage_bands MUST have band starting at 0 for O=D flows.\n"
+            f"Current minimum mileage_band_min: {min_start}\n"
+            f"Fix: Add row with mileage_band_min=0, mileage_band_max=0 (or small value)"
+        )
+
+    # Check for invalid ranges
     invalid_ranges = df[df["mileage_band_min"] >= df["mileage_band_max"]]
     if not invalid_ranges.empty:
         raise ValueError(
@@ -272,6 +361,18 @@ def _validate_mileage_bands(df: pd.DataFrame) -> None:
             f"{invalid_ranges[['mileage_band_min', 'mileage_band_max']].to_dict('records')}"
         )
 
+    # Check for negative costs/speeds
+    if (df["fixed_cost_per_truck"] < 0).any():
+        raise ValueError("mileage_bands: fixed_cost_per_truck must be non-negative")
+
+    if (df["variable_cost_per_mile"] < 0).any():
+        raise ValueError("mileage_bands: variable_cost_per_mile must be non-negative")
+
+    if (df["circuity_factor"] < 1.0).any():
+        raise ValueError("mileage_bands: circuity_factor must be >= 1.0")
+
+    if (df["mph"] <= 0).any():
+        raise ValueError("mileage_bands: mph must be positive")
 
 def _validate_timing_params(df: pd.DataFrame) -> None:
     """

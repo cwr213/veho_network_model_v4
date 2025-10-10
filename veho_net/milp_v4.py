@@ -1,10 +1,10 @@
 """
-MILP Optimization Module - v4.4
+MILP Optimization Module - v4.7
 
-Critical Fix: path_nodes now preserved through entire MILP pipeline
-- Robust extraction from candidates DataFrame
-- Fallback to path_str parsing if needed
-- Ensures arc aggregation works correctly
+Changes:
+1. O=D middle-mile cost calculation fixed (injection sort required)
+2. Sort capacity constraints tightened (proper point counting)
+3. Path nodes preservation maintained
 """
 
 from ortools.sat.python import cp_model
@@ -536,33 +536,60 @@ def _ensure_load_strategy(gs) -> LoadStrategy:
 
 def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
                                facilities, package_mix, container_params):
-    """Calculate per-package processing cost."""
+    """
+    Calculate per-package processing cost.
+
+    FIXED v4.7: O=D middle-mile includes injection sort + last-mile sort.
+    O=D direct injection (handled separately) has no injection sort.
+
+    Cost Components:
+    ----------------
+    1. Injection sort: Always for middle-mile flows (including O=D)
+    2. Intermediate handling: Container handling OR sort (depends on strategy/level)
+    3. Last-mile sort: Unless pre-sorted to sort_group level
+    4. Delivery: Always included
+    """
     nodes = path_data['path_nodes']
     origin = path_data['origin']
     dest = path_data['dest']
 
+    # Start with injection sort (ALL middle-mile flows need this)
     cost = cost_params.injection_sort_cost_per_pkg
 
+    # O=D middle-mile: injection sort + last-mile sort + delivery
     if origin == dest:
-        cost += cost_params.last_mile_sort_cost_per_pkg
-        cost += cost_params.last_mile_delivery_cost_per_pkg
+        cost += cost_params.last_mile_sort_cost_per_pkg  # Last mile sort
+        cost += cost_params.last_mile_delivery_cost_per_pkg  # Delivery
         return cost
 
+    # O≠D flows: process intermediates
     intermediates = nodes[1:-1] if len(nodes) > 2 else []
 
     if intermediates:
+        # Determine handling cost at intermediate facilities
         if sort_level == 'sort_group':
-            containers_per_pkg = estimate_containers_for_packages(1, package_mix, container_params) / 1.0
+            # Pre-sorted to granular level → just container handling
+            containers_per_pkg = estimate_containers_for_packages(
+                1, package_mix, container_params
+            ) / 1.0
             cost += len(intermediates) * cost_params.container_handling_cost * containers_per_pkg
+
         elif strategy.lower() == 'container':
-            containers_per_pkg = estimate_containers_for_packages(1, package_mix, container_params) / 1.0
+            # Container strategy → container handling at intermediates
+            containers_per_pkg = estimate_containers_for_packages(
+                1, package_mix, container_params
+            ) / 1.0
             cost += len(intermediates) * cost_params.container_handling_cost * containers_per_pkg
+
         else:
+            # Fluid strategy → full sort at intermediates
             cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
 
+    # Last-mile sort (unless already sorted to sort_group)
     if sort_level != 'sort_group':
         cost += cost_params.last_mile_sort_cost_per_pkg
 
+    # Delivery (always)
     cost += cost_params.last_mile_delivery_cost_per_pkg
 
     return cost
@@ -618,14 +645,41 @@ def _get_valid_sort_levels(origin, dest, fac_lookup):
 
 def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                                    facilities, timing_params, cand):
-    """Add sort capacity constraints per facility per day type."""
-    fac_lookup = get_facility_lookup(facilities)
-    sort_points_per_dest = timing_params.sort_points_per_destination
+    """
+    FIXED v4.7: Enforce sort capacity limits with proper point counting.
+    
+    Sort Points Formula:
+    -------------------
+    - Region sort: 1 point per unique region (shared across destinations)
+    - Market sort: 1 point per unique market/destination
+    - Sort group: N points per market (N = sort_groups_count at destination)
+    
+    Example:
+    --------
+    Facility sorts to 3 destinations in California:
+    - All 3 use region sort → 1 point (California region)
+    - All 3 use market sort → 3 points (3 markets)
+    - 2 use market, 1 uses sort_group (4 groups) → 2 + 4 = 6 points
+    """
+    from .utils import get_facility_lookup
+    from .config_v4 import OptimizationConstants
 
+    fac_lookup = get_facility_lookup(facilities)
+
+    # Handle both dict and TimingParameters object
+    if hasattr(timing_params, 'sort_points_per_destination'):
+        # TimingParameters dataclass
+        sort_points_per_dest = float(timing_params.sort_points_per_destination)
+    else:
+        # Dictionary
+        sort_points_per_dest = float(timing_params['sort_points_per_destination'])
+
+    # Get all hub/hybrid facilities
     hub_facilities = facilities[
         facilities['type'].str.lower().isin(['hub', 'hybrid'])
     ]['facility_name'].tolist()
 
+    # For each facility + day_type combination
     facility_day_combos = set()
     for group_name in groups.keys():
         scenario_id, origin, dest, day_type = group_name
@@ -642,77 +696,93 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
 
         max_capacity = int(max_capacity)
 
-        unique_dests = set()
-        dest_sort_levels = {}
+        # Collect all ODs originating from this facility
+        facility_groups = [
+            (group_name, group_idxs)
+            for group_name, group_idxs in groups.items()
+            if group_name[1] == facility and group_name[3] == day_type
+        ]
+
+        if not facility_groups:
+            continue
+
+        # Build regional hub mapping
+        regional_hubs = {}
         dest_to_hub = {}
 
-        for group_name, group_idxs in groups.items():
-            scenario_id, origin, dest, group_day_type = group_name
-
-            if origin != facility or group_day_type != day_type:
-                continue
-
-            unique_dests.add(dest)
-
-            if dest not in dest_sort_levels:
-                dest_sort_levels[dest] = sort_decision[group_name]
+        for (group_name, _) in facility_groups:
+            _, _, dest, _ = group_name
 
             if dest in fac_lookup.index:
                 hub = fac_lookup.at[dest, 'regional_sort_hub']
-                dest_to_hub[dest] = hub if not pd.isna(hub) and hub != "" else dest
-            else:
-                dest_to_hub[dest] = dest
+                if pd.isna(hub) or hub == '':
+                    hub = dest
+                dest_to_hub[dest] = hub
 
-        if not unique_dests:
-            continue
+                if hub not in regional_hubs:
+                    regional_hubs[hub] = []
+                regional_hubs[hub].append(dest)
 
-        hub_to_dests = {}
-        for dest in unique_dests:
-            hub = dest_to_hub[dest]
-            if hub not in hub_to_dests:
-                hub_to_dests[hub] = []
-            hub_to_dests[hub].append(dest)
-
-        facility_points = model.NewIntVar(
+        # Create capacity tracking variable
+        facility_sort_points = model.NewIntVar(
             0, max_capacity,
-            f"points_{facility}_{day_type}"
+            f"sort_pts_{facility}_{day_type}"
         )
 
         point_terms = []
 
-        for hub, dests in hub_to_dests.items():
-            hub_region_var = model.NewBoolVar(f"hub_reg_{facility}_{day_type}_{hub}")
+        # 1. REGION-LEVEL SORT POINTS (shared across destinations in region)
+        for region_hub, dests_in_region in regional_hubs.items():
+            region_var = model.NewBoolVar(
+                f"region_{facility}_{day_type}_{region_hub}"
+            )
 
-            region_vars = []
-            for dest in dests:
-                sort_vars = dest_sort_levels.get(dest)
-                if sort_vars and sort_vars.get('region') is not None:
-                    region_vars.append(sort_vars['region'])
+            # Region var is 1 if ANY destination in region uses region sort
+            region_sort_vars = []
+            for (group_name, _) in facility_groups:
+                _, _, dest, _ = group_name
+                if dest_to_hub.get(dest) == region_hub:
+                    sort_vars = sort_decision.get(group_name, {})
+                    if sort_vars.get('region') is not None:
+                        region_sort_vars.append(sort_vars['region'])
 
-            if region_vars:
-                model.AddMaxEquality(hub_region_var, region_vars)
-                point_terms.append(hub_region_var * int(sort_points_per_dest))
+            if region_sort_vars:
+                model.AddMaxEquality(region_var, region_sort_vars)
+                # 1 sort point per region
+                point_terms.append(region_var * int(sort_points_per_dest))
 
-        for dest in unique_dests:
-            sort_vars = dest_sort_levels.get(dest)
-            if not sort_vars:
-                continue
+        # 2. MARKET-LEVEL SORT POINTS (1 per destination)
+        for (group_name, _) in facility_groups:
+            _, _, dest, _ = group_name
+            sort_vars = sort_decision.get(group_name, {})
 
             if sort_vars.get('market') is not None:
-                point_terms.append(sort_vars['market'] * int(sort_points_per_dest))
+                # 1 sort point per market
+                point_terms.append(
+                    sort_vars['market'] * int(sort_points_per_dest)
+                )
+
+        # 3. SORT-GROUP-LEVEL SORT POINTS (N per destination)
+        for (group_name, _) in facility_groups:
+            _, _, dest, _ = group_name
+            sort_vars = sort_decision.get(group_name, {})
 
             if sort_vars.get('sort_group') is not None:
+                # N sort points per market (N = groups at destination)
                 if dest in fac_lookup.index:
                     groups_count = fac_lookup.at[dest, 'last_mile_sort_groups_count']
                     if pd.isna(groups_count) or groups_count <= 0:
                         groups_count = OptimizationConstants.DEFAULT_SORT_GROUPS
                     groups_count = int(groups_count)
-                    point_terms.append(sort_vars['sort_group'] * int(sort_points_per_dest * groups_count))
 
+                    point_terms.append(
+                        sort_vars['sort_group'] * int(sort_points_per_dest * groups_count)
+                    )
+
+        # ENFORCE CAPACITY CONSTRAINT
         if point_terms:
-            model.Add(facility_points >= sum(point_terms))
-            model.Add(facility_points <= max_capacity)
-
+            model.Add(facility_sort_points == sum(point_terms))
+            model.Add(facility_sort_points <= max_capacity)
 
 def _determine_arc_strategies(arc_meta, chosen_idx, path_od_data, path_arcs, global_strategy):
     """Determine effective strategy per arc."""

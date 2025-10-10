@@ -68,7 +68,50 @@ def calculate_origin_containers_by_sort_level(
 ) -> Dict[str, float]:
     """
     Calculate containers created at origin based on chosen sort level.
+
+    FIXED v4.7: Properly account for sort level impact on container count.
+
+    Sort Level Logic:
+    -----------------
+    - Region sort: Packages go to 1 destination (the regional hub)
+      → Fewer containers, higher fill rates
+
+    - Market sort: Packages go to 1 destination (the specific market)
+      → Moderate containers
+
+    - Sort group sort: Packages split across N destinations (N = groups)
+      → More containers, lower fill rates per container
+
+    Example:
+    --------
+    1000 packages to LAX1 (which has 4 sort groups):
+
+    Region sort → 1000 pkgs to 1 dest (CA region) → ~5 containers
+    Market sort → 1000 pkgs to 1 dest (LAX1) → ~5 containers
+    Sort group → 250 pkgs each to 4 dests (4 groups) → ~2 containers each = 8 total
+
+    Args:
+        origin: Origin facility name
+        dest: Destination facility name
+        packages: Package volume
+        sort_level: 'region', 'market', or 'sort_group'
+        package_mix: Package mix distribution
+        container_params: Container parameters
+        facilities: Facility master data
+
+    Returns:
+        Dictionary with:
+            - containers: Total containers created
+            - sort_destinations: Number of sort destinations
+            - containers_per_destination: Containers per destination
+            - avg_pkgs_per_container: Average packages per container
+            - container_fill_rate: Fill rate (0-1)
+            - total_cube: Total cubic feet
     """
+    from .containers_v4 import weighted_pkg_cube
+    from .utils import safe_divide, get_facility_lookup
+    from .config_v4 import OptimizationConstants
+
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = packages * w_cube
 
@@ -82,11 +125,17 @@ def calculate_origin_containers_by_sort_level(
 
     fac_lookup = get_facility_lookup(facilities)
 
+    # Determine number of sort destinations based on sort level
     if sort_level == 'region':
+        # Sorting to regional hub only (1 destination)
         sort_destinations = 1
+
     elif sort_level == 'market':
+        # Sorting to specific destination facility (1 destination)
         sort_destinations = 1
+
     elif sort_level == 'sort_group':
+        # Sorting to route groups within destination (N destinations)
         if dest in fac_lookup.index:
             groups = fac_lookup.at[dest, 'last_mile_sort_groups_count']
             if pd.isna(groups) or groups <= 0:
@@ -95,16 +144,22 @@ def calculate_origin_containers_by_sort_level(
         else:
             sort_destinations = OptimizationConstants.DEFAULT_SORT_GROUPS
     else:
+        # Fallback
         sort_destinations = 1
 
+    # Split packages and cube across sort destinations
+    pkgs_per_destination = packages / sort_destinations
     cube_per_destination = total_cube / sort_destinations
 
+    # Containers needed per destination
     containers_per_destination = max(1, int(np.ceil(
         cube_per_destination / effective_container_cube
     )))
 
+    # Total containers across all destinations
     total_containers = containers_per_destination * sort_destinations
 
+    # Fill rate per container (using raw cube for reporting)
     container_fill_rate = safe_divide(
         cube_per_destination,
         containers_per_destination * raw_container_cube

@@ -517,36 +517,44 @@ def _calculate_zone_distribution_for_ods(
         facility: str = None
 ) -> Dict[str, float]:
     """
-    FIXED: Calculate zone distribution including direct injection.
+    Calculate zone distribution for OD set.
 
-    Returns DECIMALS not percentages (0.25 not 25.0)
+    SIMPLIFIED v4.7: Uses integer zones directly.
 
-    Returns dict with:
-    - zone_0_pct through zone_8_pct (as decimals 0-1)
-    - zone_unknown_pct (as decimal)
+    Returns DECIMALS not percentages (0.25 not 25.0).
+
+    Args:
+        ods: OD DataFrame with integer zone column
+        direct_day: Direct injection (optional, for zone 0)
+        facility: Facility name (for direct injection filtering)
+
+    Returns:
+        Dictionary with:
+            - zone_0_pct through zone_8_pct (decimals 0-1)
+            - zone_unknown_pct (decimal 0-1)
     """
+    from .utils import safe_divide
+
     # Start with middle-mile OD zones
     total_pkgs = 0
-    zone_pkgs = {str(i): 0 for i in range(9)}
-    zone_pkgs['unknown'] = 0
+    zone_pkgs = {i: 0 for i in range(9)}
+    zone_pkgs[-1] = 0  # Unknown
 
     # Add middle-mile packages
     if not ods.empty and 'zone' in ods.columns:
         total_pkgs += ods['pkgs_day'].sum()
 
-        # Normalize all zone values
-        normalized_zones = ods['zone'].apply(_normalize_zone_value)
-
         for zone_num in range(9):
-            zone_str = str(zone_num)
-            zone_mask = normalized_zones == zone_str
-            zone_pkgs[zone_str] += ods[zone_mask]['pkgs_day'].sum()
+            zone_pkgs[zone_num] += ods[
+                ods['zone'] == zone_num
+                ]['pkgs_day'].sum()
 
         # Unknown
-        unknown_mask = normalized_zones == 'unknown'
-        zone_pkgs['unknown'] += ods[unknown_mask]['pkgs_day'].sum()
+        zone_pkgs[-1] += ods[
+            ods['zone'] == -1
+            ]['pkgs_day'].sum()
 
-    # Add direct injection packages (zone 0)
+    # Add direct injection packages (zone 0) if applicable
     if direct_day is not None and not direct_day.empty and facility is not None:
         direct_col = 'dir_pkgs_day'
         if direct_col in direct_day.columns and 'dest' in direct_day.columns:
@@ -554,16 +562,21 @@ def _calculate_zone_distribution_for_ods(
             facility_direct = direct_day[direct_day['dest'] == facility]
             if not facility_direct.empty:
                 direct_pkgs = facility_direct[direct_col].sum()
-                zone_pkgs['0'] += direct_pkgs
+                zone_pkgs[0] += direct_pkgs
                 total_pkgs += direct_pkgs
 
     # Calculate percentages as DECIMALS
     zone_dist = {}
     for zone_num in range(9):
-        zone_str = str(zone_num)
-        zone_dist[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs), 4)
+        zone_dist[f'zone_{zone_num}_pct'] = round(
+            safe_divide(zone_pkgs[zone_num], total_pkgs),
+            4
+        )
 
-    zone_dist['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs), 4)
+    zone_dist['zone_unknown_pct'] = round(
+        safe_divide(zone_pkgs[-1], total_pkgs),
+        4
+    )
 
     return zone_dist
 
@@ -643,46 +656,69 @@ def calculate_network_zone_distribution(
 ) -> Dict:
     """
     Calculate network-level zone distribution.
+    
+    SIMPLIFIED v4.7: Uses integer zones directly.
+    
+    Includes:
+    - Zone 0: Direct injection (from direct_day)
+    - Zones 1-8: Middle-mile (from od_selected)
+    - Zone -1: Unknown (classification failed)
 
-    FIXED: Includes direct injection (zone 0) from direct_day.
+    Args:
+        od_selected: Selected OD paths with integer zone column
+        direct_day: Direct injection volumes (optional)
+
+    Returns:
+        Dictionary with:
+            - zone_0_pkgs through zone_8_pkgs (int)
+            - zone_0_pct through zone_8_pct (decimal 0-1)
+            - zone_unknown_pkgs (int)
+            - zone_unknown_pct (decimal 0-1)
     """
-    result = {}
+    from .utils import safe_divide
 
     # Initialize
-    zone_pkgs = {str(i): 0 for i in range(9)}
-    zone_pkgs['unknown'] = 0
+    zone_pkgs = {i: 0 for i in range(9)}
+    zone_pkgs[-1] = 0  # Unknown
     total_pkgs = 0
 
-    # Add middle-mile packages
+    # Add middle-mile packages (zones 1-8, possibly -1)
     if not od_selected.empty and 'zone' in od_selected.columns:
         total_pkgs += od_selected['pkgs_day'].sum()
 
-        normalized_zones = od_selected['zone'].apply(_normalize_zone_value)
-
         for zone_num in range(9):
-            zone_str = str(zone_num)
-            zone_mask = normalized_zones == zone_str
-            zone_pkgs[zone_str] += od_selected[zone_mask]['pkgs_day'].sum()
+            zone_pkgs[zone_num] += od_selected[
+                od_selected['zone'] == zone_num
+            ]['pkgs_day'].sum()
 
-        unknown_mask = normalized_zones == 'unknown'
-        zone_pkgs['unknown'] += od_selected[unknown_mask]['pkgs_day'].sum()
+        # Unknown zone (-1)
+        zone_pkgs[-1] += od_selected[
+            od_selected['zone'] == -1
+        ]['pkgs_day'].sum()
 
     # Add direct injection packages (zone 0)
     if direct_day is not None and not direct_day.empty:
         direct_col = 'dir_pkgs_day'
         if direct_col in direct_day.columns:
             direct_pkgs = direct_day[direct_col].sum()
-            zone_pkgs['0'] += direct_pkgs
+            zone_pkgs[0] += direct_pkgs
             total_pkgs += direct_pkgs
 
-    # Calculate results as decimals
-    for zone_num in range(9):
-        zone_str = str(zone_num)
-        result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs[zone_str])
-        result[f'zone_{zone_num}_pct'] = round(safe_divide(zone_pkgs[zone_str], total_pkgs), 4)
+    # Build result as decimals (not percentages)
+    result = {}
 
-    result['zone_unknown_pkgs'] = int(zone_pkgs['unknown'])
-    result['zone_unknown_pct'] = round(safe_divide(zone_pkgs['unknown'], total_pkgs), 4)
+    for zone_num in range(9):
+        result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs[zone_num])
+        result[f'zone_{zone_num}_pct'] = round(
+            safe_divide(zone_pkgs[zone_num], total_pkgs),
+            4  # 4 decimal places
+        )
+
+    result['zone_unknown_pkgs'] = int(zone_pkgs[-1])
+    result['zone_unknown_pct'] = round(
+        safe_divide(zone_pkgs[-1], total_pkgs),
+        4
+    )
 
     return result
 
@@ -735,24 +771,34 @@ def add_zone_classification(
     """
     Add zone classification based on distance from mileage_bands.
 
-    FIXED: O=D flows now use mileage_bands for distance=0 (not hardcoded zone 1).
+    SIMPLIFIED v4.7: Uses integer zones directly (0-8 or -1).
 
     Zone Assignment Rules:
     - For ALL flows (including O=D): Use mileage_bands for distance
     - Zone 0 is ONLY for direct injection (handled separately)
-    - Unknown: Classification failed (data quality issue)
+    - Returns -1 for unknown/error cases
+
+    Args:
+        od_df: OD DataFrame
+        facilities: Facility master data
+        mileage_bands: Mileage bands with integer zone column
+
+    Returns:
+        DataFrame with added 'zone' column (integer)
     """
+    from .geo_v4 import calculate_zone_from_distance
+
     if od_df.empty:
         return od_df
 
     od_df = od_df.copy()
-    od_df['zone'] = 'unknown'
+    od_df['zone'] = -1  # Initialize as unknown
 
     for idx, row in od_df.iterrows():
         origin = row['origin']
         dest = row['dest']
 
-        # ALL middle-mile flows (including O=D) use distance-based zone from mileage_bands
+        # ALL middle-mile flows use distance-based zone
         zone = calculate_zone_from_distance(origin, dest, facilities, mileage_bands)
         od_df.at[idx, 'zone'] = zone
 
@@ -765,6 +811,8 @@ def add_direct_injection_zone_classification(
     """
     Add zone 0 classification to direct injection flows.
 
+    SIMPLIFIED v4.7: Zone is integer 0.
+
     Direct injection = packages injected at destination without middle-mile transport.
     These are ALWAYS zone 0.
 
@@ -772,13 +820,13 @@ def add_direct_injection_zone_classification(
         direct_df: Direct injection DataFrame with 'dest' column
 
     Returns:
-        DataFrame with added 'zone' column set to '0'
+        DataFrame with added 'zone' column set to 0
     """
     if direct_df.empty:
         return direct_df
 
     direct_df = direct_df.copy()
-    direct_df['zone'] = '0'
+    direct_df['zone'] = 0  # Integer 0
 
     return direct_df
 
@@ -791,7 +839,17 @@ def add_zone_miles_to_od_selected(
     Add zone_miles column for validation.
 
     This allows validation of zone classification by showing actual O-D distance.
+
+    Args:
+        od_df: OD DataFrame
+        facilities: Facility master data
+
+    Returns:
+        DataFrame with added 'zone_miles' column (float)
     """
+    from .geo_v4 import haversine_miles
+    from .utils import get_facility_lookup
+
     if od_df.empty:
         return od_df
 
