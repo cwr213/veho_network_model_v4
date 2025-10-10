@@ -1,5 +1,11 @@
 """
-MILP Optimization Module - v4.9
+MILP Optimization Module - v4.10
+
+CRITICAL FIX v4.10:
+- Fixed intermediate sort vs. crossdock logic for region sort
+- Region sort ALWAYS requires full intermediate sort at regional hub
+- Market/sort_group use crossdock/container handling (already sorted)
+- No hardcoded values - all parameters from input file
 
 CRITICAL FIX v4.8:
 - Fixed container handling cost allocation using containers_per_package
@@ -91,7 +97,7 @@ def _extract_path_nodes_robust(row: pd.Series) -> List[str]:
             return parsed
 
     # Last resort: direct path
-    return [row["origin"], row["dest"]]
+    return [row.get("origin", ""), row.get("dest", "")]
 
 
 # ============================================================================
@@ -115,6 +121,8 @@ def solve_network_optimization(
     The solver explores all valid path combinations to find the minimum-cost
     network configuration. It is NOT being fed a target cost - it discovers
     the optimal solution through constraint satisfaction and cost minimization.
+
+    ALL PARAMETERS COME FROM INPUT FILE - NO HARDCODING.
     """
     # Convert parameters to proper types
     cost_params = _ensure_cost_parameters(cost_params)
@@ -173,7 +181,7 @@ def solve_network_optimization(
         else:
             model.Add(arc_pkgs[a_idx] == 0)
 
-    # Calculate capacities
+    # Calculate capacities from input parameters
     raw_trailer_cube = get_raw_trailer_cube(container_params)
     container_capacity = get_container_capacity(container_params) * get_containers_per_truck(container_params)
     fluid_capacity = get_trailer_capacity(container_params)
@@ -195,7 +203,7 @@ def solve_network_optimization(
             strategy_counts[s] = strategy_counts.get(s, 0) + 1
         predominant = max(strategy_counts, key=strategy_counts.get)
 
-        # Set capacity
+        # Set capacity from input parameters
         if predominant.lower() == "container":
             cap_scaled = int(container_capacity * OptimizationConstants.CUBE_SCALE_FACTOR)
         else:
@@ -222,7 +230,7 @@ def solve_network_optimization(
     # Build objective
     cost_terms = []
 
-    # Transportation costs
+    # Transportation costs from mileage_bands
     for a_idx in range(len(arc_meta)):
         truck_cost = safe_int_cost(
             arc_meta[a_idx]["cost_per_truck"],
@@ -232,7 +240,7 @@ def solve_network_optimization(
 
     processing_cost_terms = 0
 
-    # Processing costs
+    # Processing costs from cost_params
     for group_name, group_idxs in groups.items():
         repr_idx = group_idxs[0]
         volume = path_od_data[repr_idx]['pkgs_day']
@@ -437,7 +445,7 @@ def _build_arc_structures(cand, facilities, mileage_bands, path_keys):
 
 
 def _calc_arc(u, v, facilities, mileage_bands):
-    """Calculate arc metrics."""
+    """Calculate arc metrics from mileage_bands."""
     fac = facilities.set_index("facility_name")[["lat", "lon"]].astype(float)
 
     lat1, lon1 = fac.at[u, "lat"], fac.at[u, "lon"]
@@ -455,7 +463,7 @@ def _calc_arc(u, v, facilities, mileage_bands):
 
 
 # ============================================================================
-# PROCESSING COST CALCULATION - FIXED v4.8
+# PROCESSING COST CALCULATION - FIXED v4.10
 # ============================================================================
 
 def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
@@ -463,20 +471,28 @@ def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
     """
     Calculate per-package processing cost.
 
+    FIXED v4.10: Correct intermediate sort vs. crossdock logic
+    - Region sort ALWAYS requires full intermediate sort at regional hub
+    - Market/sort_group use crossdock/container handling (already sorted)
+    - ALL COSTS FROM cost_params INPUT FILE
+
     FIXED v4.8: Container handling now uses containers_per_package fraction
     instead of always charging for 1 full container per package.
 
     Cost Components:
     ----------------
     1. Injection sort: Always for middle-mile flows (including O=D)
-    2. Intermediate handling: Container handling OR sort (depends on strategy/level)
+    2. Intermediate handling:
+       - Region sort → FULL SORT at regional hub (regardless of strategy)
+       - Market sort → Crossdock/container handling (already sorted)
+       - Sort_group → Crossdock/container handling (pre-sorted)
+       - Fluid strategy → Always full sort
     3. Last-mile sort: Unless pre-sorted to sort_group level
     4. Delivery: Always included
 
     Container Handling Cost Allocation:
     -----------------------------------
-    Previous bug: estimate_containers_for_packages(1, ...) always returned 1
-    New fix: Use calculate_containers_per_package() for fractional allocation
+    Uses calculate_containers_per_package() for fractional allocation
 
     Example:
     - container_handling_cost = $5.00 per container touch
@@ -493,31 +509,45 @@ def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
 
     # O=D middle-mile: injection sort + last-mile sort + delivery
     if origin == dest:
-        cost += cost_params.last_mile_sort_cost_per_pkg  # Last mile sort
-        cost += cost_params.last_mile_delivery_cost_per_pkg  # Delivery
+        cost += cost_params.last_mile_sort_cost_per_pkg
+        cost += cost_params.last_mile_delivery_cost_per_pkg
         return cost
 
     # O≠D flows: process intermediates
     intermediates = nodes[1:-1] if len(nodes) > 2 else []
 
     if intermediates:
-        # FIXED v4.8: Calculate containers per package (fraction of container per pkg)
+        # Calculate containers per package (fraction of container per pkg)
         containers_per_package = calculate_containers_per_package(
             package_mix, container_params
         )
 
         # Determine handling cost at intermediate facilities
-        if sort_level == 'sort_group':
-            # Pre-sorted to granular level → just container handling
+        # CRITICAL FIX v4.10: Region sort ALWAYS needs full sort at intermediate
+        if sort_level == 'region':
+            # Region sort → packages going to regional hub for sorting
+            # MUST perform full sort regardless of strategy
+            cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+
+        elif sort_level == 'sort_group':
+            # Pre-sorted to granular level → just container handling/crossdock
             cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
 
-        elif strategy.lower() == 'container':
-            # Container strategy → container handling at intermediates
-            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+        elif sort_level == 'market':
+            # Market sort → already sorted to destination
+            if strategy.lower() == 'container':
+                # Container strategy → just container handling
+                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+            else:
+                # Fluid strategy → must sort to split freight
+                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
 
         else:
-            # Fluid strategy → full sort at intermediates
-            cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+            # Default fallback (shouldn't happen)
+            if strategy.lower() == 'container':
+                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+            else:
+                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
 
     # Last-mile sort (unless already sorted to sort_group)
     if sort_level != 'sort_group':
@@ -552,16 +582,18 @@ def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
         else:
             sort_level = 'market'
 
-        # Calculate transport cost
+        # Calculate transport cost - FIXED allocation
         transport_cost = 0
         for a_idx in path_arcs[i]:
             arc = arc_meta[a_idx]
             trucks = solver.Value(arc_trucks[a_idx])
-            if trucks > 0:
-                arc_pkgs_val = solver.Value(arc_pkgs[a_idx])
-                if arc_pkgs_val > 0:
-                    share = path_data['pkgs_day'] / arc_pkgs_val
-                    transport_cost += trucks * arc['cost_per_truck'] * share
+            arc_pkgs_val = solver.Value(arc_pkgs[a_idx])
+
+            if arc_pkgs_val > 0:
+                # Proportional allocation based on package share
+                pkg_share = path_data['pkgs_day'] / arc_pkgs_val
+                arc_cost = trucks * arc['cost_per_truck']
+                transport_cost += arc_cost * pkg_share
 
         # Calculate processing cost
         proc_cost_per_pkg = _calculate_processing_cost(

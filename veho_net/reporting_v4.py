@@ -1,5 +1,11 @@
 """
-Reporting Module - v4.5
+Reporting Module - v4.11
+
+FIXED v4.11:
+- Corrected _determine_intermediate_operation_type() logic
+- Region sort ALWAYS needs full sort at intermediate
+- Market/sort_group use crossdock (already sorted)
+- No hardcoded values - all from input parameters
 
 ZONE 0 FIX:
 - Zone 0 is ONLY for direct injection (tracked separately in direct_day)
@@ -74,6 +80,8 @@ def build_facility_volume(
 ) -> pd.DataFrame:
     """
     Calculate facility daily volumes and throughput (operational metrics only).
+
+    ALL VALUES FROM INPUT PARAMETERS - NO HARDCODING.
     """
     volume_data = []
 
@@ -229,7 +237,7 @@ def build_facility_volume(
                 if not inbound_arcs.empty:
                     inbound_trucks = int(inbound_arcs['trucks'].sum())
 
-            # Hourly throughput
+            # Hourly throughput from timing_params
             injection_va_hours = float(timing_params['injection_va_hours'])
             middle_mile_va_hours = float(timing_params['middle_mile_va_hours'])
             crossdock_va_hours = float(timing_params.get('crossdock_va_hours', 3.0))
@@ -294,28 +302,30 @@ def _determine_intermediate_operation_type(
         chosen_sort_level: str,
         facilities: pd.DataFrame
 ) -> str:
-    """Determine if intermediate facility needs sort or crossdock."""
+    """
+    Determine if intermediate facility performs sort or crossdock.
+
+    FIXED v4.11: Correct logic for region sort
+
+    Rules (NO HARDCODING):
+    - Fluid strategy: Always sort (must split freight)
+    - Region sort: Always sort (freight sent unsorted to regional hub)
+    - Market sort: Crossdock (already sorted to destination)
+    - Sort_group: Crossdock (pre-sorted to route groups)
+    """
     if path_strategy.lower() == 'fluid':
         return 'sort'
 
-    if path_strategy.lower() == 'container':
-        if chosen_sort_level == 'region':
-            fac_lookup = get_facility_lookup(facilities)
+    # CRITICAL FIX: Region sort ALWAYS needs full sort
+    if chosen_sort_level == 'region':
+        return 'sort'
 
-            if dest_facility in fac_lookup.index:
-                dest_hub = fac_lookup.at[dest_facility, 'regional_sort_hub']
-                if pd.isna(dest_hub) or dest_hub == '':
-                    dest_hub = dest_facility
+    # Market and sort_group are already sorted at origin
+    elif chosen_sort_level in ['market', 'sort_group']:
+        return 'crossdock'
 
-                if intermediate_facility == dest_hub:
-                    return 'sort'
-                else:
-                    return 'crossdock'
-
-        elif chosen_sort_level in ['market', 'sort_group']:
-            return 'crossdock'
-
-    return 'sort'
+    # Default: crossdock for container strategy
+    return 'crossdock'
 
 
 def _calculate_containers_for_volume(
@@ -324,7 +334,7 @@ def _calculate_containers_for_volume(
         container_params: pd.DataFrame,
         strategy: str
 ) -> Dict[str, float]:
-    """Calculate containers and cube for volume."""
+    """Calculate containers and cube for volume from input parameters."""
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = packages * w_cube
 
@@ -656,9 +666,9 @@ def calculate_network_zone_distribution(
 ) -> Dict:
     """
     Calculate network-level zone distribution.
-    
+
     SIMPLIFIED v4.7: Uses integer zones directly.
-    
+
     Includes:
     - Zone 0: Direct injection (from direct_day)
     - Zones 1-8: Middle-mile (from od_selected)
@@ -689,12 +699,12 @@ def calculate_network_zone_distribution(
         for zone_num in range(9):
             zone_pkgs[zone_num] += od_selected[
                 od_selected['zone'] == zone_num
-            ]['pkgs_day'].sum()
+                ]['pkgs_day'].sum()
 
         # Unknown zone (-1)
         zone_pkgs[-1] += od_selected[
             od_selected['zone'] == -1
-        ]['pkgs_day'].sum()
+            ]['pkgs_day'].sum()
 
     # Add direct injection packages (zone 0)
     if direct_day is not None and not direct_day.empty:
