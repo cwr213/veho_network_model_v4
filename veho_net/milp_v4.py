@@ -1,10 +1,17 @@
 """
-MILP Optimization Module - v4.7
+MILP Optimization Module - v4.8
+
+CRITICAL FIX v4.8:
+- Fixed container handling cost allocation using containers_per_package
+- Previously was charging 1 full container per package (always returned max(1, ...))
+- Now correctly allocates fractional container cost (e.g., 0.02 for 50 pkgs/container)
+- This fixes the $10+ cost discrepancy for multi-touch flows
 
 Changes:
 1. O=D middle-mile cost calculation fixed (injection sort required)
 2. Sort capacity constraints tightened (proper point counting)
 3. Path nodes preservation maintained
+4. Container handling cost now uses calculate_containers_per_package() helper
 """
 
 from ortools.sat.python import cp_model
@@ -18,7 +25,7 @@ from .containers_v4 import (
     get_containers_per_truck,
     get_trailer_capacity,
     get_raw_trailer_cube,
-    estimate_containers_for_packages,
+    calculate_containers_per_package,  # NEW import
 )
 from .geo_v4 import haversine_miles, band_lookup
 from .config_v4 import (
@@ -419,6 +426,81 @@ def _calc_arc(u, v, facilities, mileage_bands):
 
 
 # ============================================================================
+# PROCESSING COST CALCULATION - FIXED v4.8
+# ============================================================================
+
+def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
+                               facilities, package_mix, container_params):
+    """
+    Calculate per-package processing cost.
+
+    FIXED v4.8: Container handling now uses containers_per_package fraction
+    instead of always charging for 1 full container per package.
+
+    Cost Components:
+    ----------------
+    1. Injection sort: Always for middle-mile flows (including O=D)
+    2. Intermediate handling: Container handling OR sort (depends on strategy/level)
+    3. Last-mile sort: Unless pre-sorted to sort_group level
+    4. Delivery: Always included
+
+    Container Handling Cost Allocation:
+    -----------------------------------
+    Previous bug: estimate_containers_for_packages(1, ...) always returned 1
+    New fix: Use calculate_containers_per_package() for fractional allocation
+
+    Example:
+    - container_handling_cost = $5.00 per container touch
+    - packages_per_container = 50 packages
+    - containers_per_package = 0.02
+    - cost_per_package = $5.00 × 0.02 = $0.10 per package ✓
+    """
+    nodes = path_data['path_nodes']
+    origin = path_data['origin']
+    dest = path_data['dest']
+
+    # Start with injection sort (ALL middle-mile flows need this)
+    cost = cost_params.injection_sort_cost_per_pkg
+
+    # O=D middle-mile: injection sort + last-mile sort + delivery
+    if origin == dest:
+        cost += cost_params.last_mile_sort_cost_per_pkg  # Last mile sort
+        cost += cost_params.last_mile_delivery_cost_per_pkg  # Delivery
+        return cost
+
+    # O≠D flows: process intermediates
+    intermediates = nodes[1:-1] if len(nodes) > 2 else []
+
+    if intermediates:
+        # FIXED v4.8: Calculate containers per package (fraction of container per pkg)
+        containers_per_package = calculate_containers_per_package(
+            package_mix, container_params
+        )
+
+        # Determine handling cost at intermediate facilities
+        if sort_level == 'sort_group':
+            # Pre-sorted to granular level → just container handling
+            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+
+        elif strategy.lower() == 'container':
+            # Container strategy → container handling at intermediates
+            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+
+        else:
+            # Fluid strategy → full sort at intermediates
+            cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+
+    # Last-mile sort (unless already sorted to sort_group)
+    if sort_level != 'sort_group':
+        cost += cost_params.last_mile_sort_cost_per_pkg
+
+    # Delivery (always)
+    cost += cost_params.last_mile_delivery_cost_per_pkg
+
+    return cost
+
+
+# ============================================================================
 # RESULT BUILDING - FIXED
 # ============================================================================
 
@@ -534,67 +616,6 @@ def _ensure_load_strategy(gs) -> LoadStrategy:
     return LoadStrategy.CONTAINER if str(gs).lower() == 'container' else LoadStrategy.FLUID
 
 
-def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
-                               facilities, package_mix, container_params):
-    """
-    Calculate per-package processing cost.
-
-    FIXED v4.7: O=D middle-mile includes injection sort + last-mile sort.
-    O=D direct injection (handled separately) has no injection sort.
-
-    Cost Components:
-    ----------------
-    1. Injection sort: Always for middle-mile flows (including O=D)
-    2. Intermediate handling: Container handling OR sort (depends on strategy/level)
-    3. Last-mile sort: Unless pre-sorted to sort_group level
-    4. Delivery: Always included
-    """
-    nodes = path_data['path_nodes']
-    origin = path_data['origin']
-    dest = path_data['dest']
-
-    # Start with injection sort (ALL middle-mile flows need this)
-    cost = cost_params.injection_sort_cost_per_pkg
-
-    # O=D middle-mile: injection sort + last-mile sort + delivery
-    if origin == dest:
-        cost += cost_params.last_mile_sort_cost_per_pkg  # Last mile sort
-        cost += cost_params.last_mile_delivery_cost_per_pkg  # Delivery
-        return cost
-
-    # O≠D flows: process intermediates
-    intermediates = nodes[1:-1] if len(nodes) > 2 else []
-
-    if intermediates:
-        # Determine handling cost at intermediate facilities
-        if sort_level == 'sort_group':
-            # Pre-sorted to granular level → just container handling
-            containers_per_pkg = estimate_containers_for_packages(
-                1, package_mix, container_params
-            ) / 1.0
-            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_pkg
-
-        elif strategy.lower() == 'container':
-            # Container strategy → container handling at intermediates
-            containers_per_pkg = estimate_containers_for_packages(
-                1, package_mix, container_params
-            ) / 1.0
-            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_pkg
-
-        else:
-            # Fluid strategy → full sort at intermediates
-            cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
-
-    # Last-mile sort (unless already sorted to sort_group)
-    if sort_level != 'sort_group':
-        cost += cost_params.last_mile_sort_cost_per_pkg
-
-    # Delivery (always)
-    cost += cost_params.last_mile_delivery_cost_per_pkg
-
-    return cost
-
-
 def _create_sort_decision_variables(model, groups, cand, facilities, timing_params):
     """Create sort level decision variables."""
     sort_decision = {}
@@ -645,41 +666,21 @@ def _get_valid_sort_levels(origin, dest, fac_lookup):
 
 def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                                    facilities, timing_params, cand):
-    """
-    FIXED v4.7: Enforce sort capacity limits with proper point counting.
-    
-    Sort Points Formula:
-    -------------------
-    - Region sort: 1 point per unique region (shared across destinations)
-    - Market sort: 1 point per unique market/destination
-    - Sort group: N points per market (N = sort_groups_count at destination)
-    
-    Example:
-    --------
-    Facility sorts to 3 destinations in California:
-    - All 3 use region sort → 1 point (California region)
-    - All 3 use market sort → 3 points (3 markets)
-    - 2 use market, 1 uses sort_group (4 groups) → 2 + 4 = 6 points
-    """
+    """Enforce sort capacity limits with proper point counting."""
     from .utils import get_facility_lookup
     from .config_v4 import OptimizationConstants
 
     fac_lookup = get_facility_lookup(facilities)
 
-    # Handle both dict and TimingParameters object
     if hasattr(timing_params, 'sort_points_per_destination'):
-        # TimingParameters dataclass
         sort_points_per_dest = float(timing_params.sort_points_per_destination)
     else:
-        # Dictionary
         sort_points_per_dest = float(timing_params['sort_points_per_destination'])
 
-    # Get all hub/hybrid facilities
     hub_facilities = facilities[
         facilities['type'].str.lower().isin(['hub', 'hybrid'])
     ]['facility_name'].tolist()
 
-    # For each facility + day_type combination
     facility_day_combos = set()
     for group_name in groups.keys():
         scenario_id, origin, dest, day_type = group_name
@@ -696,7 +697,6 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
 
         max_capacity = int(max_capacity)
 
-        # Collect all ODs originating from this facility
         facility_groups = [
             (group_name, group_idxs)
             for group_name, group_idxs in groups.items()
@@ -706,7 +706,6 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
         if not facility_groups:
             continue
 
-        # Build regional hub mapping
         regional_hubs = {}
         dest_to_hub = {}
 
@@ -723,7 +722,6 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                     regional_hubs[hub] = []
                 regional_hubs[hub].append(dest)
 
-        # Create capacity tracking variable
         facility_sort_points = model.NewIntVar(
             0, max_capacity,
             f"sort_pts_{facility}_{day_type}"
@@ -731,13 +729,11 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
 
         point_terms = []
 
-        # 1. REGION-LEVEL SORT POINTS (shared across destinations in region)
         for region_hub, dests_in_region in regional_hubs.items():
             region_var = model.NewBoolVar(
                 f"region_{facility}_{day_type}_{region_hub}"
             )
 
-            # Region var is 1 if ANY destination in region uses region sort
             region_sort_vars = []
             for (group_name, _) in facility_groups:
                 _, _, dest, _ = group_name
@@ -748,27 +744,22 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
 
             if region_sort_vars:
                 model.AddMaxEquality(region_var, region_sort_vars)
-                # 1 sort point per region
                 point_terms.append(region_var * int(sort_points_per_dest))
 
-        # 2. MARKET-LEVEL SORT POINTS (1 per destination)
         for (group_name, _) in facility_groups:
             _, _, dest, _ = group_name
             sort_vars = sort_decision.get(group_name, {})
 
             if sort_vars.get('market') is not None:
-                # 1 sort point per market
                 point_terms.append(
                     sort_vars['market'] * int(sort_points_per_dest)
                 )
 
-        # 3. SORT-GROUP-LEVEL SORT POINTS (N per destination)
         for (group_name, _) in facility_groups:
             _, _, dest, _ = group_name
             sort_vars = sort_decision.get(group_name, {})
 
             if sort_vars.get('sort_group') is not None:
-                # N sort points per market (N = groups at destination)
                 if dest in fac_lookup.index:
                     groups_count = fac_lookup.at[dest, 'last_mile_sort_groups_count']
                     if pd.isna(groups_count) or groups_count <= 0:
@@ -779,10 +770,10 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
                         sort_vars['sort_group'] * int(sort_points_per_dest * groups_count)
                     )
 
-        # ENFORCE CAPACITY CONSTRAINT
         if point_terms:
             model.Add(facility_sort_points == sum(point_terms))
             model.Add(facility_sort_points <= max_capacity)
+
 
 def _determine_arc_strategies(arc_meta, chosen_idx, path_od_data, path_arcs, global_strategy):
     """Determine effective strategy per arc."""
@@ -817,7 +808,7 @@ def _build_arc_summary(arc_meta, arc_pkgs, arc_trucks, arc_strategies, w_cube,
 
     gaylord_row = container_params[
         container_params["container_type"].str.lower() == "gaylord"
-        ].iloc[0]
+    ].iloc[0]
     raw_container_cube = float(gaylord_row["usable_cube_cuft"])
 
     for a_idx in range(len(arc_meta)):

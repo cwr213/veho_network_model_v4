@@ -1,13 +1,13 @@
 """
 Container and Truck Capacity Calculations
 
-All calculations use input parameters - NO HARDCODED VALUES.
 Handles both container and fluid loading strategies with proper fill rate calculations.
 
 Key Functions:
     - weighted_pkg_cube: Calculate weighted average package cube
     - calculate_truck_capacity: Determine packages per truck by strategy
     - calculate_trucks_and_fill_rates: Full truck calculation with dwell logic
+    - calculate_containers_per_package: NEW - Fraction of container per package
 
 Business Logic:
     Container Strategy: packages → gaylords → trucks
@@ -49,6 +49,64 @@ def weighted_pkg_cube(package_mix: pd.DataFrame) -> float:
         >>> weighted_pkg_cube(mix)  # Returns 1.9
     """
     return float((package_mix["share_of_pkgs"] * package_mix["avg_cube_cuft"]).sum())
+
+
+# ============================================================================
+# CONTAINER PER PACKAGE CALCULATION (NEW)
+# ============================================================================
+
+def calculate_containers_per_package(
+        package_mix: pd.DataFrame,
+        container_params: pd.DataFrame
+) -> float:
+    """
+    Calculate the fraction of a container that one average package represents.
+
+    This is the INVERSE of packages per container. Used for allocating
+    container handling costs on a per-package basis.
+
+    Formula:
+        1. weighted_cube = average cubic feet per package
+        2. effective_container_cube = usable_cube × pack_utilization
+        3. packages_per_container = effective_container_cube / weighted_cube
+        4. containers_per_package = 1 / packages_per_container
+
+    Args:
+        package_mix: Package distribution with cube factors
+        container_params: Container parameters
+
+    Returns:
+        Fraction of container per package (e.g., 0.02 = 50 pkgs per container)
+
+    Example:
+        >>> # If 50 packages fit in a container on average
+        >>> containers_per_pkg = calculate_containers_per_package(mix, params)
+        >>> containers_per_pkg  # Returns 0.02
+        >>>
+        >>> # Used for cost allocation:
+        >>> container_handling_cost = 5.00  # $5 per container touch
+        >>> cost_per_pkg = container_handling_cost * containers_per_pkg
+        >>> cost_per_pkg  # Returns 0.10 ($0.10 per package)
+    """
+    weighted_cube = weighted_pkg_cube(package_mix)
+
+    if weighted_cube < OptimizationConstants.EPSILON:
+        raise ValueError(f"Weighted package cube must be positive, got {weighted_cube}")
+
+    # Get effective container capacity
+    gaylord_row = container_params[
+        container_params["container_type"].str.lower() == "gaylord"
+        ].iloc[0]
+
+    raw_container_cube = float(gaylord_row["usable_cube_cuft"])
+    pack_util_container = float(gaylord_row["pack_utilization_container"])
+    effective_container_cube = raw_container_cube * pack_util_container
+
+    # Calculate packages per container
+    packages_per_container = effective_container_cube / weighted_cube
+
+    # Return inverse (containers per package)
+    return 1.0 / packages_per_container
 
 
 # ============================================================================
