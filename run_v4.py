@@ -1,14 +1,11 @@
 """
-Main Execution Script - v4.3 ZONE TRACKING UPDATE
+Main Execution Script - v4.13 FLUID ANALYSIS UPDATE
 
 Updates:
-1. Zone 0 for direct injection packages
-2. Zone 1 for middle-mile O=D
-3. Zones 2-8 from mileage bands
-4. Unknown zone flagging and warnings
-5. Comprehensive zone cost analysis including direct injection
-6. FIXED: Zone miles validation column added
-7. FIXED: Percentages as decimals for Excel formatting
+1. Simplified fluid load analysis (arc-based, no consolidation logic)
+2. Removed hardcoded min_daily_benefit and max_results thresholds
+3. Returns ALL fluid opportunities (user can filter in Excel)
+4. Updated validation for fluid analysis requirements
 """
 
 import argparse
@@ -50,8 +47,7 @@ from veho_net.zone_cost_analysis import (
 )
 from veho_net.fluid_load_analysis import (
     analyze_fluid_load_opportunities,
-    create_fluid_load_summary_report,
-    calculate_sort_point_savings
+    create_fluid_load_summary_report
 )
 from veho_net.sort_strategy_comparison import (
     run_sort_strategy_comparison,
@@ -493,7 +489,7 @@ def main(input_path: str, output_dir: str):
             )
 
             # Check for unknown zones
-            unknown_zones = od_selected[od_selected['zone'] == 'unknown']
+            unknown_zones = od_selected[od_selected['zone'] == -1]
             if not unknown_zones.empty:
                 unknown_pkgs = unknown_zones['pkgs_day'].sum()
                 unknown_pct = (unknown_pkgs / od_selected['pkgs_day'].sum()) * 100
@@ -808,12 +804,14 @@ def main(input_path: str, output_dir: str):
         print("=" * 70)
 
         try:
-            required_for_fluid = ['origin', 'dest', 'pkgs_day', 'effective_strategy']
+            # UPDATED: Simplified validation for arc-based analysis
+            required_for_fluid = ['pkgs_day', 'chosen_sort_level', 'path_nodes']
             missing_cols = [col for col in required_for_fluid if col not in od_selected.columns]
 
             if missing_cols:
                 print(f"  ⚠️  Skipping fluid analysis - missing columns: {missing_cols}")
             else:
+                # UPDATED: No hardcoded thresholds - returns ALL opportunities
                 fluid_opportunities = analyze_fluid_load_opportunities(
                     od_selected=od_selected,
                     arc_summary=arc_summary,
@@ -821,27 +819,11 @@ def main(input_path: str, output_dir: str):
                     package_mix=dfs["package_mix"],
                     container_params=dfs["container_params"],
                     mileage_bands=dfs["mileage_bands"],
-                    cost_params=cost_params,
-                    min_daily_benefit=50.0,
-                    max_results=50
+                    cost_params=cost_params
                 )
 
                 if not fluid_opportunities.empty:
                     print(create_fluid_load_summary_report(fluid_opportunities))
-
-                    try:
-                        sort_point_savings = calculate_sort_point_savings(
-                            fluid_opportunities,
-                            timing_params_dict,
-                            dfs["facilities"]
-                        )
-
-                        if not sort_point_savings.empty:
-                            print("\n📊 Sort Point Capacity Freed by Fluid Loading:")
-                            print(sort_point_savings.to_string(index=False))
-                    except Exception as e:
-                        print(f"  ⚠️  Sort point savings calculation failed: {e}")
-                        sort_point_savings = pd.DataFrame()
 
                     try:
                         fluid_output = output_dir / f"fluid_opportunities_{run_id}.xlsx"
@@ -851,19 +833,14 @@ def main(input_path: str, output_dir: str):
                                 sheet_name='opportunities',
                                 index=False
                             )
-                            if not sort_point_savings.empty:
-                                sort_point_savings.to_excel(
-                                    writer,
-                                    sheet_name='sort_point_savings',
-                                    index=False
-                                )
 
                         print(f"\n✓ Saved fluid opportunities to: {fluid_output.name}")
+                        print(f"  ({len(fluid_opportunities)} arcs analyzed)")
                         created_files.append(fluid_output.name)
                     except Exception as e:
                         print(f"  ⚠️  Could not save fluid opportunities: {e}")
                 else:
-                    print("  ✓ All lanes optimally utilized - no fluid opportunities found")
+                    print("  ✓ All arcs optimally utilized - no fluid opportunities found")
 
         except Exception as e:
             print(f"  ⚠️  Fluid load analysis failed: {e}")
@@ -924,9 +901,8 @@ def main(input_path: str, output_dir: str):
     print(f"✅ Container flow correction: APPLIED")
     print(f"✅ Zone tracking: 0 (DI) + 1-8 + Unknown")
     print(f"✅ Zone miles validation: ADDED")
-    print(f"✅ Percentage decimals: FIXED")
-    print(f"✅ Unknown zone flagging: ACTIVE")
-    print(f"✅ Enhanced error handling: ACTIVE")
+    print(f"✅ Fluid analysis: Arc-based (simplified)")
+    print(f"✅ All thresholds removed: User filters in Excel")
 
     if created_files:
         print(f"\nOutput files in {output_dir}:")
@@ -952,10 +928,10 @@ Zone Classification:
   - Zone 1-8: Distance-based from mileage_bands (includes O=D)
   - Unknown: Classification failed (data quality flag)
 
-Zone Validation:
-  - Check zone_miles column in od_selected_paths
-  - Verify against mileage_band ranges
-  - O=D flows should show 0.0 miles
+Fluid Load Analysis:
+  - Arc-based: Analyzes actual planned arcs only
+  - No consolidation assumptions: Direct container vs fluid comparison
+  - Returns ALL opportunities: Filter/sort in Excel as needed
 
 For input file validation, run the diagnostic script first:
   python diagnostic_runner.py data/input.xlsx
