@@ -1,11 +1,15 @@
 """
-Main Execution Script - v4.13 FLUID ANALYSIS UPDATE
+Main Execution Script - v4.15 FLUID ANALYSIS FIX
 
-Updates:
-1. Simplified fluid load analysis (arc-based, no consolidation logic)
-2. Removed hardcoded min_daily_benefit and max_results thresholds
-3. Returns ALL fluid opportunities (user can filter in Excel)
-4. Updated validation for fluid analysis requirements
+Updates v4.15:
+1. Fluid analysis now runs per-scenario (not just last one)
+2. Executive summary and comparison work correctly with all scenarios
+3. Proper scenario tracking throughout
+
+Updates v4.14:
+1. Added max_sort_points_capacity override in scenarios sheet
+2. Smart run_id auto-generation from scenario characteristics
+3. Capacity passthrough to MILP solver
 """
 
 import argparse
@@ -61,29 +65,46 @@ from veho_net.container_flow_v4 import (
 )
 
 
+def generate_run_id(scenarios_df: pd.DataFrame) -> str:
+    """Generate descriptive run_id from scenario characteristics."""
+
+    years = scenarios_df['year'].unique()
+
+    if 'max_sort_points_capacity' in scenarios_df.columns:
+        capacities = scenarios_df['max_sort_points_capacity'].dropna()
+        if len(capacities) > 0:
+            cap_values = sorted(capacities.unique())
+            if len(cap_values) == 1:
+                cap_suffix = f"_cap{int(cap_values[0])}"
+            else:
+                cap_suffix = f"_cap{int(min(cap_values))}-{int(max(cap_values))}"
+        else:
+            cap_suffix = ""
+    else:
+        cap_suffix = ""
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    year_str = f"{min(years)}" if len(years) == 1 else f"{min(years)}-{max(years)}"
+
+    return f"{year_str}_{timestamp}{cap_suffix}"
+
+
 def validate_scenario_data(scenario_row: pd.Series, dfs: dict) -> tuple:
     """
     Validate scenario has required data before processing.
-
-    Returns:
-        (is_valid: bool, error_message: str)
     """
     year = int(scenario_row["year"])
 
-    # Check demand data exists
     year_demand = dfs["demand"].query("year == @year")
     if year_demand.empty:
         return False, f"No demand data for year {year}"
 
-    # Check facilities exist
     if dfs["facilities"].empty:
         return False, "No facilities defined"
 
-    # Check package mix exists
     if dfs["package_mix"].empty:
         return False, "No package mix defined"
 
-    # Check mileage bands exist
     if dfs["mileage_bands"].empty:
         return False, "No mileage bands defined"
 
@@ -93,12 +114,6 @@ def validate_scenario_data(scenario_row: pd.Series, dfs: dict) -> tuple:
 def normalize_path_nodes(df: pd.DataFrame) -> pd.DataFrame:
     """
     Ensure path_nodes column contains lists (not tuples) for downstream processing.
-
-    Args:
-        df: DataFrame with path_nodes column
-
-    Returns:
-        DataFrame with normalized path_nodes
     """
     if 'path_nodes' not in df.columns:
         return df
@@ -114,13 +129,6 @@ def normalize_path_nodes(df: pd.DataFrame) -> pd.DataFrame:
 def validate_arc_summary(arc_summary: pd.DataFrame, context: str = "") -> bool:
     """
     Validate arc summary has required columns.
-
-    Args:
-        arc_summary: Arc summary DataFrame
-        context: Description for error messages
-
-    Returns:
-        True if valid, False otherwise
     """
     if arc_summary.empty:
         print(f"  ⚠️  {context}: Arc summary is empty")
@@ -154,10 +162,6 @@ def main(input_path: str, output_dir: str):
     print(f"\n📁 Input: {input_path.name}")
     print(f"📁 Output: {output_dir}")
 
-    # ========================================================================
-    # LOAD AND VALIDATE INPUTS
-    # ========================================================================
-
     print(f"\n{'=' * 70}")
     print("LOADING INPUTS")
     print("=" * 70)
@@ -178,10 +182,6 @@ def main(input_path: str, output_dir: str):
         print(f"   Error: {e}")
         return 1
 
-    # ========================================================================
-    # PARSE PARAMETERS
-    # ========================================================================
-
     print(f"\n{'=' * 70}")
     print("PARSING PARAMETERS")
     print("=" * 70)
@@ -197,7 +197,6 @@ def main(input_path: str, output_dir: str):
         print(f"   Error: {e}")
         return 1
 
-    # Create parameter objects
     try:
         cost_params = CostParameters(
             injection_sort_cost_per_pkg=float(cost_params_dict["injection_sort_cost_per_pkg"]),
@@ -215,7 +214,6 @@ def main(input_path: str, output_dir: str):
         print(f"   Error: {e}")
         return 1
 
-    # Determine strategy
     try:
         global_strategy = (
             LoadStrategy.CONTAINER
@@ -229,7 +227,14 @@ def main(input_path: str, output_dir: str):
 
     enable_sort_opt = bool(run_settings_dict.get("enable_sort_optimization", False))
     around_factor = float(run_settings_dict.get("path_around_the_world_factor", 1.3))
-    run_id = run_settings_dict.get("run_id", datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+    user_run_id = run_settings_dict.get("run_id", None)
+    if user_run_id and str(user_run_id).strip():
+        run_id = str(user_run_id).strip()
+        print(f"\n✓ Using provided run_id: {run_id}")
+    else:
+        run_id = generate_run_id(dfs["scenarios"])
+        print(f"\n✓ Auto-generated run_id: {run_id}")
 
     print(f"\n✓ Configuration:")
     print(f"  - Global strategy: {global_strategy.value}")
@@ -242,10 +247,7 @@ def main(input_path: str, output_dir: str):
 
     all_results = []
     created_files = []
-
-    # ========================================================================
-    # PROCESS SCENARIOS
-    # ========================================================================
+    scenario_data_store = {}
 
     print(f"\n{'=' * 70}")
     print(f"PROCESSING {len(dfs['scenarios'])} SCENARIOS")
@@ -259,19 +261,21 @@ def main(input_path: str, output_dir: str):
         print(f"\n{'─' * 70}")
         print(f"SCENARIO {scenario_idx + 1}/{len(dfs['scenarios'])}: {scenario_id}")
         print(f"  Year: {year}, Day Type: {day_type}")
+
+        if 'max_sort_points_capacity' in scenario_row.index and pd.notna(scenario_row['max_sort_points_capacity']):
+            capacity_override = int(scenario_row['max_sort_points_capacity'])
+            print(f"  Capacity Override: {capacity_override} sort points")
+        else:
+            print(f"  Capacity: Using facilities defaults")
+
         print("─" * 70)
 
-        # Validate scenario data
         is_valid, error_msg = validate_scenario_data(scenario_row, dfs)
         if not is_valid:
             print(f"  ❌ Skipping scenario: {error_msg}")
             continue
 
         try:
-            # ================================================================
-            # 1. BUILD OD MATRIX
-            # ================================================================
-
             print("\n1. Building OD matrix...")
             year_demand = dfs["demand"].query("year == @year").copy()
 
@@ -300,14 +304,9 @@ def main(input_path: str, output_dir: str):
 
             direct_day["dir_pkgs_day"] = direct_day[direct_col]
 
-            # Add zone 0 classification to direct injection
             direct_day = add_direct_injection_zone_classification(direct_day)
             direct_pkgs_total = direct_day["dir_pkgs_day"].sum()
             print(f"  ✓ Direct injection (Zone 0): {direct_pkgs_total:,.0f} packages")
-
-            # ================================================================
-            # 2. GENERATE CANDIDATE PATHS
-            # ================================================================
 
             print("\n2. Generating candidate paths...")
 
@@ -328,7 +327,6 @@ def main(input_path: str, output_dir: str):
                 print(f"  ❌ No valid paths generated")
                 continue
 
-            # Merge package volumes
             paths = paths.merge(
                 od[['origin', 'dest', 'pkgs_day']],
                 on=['origin', 'dest'],
@@ -340,10 +338,6 @@ def main(input_path: str, output_dir: str):
             paths["day_type"] = day_type
 
             print(f"  ✓ Generated {len(paths)} candidate paths")
-
-            # ================================================================
-            # 3. SORT STRATEGY COMPARISON (if enabled)
-            # ================================================================
 
             if enable_sort_opt:
                 print(f"\n{'─' * 70}")
@@ -362,11 +356,11 @@ def main(input_path: str, output_dir: str):
                             cost_params=cost_params,
                             timing_params=timing_params_dict,
                             global_strategy=global_strategy,
-                            scenario_id=scenario_id
+                            scenario_id=scenario_id,
+                            scenario_row=scenario_row
                         )
                     )
 
-                    # Save comparison results
                     if not comparison_summary.empty:
                         comp_output = output_dir / f"sort_comparison_{scenario_id}_{global_strategy.value}.xlsx"
                         with pd.ExcelWriter(comp_output, engine='xlsxwriter') as writer:
@@ -383,7 +377,6 @@ def main(input_path: str, output_dir: str):
                             comparison_summary, facility_comparison
                         ))
 
-                    # Reuse optimized results
                     if optimized_results is not None:
                         print(f"\n{'─' * 70}")
                         print("✓ USING OPTIMIZED RESULTS FROM COMPARISON")
@@ -407,7 +400,8 @@ def main(input_path: str, output_dir: str):
                                 cost_params,
                                 timing_params_dict,
                                 global_strategy,
-                                True
+                                True,
+                                scenario_row
                             )
                         )
 
@@ -431,7 +425,8 @@ def main(input_path: str, output_dir: str):
                             cost_params,
                             timing_params_dict,
                             global_strategy,
-                            True
+                            True,
+                            scenario_row
                         )
                     )
 
@@ -448,7 +443,8 @@ def main(input_path: str, output_dir: str):
                         cost_params,
                         timing_params_dict,
                         global_strategy,
-                        False
+                        False,
+                        scenario_row
                     )
                 except Exception as e:
                     print(f"  ❌ Optimization failed: {e}")
@@ -456,39 +452,27 @@ def main(input_path: str, output_dir: str):
                     traceback.print_exc()
                     continue
 
-            # ================================================================
-            # 4. Validate optimization results
-            # ================================================================
-
             if od_selected.empty:
                 print(f"  ❌ Optimization returned no paths")
                 continue
 
             print(f"  ✓ Selected {len(od_selected)} optimal paths")
 
-            # Normalize path_nodes to lists
             od_selected = normalize_path_nodes(od_selected)
-
-            # ================================================================
-            # 5. ADD ZONE CLASSIFICATION
-            # ================================================================
 
             print("\n4. Adding zone classification...")
 
-            # Add zone classification to middle-mile flows (zones 1-8)
             od_selected = add_zone_classification(
                 od_selected,
                 dfs["facilities"],
                 dfs["mileage_bands"]
             )
 
-            # NEW: Add zone_miles column for validation
             od_selected = add_zone_miles_to_od_selected(
                 od_selected,
                 dfs["facilities"]
             )
 
-            # Check for unknown zones
             unknown_zones = od_selected[od_selected['zone'] == -1]
             if not unknown_zones.empty:
                 unknown_pkgs = unknown_zones['pkgs_day'].sum()
@@ -496,16 +480,11 @@ def main(input_path: str, output_dir: str):
                 print(f"  ⚠️  WARNING: {unknown_pct:.1f}% of packages in unknown zone")
                 print(f"     {len(unknown_zones)} OD pairs affected")
 
-                # Print examples for debugging
                 print(f"\n     Example unknown zone ODs:")
                 for _, row in unknown_zones.head(5).iterrows():
                     print(f"     {row['origin']} -> {row['dest']}: {row['zone_miles']:.1f} miles")
             else:
                 print(f"  ✓ All OD pairs successfully classified")
-
-            # ================================================================
-            # 6. CONTAINER FLOW CORRECTION
-            # ================================================================
 
             print("\n5. Applying container flow correction...")
 
@@ -565,13 +544,8 @@ def main(input_path: str, output_dir: str):
                 arc_summary = arc_summary_original
                 sort_container_impact = pd.DataFrame()
 
-            # ================================================================
-            # 7. GENERATE OUTPUTS
-            # ================================================================
-
             print("\n6. Generating outputs...")
 
-            # Zone cost analysis (including direct injection = zone 0)
             zone_cost_analysis = pd.DataFrame()
             try:
                 print("\n6a. Calculating zone cost analysis (including Zone 0)...")
@@ -579,7 +553,7 @@ def main(input_path: str, output_dir: str):
                     od_selected,
                     dfs["facilities"],
                     dfs["mileage_bands"],
-                    direct_day  # Pass direct injection for zone 0
+                    direct_day
                 )
 
                 if not zone_cost_analysis.empty:
@@ -587,7 +561,6 @@ def main(input_path: str, output_dir: str):
             except Exception as e:
                 print(f"  ⚠️  Zone cost analysis failed: {e}")
 
-            # Path steps
             try:
                 path_steps = build_path_steps(
                     od_selected,
@@ -600,7 +573,6 @@ def main(input_path: str, output_dir: str):
                 print(f"  ⚠️  Path steps generation failed: {e}")
                 path_steps = pd.DataFrame()
 
-            # Facility volume
             try:
                 facility_volume = build_facility_volume(
                     od_selected,
@@ -619,20 +591,18 @@ def main(input_path: str, output_dir: str):
                 traceback.print_exc()
                 facility_volume = pd.DataFrame()
 
-            # Facility network profile - FIXED: Pass direct_day
             try:
                 facility_network_profile = build_facility_network_profile(
                     od_selected,
                     dfs["facilities"],
                     dfs["mileage_bands"],
-                    direct_day  # FIXED: Pass direct_day for zone 0
+                    direct_day
                 )
                 print("  ✓ Facility network profile built")
             except Exception as e:
                 print(f"  ⚠️  Facility network profile failed: {e}")
                 facility_network_profile = pd.DataFrame()
 
-            # Network metrics
             try:
                 distance_metrics = calculate_network_distance_metrics(
                     od_selected,
@@ -657,7 +627,6 @@ def main(input_path: str, output_dir: str):
                 zone_distribution = {}
                 sort_distribution = {}
 
-            # Validation
             try:
                 validation_results = validate_network_aggregations(
                     od_selected,
@@ -668,19 +637,16 @@ def main(input_path: str, output_dir: str):
                 if not validation_results.get('package_consistency', True):
                     print("  ⚠️  Warning: Package volume inconsistency detected")
 
-                # Report unknown zones
                 if validation_results.get('unknown_zone_pct', 0) > 0:
                     print(f"  ⚠️  {validation_results['unknown_zone_pct']:.1f}% of packages in unknown zone")
 
             except Exception as e:
                 print(f"  ⚠️  Validation check failed: {e}")
 
-            # Calculate totals
             total_cost = od_selected["total_cost"].sum()
             total_pkgs = od_selected["pkgs_day"].sum()
             cost_per_pkg = total_cost / max(total_pkgs, 1)
 
-            # Build KPIs
             kpis = pd.Series({
                 "scenario_id": scenario_id,
                 "year": year,
@@ -699,7 +665,6 @@ def main(input_path: str, output_dir: str):
                 **sort_distribution
             })
 
-            # Scenario summary
             scenario_summary = pd.DataFrame([
                 {"key": "scenario_id", "value": scenario_id},
                 {"key": "year", "value": year},
@@ -715,9 +680,12 @@ def main(input_path: str, output_dir: str):
                 {"key": "zone_miles_validation", "value": True}
             ])
 
-            # ================================================================
-            # 8. WRITE OUTPUT FILES
-            # ================================================================
+            if 'max_sort_points_capacity' in scenario_row.index and pd.notna(scenario_row['max_sort_points_capacity']):
+                capacity_used = int(scenario_row['max_sort_points_capacity'])
+                scenario_summary = pd.concat([
+                    scenario_summary,
+                    pd.DataFrame([{"key": "max_sort_capacity_override", "value": capacity_used}])
+                ], ignore_index=True)
 
             output_filename = OUTPUT_FILE_TEMPLATE.format(
                 scenario_id=scenario_id,
@@ -725,7 +693,6 @@ def main(input_path: str, output_dir: str):
             )
             output_path = output_dir / output_filename
 
-            # Build sort analysis
             if enable_sort_opt and not sort_summary.empty:
                 try:
                     sort_analysis = build_sort_summary(
@@ -740,7 +707,6 @@ def main(input_path: str, output_dir: str):
             else:
                 sort_analysis = sort_summary
 
-            # Write main workbook
             try:
                 write_success = write_workbook(
                     output_path,
@@ -768,7 +734,6 @@ def main(input_path: str, output_dir: str):
                 traceback.print_exc()
                 continue
 
-            # Write container impact (if available)
             if not sort_container_impact.empty:
                 try:
                     container_impact_path = output_dir / f"container_impact_{scenario_id}.xlsx"
@@ -785,8 +750,57 @@ def main(input_path: str, output_dir: str):
                 except Exception as e:
                     print(f"  ⚠️  Could not save container impact: {e}")
 
-            # Store results
+            print("\n7. Running fluid load analysis for this scenario...")
+
+            try:
+                required_for_fluid = ['pkgs_day', 'chosen_sort_level', 'path_nodes']
+                missing_cols = [col for col in required_for_fluid if col not in od_selected.columns]
+
+                if missing_cols:
+                    print(f"  ⚠️  Skipping fluid analysis - missing columns: {missing_cols}")
+                else:
+                    fluid_opportunities = analyze_fluid_load_opportunities(
+                        od_selected=od_selected,
+                        arc_summary=arc_summary,
+                        facilities=dfs["facilities"],
+                        package_mix=dfs["package_mix"],
+                        container_params=dfs["container_params"],
+                        mileage_bands=dfs["mileage_bands"],
+                        cost_params=cost_params
+                    )
+
+                    if not fluid_opportunities.empty:
+                        print(create_fluid_load_summary_report(fluid_opportunities))
+
+                        try:
+                            fluid_output = output_dir / f"fluid_opportunities_{scenario_id}.xlsx"
+                            with pd.ExcelWriter(fluid_output, engine='xlsxwriter') as writer:
+                                fluid_opportunities.to_excel(
+                                    writer,
+                                    sheet_name='opportunities',
+                                    index=False
+                                )
+
+                            print(f"\n  ✓ Saved fluid opportunities to: fluid_opportunities_{scenario_id}.xlsx")
+                            print(f"    ({len(fluid_opportunities)} arcs analyzed)")
+                            created_files.append(f"fluid_opportunities_{scenario_id}.xlsx")
+                        except Exception as e:
+                            print(f"  ⚠️  Could not save fluid opportunities: {e}")
+                    else:
+                        print("  ✓ All arcs optimally utilized - no fluid opportunities found")
+
+            except Exception as e:
+                print(f"  ⚠️  Fluid load analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+
             all_results.append(kpis.to_dict())
+
+            scenario_data_store[scenario_id] = {
+                'od_selected': od_selected.copy(),
+                'arc_summary': arc_summary.copy(),
+                'kpis': kpis.to_dict()
+            }
 
         except Exception as e:
             print(f"\n❌ Error processing {scenario_id}: {e}")
@@ -794,69 +808,11 @@ def main(input_path: str, output_dir: str):
             traceback.print_exc()
             continue
 
-    # ========================================================================
-    # FLUID LOAD OPPORTUNITY ANALYSIS
-    # ========================================================================
-
-    if len(all_results) > 0 and 'od_selected' in locals() and not od_selected.empty:
-        print(f"\n{'=' * 70}")
-        print("FLUID LOAD OPPORTUNITY ANALYSIS")
-        print("=" * 70)
-
-        try:
-            # UPDATED: Simplified validation for arc-based analysis
-            required_for_fluid = ['pkgs_day', 'chosen_sort_level', 'path_nodes']
-            missing_cols = [col for col in required_for_fluid if col not in od_selected.columns]
-
-            if missing_cols:
-                print(f"  ⚠️  Skipping fluid analysis - missing columns: {missing_cols}")
-            else:
-                # UPDATED: No hardcoded thresholds - returns ALL opportunities
-                fluid_opportunities = analyze_fluid_load_opportunities(
-                    od_selected=od_selected,
-                    arc_summary=arc_summary,
-                    facilities=dfs["facilities"],
-                    package_mix=dfs["package_mix"],
-                    container_params=dfs["container_params"],
-                    mileage_bands=dfs["mileage_bands"],
-                    cost_params=cost_params
-                )
-
-                if not fluid_opportunities.empty:
-                    print(create_fluid_load_summary_report(fluid_opportunities))
-
-                    try:
-                        fluid_output = output_dir / f"fluid_opportunities_{run_id}.xlsx"
-                        with pd.ExcelWriter(fluid_output, engine='xlsxwriter') as writer:
-                            fluid_opportunities.to_excel(
-                                writer,
-                                sheet_name='opportunities',
-                                index=False
-                            )
-
-                        print(f"\n✓ Saved fluid opportunities to: {fluid_output.name}")
-                        print(f"  ({len(fluid_opportunities)} arcs analyzed)")
-                        created_files.append(fluid_output.name)
-                    except Exception as e:
-                        print(f"  ⚠️  Could not save fluid opportunities: {e}")
-                else:
-                    print("  ✓ All arcs optimally utilized - no fluid opportunities found")
-
-        except Exception as e:
-            print(f"  ⚠️  Fluid load analysis failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # ========================================================================
-    # COMPARISON REPORTS
-    # ========================================================================
-
     if len(all_results) > 1:
         print(f"\n{'=' * 70}")
         print("GENERATING COMPARISON REPORTS")
         print("=" * 70)
 
-        # Comparison workbook
         try:
             compare_path = output_dir / f"comparison_{run_id}.xlsx"
             compare_success = write_comparison_workbook(
@@ -871,7 +827,6 @@ def main(input_path: str, output_dir: str):
         except Exception as e:
             print(f"  ⚠️  Could not create comparison workbook: {e}")
 
-        # Executive summary
         try:
             exec_path = output_dir / f"executive_summary_{run_id}.xlsx"
             exec_success = write_executive_summary(
@@ -886,10 +841,6 @@ def main(input_path: str, output_dir: str):
         except Exception as e:
             print(f"  ⚠️  Could not create executive summary: {e}")
 
-    # ========================================================================
-    # FINAL SUMMARY
-    # ========================================================================
-
     elapsed = datetime.now() - start_time
 
     print(f"\n{'=' * 70}")
@@ -901,8 +852,9 @@ def main(input_path: str, output_dir: str):
     print(f"✅ Container flow correction: APPLIED")
     print(f"✅ Zone tracking: 0 (DI) + 1-8 + Unknown")
     print(f"✅ Zone miles validation: ADDED")
-    print(f"✅ Fluid analysis: Arc-based (simplified)")
-    print(f"✅ All thresholds removed: User filters in Excel")
+    print(f"✅ Fluid analysis: Per-scenario (arc-based)")
+    print(f"✅ Scenario capacity override: SUPPORTED")
+    print(f"✅ Smart run_id generation: ENABLED")
 
     if created_files:
         print(f"\nOutput files in {output_dir}:")
@@ -928,8 +880,19 @@ Zone Classification:
   - Zone 1-8: Distance-based from mileage_bands (includes O=D)
   - Unknown: Classification failed (data quality flag)
 
+Scenario Capacity Override:
+  - Add optional max_sort_points_capacity column to scenarios sheet
+  - Overrides facilities.max_sort_points_capacity for that scenario
+  - Leave blank to use facility defaults
+
+Smart run_id Generation:
+  - Leave run_id blank in run_settings for auto-generation
+  - Auto format: {year}_{timestamp}_cap{min}-{max}
+  - Or provide custom run_id to override
+
 Fluid Load Analysis:
   - Arc-based: Analyzes actual planned arcs only
+  - Per-scenario: Each scenario gets its own analysis
   - No consolidation assumptions: Direct container vs fluid comparison
   - Returns ALL opportunities: Filter/sort in Excel as needed
 

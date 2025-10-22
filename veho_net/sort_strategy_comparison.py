@@ -1,15 +1,9 @@
 """
-Sort Strategy Comparison Module - v4.9
+Sort Strategy Comparison Module - v4.10
 
 Runs two optimization scenarios:
 1. Baseline: All destinations sorted to market level (CONSTRAINED)
 2. Optimized: Model freely chooses optimal sort level per OD (UNRESTRICTED)
-
-IMPROVED MESSAGING v4.9:
-- Clearly shows baseline is constrained, optimized is free
-- Emphasizes that both are genuine optimizations (not fed targets)
-- Better explanation of where savings come from
-- Warns if results are unexpected (optimized worse than baseline)
 """
 
 import pandas as pd
@@ -30,37 +24,11 @@ def run_sort_strategy_comparison(
         cost_params,
         timing_params: Dict,
         global_strategy,
-        scenario_id: str = "comparison"
+        scenario_id: str = "comparison",
+        scenario_row: pd.Series = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[Tuple]]:
     """
     Run baseline (market sort) vs. optimized (free choice) comparison.
-
-    CRITICAL FIX: Now returns optimized results as 4th tuple element
-    for reuse in main optimization flow.
-
-    Both runs use the SAME MILP solver to find minimum cost networks.
-    The difference is the constraints:
-    - Baseline: Forced to use market sort for all OD pairs
-    - Optimized: Free to choose region/market/sort_group per OD pair
-
-    Args:
-        candidates: Candidate paths
-        facilities: Facility master
-        mileage_bands: Mileage bands
-        package_mix: Package mix
-        container_params: Container params
-        cost_params: Cost parameters
-        timing_params: Timing parameters
-        global_strategy: Load strategy
-        scenario_id: Identifier for comparison
-
-    Returns:
-        Tuple of:
-            - comparison_summary: High-level comparison metrics
-            - detailed_comparison: OD-level differences
-            - facility_comparison: Facility-level sort point comparison
-            - optimized_results: (od_selected, arc_summary, kpis, sort_summary)
-                                 from optimized run for reuse
     """
     print(f"\n{'=' * 70}")
     print("SORT STRATEGY COMPARISON")
@@ -69,7 +37,6 @@ def run_sort_strategy_comparison(
     print("\nBoth runs find minimum-cost solutions using MILP solver.")
     print("Difference: baseline CONSTRAINS sort levels, optimized is FREE.")
 
-    # ========== RUN 1: BASELINE (Market Sort) ==========
     print(f"\n{'─' * 70}")
     print("[1/2] BASELINE: Market Sort (CONSTRAINED)")
     print("─" * 70)
@@ -85,7 +52,8 @@ def run_sort_strategy_comparison(
         cost_params=cost_params,
         timing_params=timing_params,
         global_strategy=global_strategy,
-        enable_sort_optimization=False  # Forces market sort
+        enable_sort_optimization=False,
+        scenario_row=scenario_row
     )
 
     baseline_od, baseline_arc, baseline_kpis, _ = baseline_results
@@ -103,7 +71,6 @@ def run_sort_strategy_comparison(
     print(f"    Cost/pkg: ${baseline_cpp:.3f}")
     print(f"    Sort strategy: Market sort for all {len(baseline_od)} OD pairs")
 
-    # ========== RUN 2: OPTIMIZED (Free Choice) ==========
     print(f"\n{'─' * 70}")
     print("[2/2] OPTIMIZED: Free Sort Choice (UNRESTRICTED)")
     print("─" * 70)
@@ -119,7 +86,8 @@ def run_sort_strategy_comparison(
         cost_params=cost_params,
         timing_params=timing_params,
         global_strategy=global_strategy,
-        enable_sort_optimization=True  # Allows optimization
+        enable_sort_optimization=True,
+        scenario_row=scenario_row
     )
 
     optimized_od, optimized_arc, optimized_kpis, optimized_sort = optimized_results
@@ -136,7 +104,6 @@ def run_sort_strategy_comparison(
     print(f"    Total cost: ${optimized_cost:,.0f}")
     print(f"    Cost/pkg: ${optimized_cpp:.3f}")
 
-    # ========== COMPARISON ANALYSIS ==========
     print(f"\n{'═' * 70}")
     print("COMPARISON RESULTS")
     print("═" * 70)
@@ -152,18 +119,16 @@ def run_sort_strategy_comparison(
     print(f"  Savings from optimization:   ${cost_savings:>12,.0f}  (${cpp_delta:+.4f}/pkg)")
     print(f"  Improvement:                 {cost_savings_pct:>11.2f}%")
 
-    # Sanity checks and warnings
     if cost_savings < 0:
         print(f"\n  ⚠️  WARNING: Optimized is MORE expensive than baseline!")
         print(f"     This suggests a potential model issue - optimized should")
         print(f"     always be <= baseline cost (since baseline is a valid solution).")
-    elif abs(cost_savings) < baseline_cost * 0.001:  # Less than 0.1% savings
+    elif abs(cost_savings) < baseline_cost * 0.001:
         print(f"\n  ℹ️  Baseline is already near-optimal (< 0.1% improvement possible)")
         print(f"     Market sort is effectively optimal for this network.")
     else:
         print(f"\n  ✓ Optimization identified cost reduction opportunities")
 
-    # High-level comparison summary
     comparison_summary = pd.DataFrame([
         {
             'metric': 'Total Daily Cost',
@@ -188,7 +153,6 @@ def run_sort_strategy_comparison(
         }
     ])
 
-    # OD-level detailed comparison (where sort level changed)
     print(f"\n{'─' * 70}")
     print("Analyzing OD-level sort decisions...")
     detailed_comparison = _build_od_comparison(
@@ -200,12 +164,10 @@ def run_sort_strategy_comparison(
     else:
         print(f"  All OD pairs use same sort level in both scenarios")
 
-    # Facility-level sort point comparison
     facility_comparison = _build_facility_sort_comparison(
         baseline_od, optimized_od, facilities, timing_params
     )
 
-    # Sort level distribution comparison
     sort_dist_baseline = _calculate_sort_distribution(baseline_od)
     sort_dist_optimized = _calculate_sort_distribution(optimized_od)
 
@@ -230,12 +192,11 @@ def run_sort_strategy_comparison(
     else:
         print("  Market sort is already optimal for this network.")
 
-    # CRITICAL FIX: Return optimized results for reuse
     return (
         comparison_summary,
         detailed_comparison,
         facility_comparison,
-        optimized_results  # This avoids duplicate optimization!
+        optimized_results
     )
 
 
@@ -250,7 +211,6 @@ def _build_od_comparison(
     """
     comparison_rows = []
 
-    # Merge baseline and optimized on OD pair
     merged = baseline_od.merge(
         optimized_od,
         on=['origin', 'dest'],
@@ -259,12 +219,11 @@ def _build_od_comparison(
     )
 
     for _, row in merged.iterrows():
-        # Skip if same in both
         base_sort = row.get('chosen_sort_level_base', 'market')
         opt_sort = row.get('chosen_sort_level_opt', 'market')
 
         if base_sort == opt_sort:
-            continue  # No change
+            continue
 
         base_cost = row.get('total_cost_base', 0)
         opt_cost = row.get('total_cost_opt', 0)
@@ -307,7 +266,6 @@ def _build_facility_sort_comparison(
     fac_lookup = get_facility_lookup(facilities)
     sort_points_per_dest = float(timing_params['sort_points_per_destination'])
 
-    # Get hub/hybrid facilities
     hub_facilities = facilities[
         facilities['type'].str.lower().isin(['hub', 'hybrid'])
     ]['facility_name'].unique()
@@ -315,12 +273,10 @@ def _build_facility_sort_comparison(
     facility_rows = []
 
     for facility in hub_facilities:
-        # Baseline sort points
         baseline_points = _calculate_facility_sort_points(
             facility, baseline_od, fac_lookup, sort_points_per_dest
         )
 
-        # Optimized sort points
         optimized_points = _calculate_facility_sort_points(
             facility, optimized_od, fac_lookup, sort_points_per_dest
         )
@@ -367,7 +323,6 @@ def _calculate_facility_sort_points(
 
     total_points = 0.0
 
-    # Track unique regions and markets
     regions_served = set()
     markets_served = set()
 
@@ -376,7 +331,6 @@ def _calculate_facility_sort_points(
         sort_level = od_row.get('chosen_sort_level', 'market')
 
         if sort_level == 'region':
-            # Get destination's regional hub
             if dest in fac_lookup.index:
                 hub = fac_lookup.at[dest, 'regional_sort_hub']
                 if pd.isna(hub) or hub == '':
@@ -387,7 +341,6 @@ def _calculate_facility_sort_points(
             markets_served.add(dest)
 
         elif sort_level == 'sort_group':
-            # Sort groups per destination
             if dest in fac_lookup.index:
                 groups = fac_lookup.at[dest, 'last_mile_sort_groups_count']
                 if pd.isna(groups) or groups <= 0:
@@ -396,7 +349,6 @@ def _calculate_facility_sort_points(
             else:
                 total_points += sort_points_per_dest * 4
 
-    # Add points for regions and markets
     total_points += len(regions_served) * sort_points_per_dest
     total_points += len(markets_served) * sort_points_per_dest
 
@@ -408,7 +360,7 @@ def _calculate_sort_distribution(od_df: pd.DataFrame) -> Dict[str, float]:
     if od_df.empty or 'chosen_sort_level' not in od_df.columns:
         return {
             'region_pct': 0.0,
-            'market_pct': 100.0,  # Baseline assumption
+            'market_pct': 100.0,
             'sort_group_pct': 0.0
         }
 
@@ -429,7 +381,6 @@ def _infer_change_reason(
 ) -> str:
     """Infer business reason for sort level change."""
     if cost_delta < 0:
-        # Optimized is cheaper
         if base_level == 'market' and opt_level == 'region':
             return "Region sort improves linehaul consolidation"
         elif base_level == 'market' and opt_level == 'sort_group':
@@ -439,7 +390,6 @@ def _infer_change_reason(
         else:
             return "Cost optimization"
     else:
-        # Optimized is more expensive (shouldn't happen often)
         return "Capacity constraint relief"
 
 
@@ -457,7 +407,6 @@ def create_comparison_summary_report(
     lines.append("=" * 100)
     lines.append("")
 
-    # High-level metrics
     for _, row in comparison_summary.iterrows():
         lines.append(f"{row['metric']:<30} Baseline: {row['baseline_market']:<15} "
                      f"Optimized: {row['optimized']:<15} Delta: {row['delta']:<15}")
@@ -466,7 +415,6 @@ def create_comparison_summary_report(
     lines.append("=" * 100)
     lines.append("")
 
-    # Facility-level sort point savings
     if not facility_comparison.empty:
         lines.append("FACILITY SORT POINT COMPARISON:")
         lines.append("")
