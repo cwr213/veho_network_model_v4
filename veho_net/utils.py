@@ -489,3 +489,52 @@ def add_missing_columns(
         if col not in df.columns:
             df[col] = default_value
     return df
+
+
+# ============================================================================
+# PATH NODE EXTRACTION
+# ============================================================================
+
+def extract_path_nodes(row: pd.Series) -> List[str]:
+    """
+    Extract path nodes from DataFrame row with robust format handling.
+
+    Handles multiple input formats:
+    - path_nodes as tuple: Convert to list
+    - path_nodes as list: Use directly
+    - path_nodes missing/invalid: Parse from path_str
+    - Fallback: [origin, dest]
+
+    Args:
+        row: DataFrame row with path information
+
+    Returns:
+        List of facility names in path order
+
+    Example:
+        >>> row = pd.Series({'origin': 'A', 'dest': 'B', 'path_nodes': ('A', 'X', 'B')})
+        >>> extract_path_nodes(row)
+        ['A', 'X', 'B']
+    """
+    # Try path_nodes column first
+    nodes = row.get("path_nodes", None)
+
+    # Handle tuple
+    if isinstance(nodes, tuple):
+        nodes = list(nodes)
+        if len(nodes) >= 2:
+            return nodes
+
+    # Handle list
+    if isinstance(nodes, list) and len(nodes) >= 2:
+        return nodes
+
+    # Fallback: Parse from path_str
+    path_str = row.get("path_str", "")
+    if isinstance(path_str, str) and "->" in path_str:
+        parsed = [n.strip() for n in path_str.split("->")]
+        if len(parsed) >= 2:
+            return parsed
+
+    # Last resort: direct path
+    return [row.get("origin", ""), row.get("dest", "")]

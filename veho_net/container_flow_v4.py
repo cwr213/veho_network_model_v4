@@ -15,45 +15,8 @@ from .containers_v4 import (
     get_containers_per_truck
 )
 from .geo_v4 import haversine_miles, band_lookup
-from .utils import safe_divide, get_facility_lookup
+from .utils import safe_divide, get_facility_lookup, extract_path_nodes
 from .config_v4 import OptimizationConstants
-
-
-def _extract_path_nodes_robust(row: pd.Series) -> List[str]:
-    """
-    ROBUST path_nodes extraction with multiple fallback strategies.
-
-    Critical fix for arc aggregation bug where path_nodes was being
-    set to [origin, dest] instead of full path including intermediates.
-
-    Tries in order:
-    1. path_nodes column (if list/tuple)
-    2. Parse from path_str (if contains "->")
-    3. Fallback to [origin, dest]
-    """
-    # Try path_nodes column first
-    nodes = row.get("path_nodes", None)
-
-    # Handle tuple
-    if isinstance(nodes, tuple):
-        nodes = list(nodes)
-        if len(nodes) >= 2:
-            return nodes
-
-    # Handle list
-    if isinstance(nodes, list) and len(nodes) >= 2:
-        return nodes
-
-    # Fallback: Parse from path_str
-    path_str = row.get("path_str", "")
-    if isinstance(path_str, str) and "->" in path_str:
-        parsed = [n.strip() for n in path_str.split("->")]
-        if len(parsed) >= 2:
-            return parsed
-
-    # Last resort: direct path
-    return [row.get("origin", ""), row.get("dest", "")]
-
 
 def calculate_origin_containers_by_sort_level(
         origin: str,
@@ -259,8 +222,6 @@ def recalculate_arc_summary_with_container_flow(
     """
     Rebuild arc summary with CORRECT container flow tracking.
 
-    CRITICAL FIX: Uses robust path_nodes extraction to ensure all OD flows
-    are properly aggregated to their arcs.
     """
     od_with_containers = build_od_container_map(
         od_selected, package_mix, container_params, facilities
@@ -270,7 +231,7 @@ def recalculate_arc_summary_with_container_flow(
     print("    Validating path_nodes for arc aggregation...")
     nodes_fixed = 0
     for idx, row in od_with_containers.iterrows():
-        nodes = _extract_path_nodes_robust(row)
+        nodes = extract_path_nodes(row)
         if len(nodes) != len(row.get('path_nodes', [])):
             od_with_containers.at[idx, 'path_nodes'] = nodes
             nodes_fixed += 1
@@ -284,8 +245,7 @@ def recalculate_arc_summary_with_container_flow(
     arc_flows = {}
 
     for _, od_row in od_with_containers.iterrows():
-        # Use robust extraction
-        path_nodes = _extract_path_nodes_robust(od_row)
+        path_nodes = extract_path_nodes(od_row)
 
         # Aggregate flows to arcs
         for i in range(len(path_nodes) - 1):

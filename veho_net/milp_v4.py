@@ -31,7 +31,7 @@ from .config_v4 import (
     LoadStrategy,
     OptimizationConstants,
 )
-from .utils import safe_divide, get_facility_lookup
+from .utils import safe_divide, get_facility_lookup, extract_path_nodes
 
 MAX_SAFE_INT = 2 ** 31 - 1
 
@@ -45,30 +45,6 @@ def safe_int_cost(value: float, context: str = "") -> int:
             f"Consider reducing cost values or scaling package volumes."
         )
     return int_val
-
-
-def _extract_path_nodes_robust(row: pd.Series) -> List[str]:
-    """
-    ROBUST path_nodes extraction with multiple fallback strategies.
-    """
-    nodes = row.get("path_nodes", None)
-
-    if isinstance(nodes, tuple):
-        nodes = list(nodes)
-        if len(nodes) >= 2:
-            return nodes
-
-    if isinstance(nodes, list) and len(nodes) >= 2:
-        return nodes
-
-    path_str = row.get("path_str", "")
-    if isinstance(path_str, str) and "->" in path_str:
-        parsed = [n.strip() for n in path_str.split("->")]
-        if len(parsed) >= 2:
-            return parsed
-
-    return [row.get("origin", ""), row.get("dest", "")]
-
 
 def solve_network_optimization(
         candidates: pd.DataFrame,
@@ -345,7 +321,7 @@ def _build_arc_structures(cand, facilities, mileage_bands, path_keys):
     for i in path_keys:
         r = cand.loc[i]
 
-        nodes = _extract_path_nodes_robust(r)
+        nodes = extract_path_nodes(r)
 
         legs = []
         for u, v in zip(nodes[:-1], nodes[1:]):
