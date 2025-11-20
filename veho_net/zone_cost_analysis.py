@@ -88,7 +88,7 @@ def calculate_zone_cost_analysis(
                     'zone': 'Zone 0',
                     'zone_number': 0,
                     'total_packages': int(direct_pkgs),
-                    'pct_of_total_packages': round(safe_divide(direct_pkgs, total_network_pkgs) * 100, 2),
+                    'pct_of_total_packages': round(safe_divide(direct_pkgs, total_network_pkgs), 4),
                     'total_cost': 0.0,  # No middle-mile cost for direct injection
                     'pct_of_total_cost': 0.0,
                     'cost_per_pkg': 0.0,
@@ -114,11 +114,11 @@ def calculate_zone_cost_analysis(
 
             # Volume metrics
             total_pkgs = zone_ods['pkgs_day'].sum()
-            pct_pkgs = safe_divide(total_pkgs, total_network_pkgs) * 100
+            pct_pkgs = safe_divide(total_pkgs, total_network_pkgs)
 
             # Cost metrics
             total_cost = zone_ods['total_cost'].sum()
-            pct_cost = safe_divide(total_cost, total_network_cost) * 100
+            pct_cost = safe_divide(total_cost, total_network_cost)
             cost_per_pkg = safe_divide(total_cost, total_pkgs)
 
             # Cost breakdown
@@ -191,9 +191,9 @@ def calculate_zone_cost_analysis(
                 'zone': f'Zone {zone_num}',
                 'zone_number': zone_num,
                 'total_packages': int(total_pkgs),
-                'pct_of_total_packages': round(pct_pkgs, 2),
+                'pct_of_total_packages': round(pct_pkgs, 4),
                 'total_cost': round(total_cost, 2),
-                'pct_of_total_cost': round(pct_cost, 2),
+                'pct_of_total_cost': round(pct_cost, 4),
                 'cost_per_pkg': round(cost_per_pkg, 3),
                 'linehaul_cost_per_pkg': round(linehaul_per_pkg, 3),
                 'processing_cost_per_pkg': round(processing_per_pkg, 3),
@@ -211,10 +211,10 @@ def calculate_zone_cost_analysis(
 
         if not unknown_ods.empty:
             total_pkgs = unknown_ods['pkgs_day'].sum()
-            pct_pkgs = safe_divide(total_pkgs, total_network_pkgs) * 100
+            pct_pkgs = safe_divide(total_pkgs, total_network_pkgs)
 
             total_cost = unknown_ods['total_cost'].sum()
-            pct_cost = safe_divide(total_cost, total_network_cost) * 100
+            pct_cost = safe_divide(total_cost, total_network_cost)
             cost_per_pkg = safe_divide(total_cost, total_pkgs)
 
             linehaul_cost = unknown_ods['linehaul_cost'].sum()
@@ -271,9 +271,9 @@ def calculate_zone_cost_analysis(
                 'zone': 'Unknown',
                 'zone_number': 999,  # Sort last
                 'total_packages': int(total_pkgs),
-                'pct_of_total_packages': round(pct_pkgs, 2),
+                'pct_of_total_packages': round(pct_pkgs, 4),
                 'total_cost': round(total_cost, 2),
-                'pct_of_total_cost': round(pct_cost, 2),
+                'pct_of_total_cost': round(pct_cost, 4),
                 'cost_per_pkg': round(cost_per_pkg, 3),
                 'linehaul_cost_per_pkg': round(linehaul_per_pkg, 3),
                 'processing_cost_per_pkg': round(processing_per_pkg, 3),
@@ -285,7 +285,7 @@ def calculate_zone_cost_analysis(
                 'cost_per_mile': round(cost_per_mile, 4),
             })
 
-            print(f"  ⚠️  WARNING: {pct_pkgs:.1f}% of packages in 'Unknown' zone")
+            print(f"  WARNING: {pct_pkgs * 100:.1f}% of packages in 'Unknown' zone")
             print(f"     Check mileage_bands coverage and facility coordinates")
 
     df = pd.DataFrame(zone_analysis)

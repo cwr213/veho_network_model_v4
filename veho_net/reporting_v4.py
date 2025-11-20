@@ -30,41 +30,6 @@ from .config_v4 import OptimizationConstants
 
 
 # ============================================================================
-# HELPER: NORMALIZE ZONE VALUE
-# ============================================================================
-
-def _normalize_zone_value(zone_val) -> str:
-    """
-    Normalize zone value to string format for comparison.
-
-    Handles: int, float, str, NaN
-    Returns: "0", "1", "2", etc. or "unknown"
-    """
-    if pd.isna(zone_val):
-        return "unknown"
-
-    # Convert to string and strip
-    zone_str = str(zone_val).strip()
-
-    # Remove "Zone " prefix if present
-    if zone_str.lower().startswith("zone "):
-        zone_str = zone_str[5:].strip()
-
-    # Try to convert to int then back to string (handles "1.0" -> "1")
-    try:
-        zone_int = int(float(zone_str))
-        return str(zone_int)
-    except (ValueError, TypeError):
-        pass
-
-    # Return as-is if already a clean string
-    if zone_str.lower() in ['unknown', '']:
-        return "unknown"
-
-    return zone_str
-
-
-# ============================================================================
 # FACILITY VOLUME (OPERATIONAL METRICS)
 # ============================================================================
 
@@ -305,27 +270,30 @@ def _determine_intermediate_operation_type(
     """
     Determine if intermediate facility performs sort or crossdock.
 
-    FIXED v4.11: Correct logic for region sort
-
-    Rules (NO HARDCODING):
+    Rules:
     - Fluid strategy: Always sort (must split freight)
     - Region sort: Always sort (freight sent unsorted to regional hub)
     - Market sort: Crossdock (already sorted to destination)
     - Sort_group: Crossdock (pre-sorted to route groups)
+
+    Returns:
+        'sort' or 'crossdock'
+
+    Raises:
+        ValueError: If sort_level is not one of the expected values
     """
     if path_strategy.lower() == 'fluid':
         return 'sort'
 
-    # CRITICAL FIX: Region sort ALWAYS needs full sort
     if chosen_sort_level == 'region':
         return 'sort'
-
-    # Market and sort_group are already sorted at origin
     elif chosen_sort_level in ['market', 'sort_group']:
         return 'crossdock'
-
-    # Default: crossdock for container strategy
-    return 'crossdock'
+    else:
+        raise ValueError(
+            f"Unexpected sort_level '{chosen_sort_level}' for intermediate operation. "
+            f"Expected one of: 'region', 'market', 'sort_group'"
+        )
 
 
 def _calculate_containers_for_volume(
@@ -1008,63 +976,53 @@ def validate_network_aggregations(
         arc_summary: pd.DataFrame,
         facility_volume: pd.DataFrame
 ) -> Dict:
-    """Validate aggregate calculations and flag data quality issues."""
+    """
+    Validate network data quality and flag issues.
+
+    Checks:
+    - Unknown zone percentage (data quality flag)
+    - Arc fill rates for utilization tracking
+
+    Returns:
+        Dictionary with validation metrics
+    """
     validation_results = {}
 
     try:
-        total_od_pkgs = od_selected['pkgs_day'].sum() if not od_selected.empty else 0
-        total_facility_mm_injection = facility_volume[
-            'injection_pkgs_day'].sum() if not facility_volume.empty else 0
+        # Check for unknown zones (data quality flag)
+        if not od_selected.empty and 'zone' in od_selected.columns:
+            unknown_zone_pkgs = od_selected[od_selected['zone'] == -1]['pkgs_day'].sum()
+            total_pkgs = od_selected['pkgs_day'].sum()
+            unknown_zone_pct = safe_divide(unknown_zone_pkgs, total_pkgs)
 
-        validation_results['total_od_packages'] = total_od_pkgs
-        validation_results['total_facility_mm_injection'] = total_facility_mm_injection
-        validation_results['package_consistency'] = abs(total_od_pkgs - total_facility_mm_injection) < 0.01
+            validation_results['unknown_zone_packages'] = int(unknown_zone_pkgs)
+            validation_results['unknown_zone_pct'] = round(unknown_zone_pct, 4)
 
-        # Check intermediate consistency
-        if not facility_volume.empty:
-            for _, row in facility_volume.iterrows():
-                sort_pkgs = row.get('intermediate_sort_pkgs_day', 0)
-                crossdock_pkgs = row.get('intermediate_crossdock_pkgs_day', 0)
-                total_intermediate = row.get('intermediate_pkgs_day', 0)
+            if unknown_zone_pct > 0.01:  # 1% threshold
+                print(f"  WARNING: Data Quality - {unknown_zone_pct * 100:.1f}% of packages in unknown zone")
+                print(f"           Check mileage_bands coverage and facility coordinates")
 
-                if abs((sort_pkgs + crossdock_pkgs) - total_intermediate) > 0.01:
-                    facility_name = row.get('facility', 'unknown')
-                    print(f"  ⚠️  Intermediate package mismatch at {facility_name}")
-                    validation_results['intermediate_consistency'] = False
-                    break
-            else:
-                validation_results['intermediate_consistency'] = True
-
-        # Check arc fill rates
+        # Calculate network average truck fill rate
         if not arc_summary.empty and 'truck_fill_rate' in arc_summary.columns:
-            non_od_arcs = arc_summary[arc_summary['from_facility'] != arc_summary['to_facility']]
+            non_od_arcs = arc_summary[
+                arc_summary['from_facility'] != arc_summary['to_facility']
+                ]
 
-            if not non_od_arcs.empty:
-                total_pkg_cube = non_od_arcs['pkg_cube_cuft'].sum() if 'pkg_cube_cuft' in non_od_arcs.columns else 0
-                total_truck_cube = (non_od_arcs['trucks'] * non_od_arcs.get('cube_per_truck', 0)).sum()
-
-                validation_results['network_avg_truck_fill'] = safe_divide(total_pkg_cube, total_truck_cube)
+            if not non_od_arcs.empty and 'pkg_cube_cuft' in non_od_arcs.columns:
+                total_pkg_cube = non_od_arcs['pkg_cube_cuft'].sum()
+                total_truck_cube = (
+                        non_od_arcs['trucks'] * non_od_arcs.get('cube_per_truck', 0)
+                ).sum()
+                validation_results['network_avg_truck_fill'] = safe_divide(
+                    total_pkg_cube, total_truck_cube
+                )
             else:
                 validation_results['network_avg_truck_fill'] = 0
         else:
             validation_results['network_avg_truck_fill'] = 0
 
-        # Check for unknown zones (data quality flag)
-        if not od_selected.empty and 'zone' in od_selected.columns:
-            normalized_zones = od_selected['zone'].apply(_normalize_zone_value)
-            unknown_zone_pkgs = od_selected[normalized_zones == 'unknown']['pkgs_day'].sum()
-
-            total_pkgs = od_selected['pkgs_day'].sum()
-            unknown_zone_pct = safe_divide(unknown_zone_pkgs, total_pkgs) * 100
-
-            validation_results['unknown_zone_packages'] = int(unknown_zone_pkgs)
-            validation_results['unknown_zone_pct'] = round(unknown_zone_pct, 2)
-
-            if unknown_zone_pct > 1.0:
-                print(f"  ⚠️  WARNING: {unknown_zone_pct:.1f}% of packages have unknown zone classification")
-                print(f"     Check mileage_bands coverage and facility coordinates")
-
     except Exception as e:
         validation_results['validation_error'] = str(e)
+        print(f"  WARNING: Validation error - {e}")
 
     return validation_results

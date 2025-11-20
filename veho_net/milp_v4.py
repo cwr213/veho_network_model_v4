@@ -733,15 +733,23 @@ def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
             sort_vars = sort_decision.get(group_name, {})
 
             if sort_vars.get('sort_group') is not None:
-                if dest in fac_lookup.index:
-                    groups_count = fac_lookup.at[dest, 'last_mile_sort_groups_count']
-                    if pd.isna(groups_count) or groups_count <= 0:
-                        groups_count = OptimizationConstants.DEFAULT_SORT_GROUPS
-                    groups_count = int(groups_count)
-
-                    point_terms.append(
-                        sort_vars['sort_group'] * int(sort_points_per_dest * groups_count)
+                if dest not in fac_lookup.index:
+                    raise ValueError(
+                        f"Destination facility '{dest}' not found in facilities master data"
                     )
+
+                groups_count = fac_lookup.at[dest, 'last_mile_sort_groups_count']
+                if pd.isna(groups_count) or groups_count <= 0:
+                    raise ValueError(
+                        f"Destination facility '{dest}' missing valid last_mile_sort_groups_count. "
+                        f"Required for sort group capacity calculation. "
+                        f"This should have been caught by input validation."
+                    )
+                groups_count = int(groups_count)
+
+                point_terms.append(
+                    sort_vars['sort_group'] * int(sort_points_per_dest * groups_count)
+                )
 
         if point_terms:
             model.Add(facility_sort_points == sum(point_terms))

@@ -177,9 +177,9 @@ def run_sort_strategy_comparison(
     print(f"  {'Level':<15} {'Baseline':<15} {'Optimized':<15} {'Change':<15}")
     print(f"  {'-' * 60}")
     for level in ['region', 'market', 'sort_group']:
-        base_pct = sort_dist_baseline.get(f'{level}_pct', 0)
-        opt_pct = sort_dist_optimized.get(f'{level}_pct', 0)
-        delta = opt_pct - base_pct
+        base_pct = sort_dist_baseline.get(f'{level}_pct', 0) * 100
+        opt_pct = sort_dist_optimized.get(f'{level}_pct', 0) * 100
+        delta = (opt_pct - base_pct)
         print(f"  {level.title():<15} {base_pct:>12.1f}%  {opt_pct:>12.1f}%  {delta:>+12.1f}%")
 
     print(f"\n{'═' * 70}")
@@ -285,18 +285,18 @@ def _build_facility_sort_comparison(
 
         max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity'] if facility in fac_lookup.index else 0
 
-        baseline_util = safe_divide(baseline_points, max_capacity) * 100
-        optimized_util = safe_divide(optimized_points, max_capacity) * 100
+        baseline_util = safe_divide(baseline_points, max_capacity)
+        optimized_util = safe_divide(optimized_points, max_capacity)
 
         facility_rows.append({
             'facility': facility,
             'max_capacity': max_capacity,
             'baseline_points_used': round(baseline_points, 1),
-            'baseline_utilization_pct': round(baseline_util, 1),
+            'baseline_utilization_pct': round(baseline_util, 4),
             'optimized_points_used': round(optimized_points, 1),
-            'optimized_utilization_pct': round(optimized_util, 1),
+            'optimized_utilization_pct': round(optimized_util, 4),
             'points_freed': round(points_saved, 1),
-            'capacity_freed_pct': round(safe_divide(points_saved, max_capacity) * 100, 1)
+            'capacity_freed_pct': round(safe_divide(points_saved, max_capacity), 4)
         })
 
     df = pd.DataFrame(facility_rows)
@@ -341,26 +341,30 @@ def _calculate_facility_sort_points(
             markets_served.add(dest)
 
         elif sort_level == 'sort_group':
-            if dest in fac_lookup.index:
-                groups = fac_lookup.at[dest, 'last_mile_sort_groups_count']
-                if pd.isna(groups) or groups <= 0:
-                    groups = 4
-                total_points += sort_points_per_dest * groups
-            else:
-                total_points += sort_points_per_dest * 4
+            if dest not in fac_lookup.index:
+                raise ValueError(
+                    f"Destination facility '{dest}' not found in facilities master data"
+                )
+
+            groups = fac_lookup.at[dest, 'last_mile_sort_groups_count']
+            if pd.isna(groups) or groups <= 0:
+                raise ValueError(
+                    f"Destination facility '{dest}' missing valid last_mile_sort_groups_count. "
+                    f"Required for sort point calculation."
+                )
+            total_points += sort_points_per_dest * groups
 
     total_points += len(regions_served) * sort_points_per_dest
     total_points += len(markets_served) * sort_points_per_dest
 
     return total_points
 
-
 def _calculate_sort_distribution(od_df: pd.DataFrame) -> Dict[str, float]:
-    """Calculate sort level distribution percentages."""
+
     if od_df.empty or 'chosen_sort_level' not in od_df.columns:
         return {
             'region_pct': 0.0,
-            'market_pct': 100.0,
+            'market_pct': 1.0,
             'sort_group_pct': 0.0
         }
 
@@ -369,7 +373,7 @@ def _calculate_sort_distribution(od_df: pd.DataFrame) -> Dict[str, float]:
     dist = {}
     for level in ['region', 'market', 'sort_group']:
         level_pkgs = od_df[od_df['chosen_sort_level'] == level]['pkgs_day'].sum()
-        dist[f'{level}_pct'] = safe_divide(level_pkgs, total_pkgs) * 100
+        dist[f'{level}_pct'] = safe_divide(level_pkgs, total_pkgs)
 
     return dist
 
