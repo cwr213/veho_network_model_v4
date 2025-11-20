@@ -1,10 +1,8 @@
 """
-Container Flow Tracking Module v4.5
+Container Flow Tracking Module
 
-Critical Fix: Robust path_nodes extraction for arc aggregation
-- Handles tuple/list/string formats
-- Falls back to path_str parsing if needed
-- Ensures arc flow sums all OD flows correctly
+Tracks physical container flows through the network and calculates arc-level metrics
+with correct fill rate accounting. Handles sort level impacts on container generation.
 """
 
 import pandas as pd

@@ -1,18 +1,8 @@
 """
-Fluid Load Opportunity Analysis Module - v4.13 SIMPLIFIED
+Fluid Load Opportunity Analysis Module
 
-Identifies planned arcs where switching from container to fluid loading
-would improve economics through better truck utilization.
-
-SIMPLIFIED APPROACH (70% right quickly):
-- Only analyze arcs that exist in optimized solution (arc_summary)
-- Direct comparison: container vs fluid for SAME arc
-- No complex consolidation logic or hypothetical scenarios
-- Clear ROI: transport savings vs incremental sort cost
-
-Key Insight: Arcs with low container fill rates may benefit from fluid's
-higher pack utilization ceiling, if transport savings exceed the cost of
-additional destination sorting.
+Identifies arcs where switching from container to fluid loading would reduce costs.
+Analyzes actual planned arcs only, comparing transport savings against incremental sort costs.
 """
 
 import pandas as pd

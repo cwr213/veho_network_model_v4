@@ -1,9 +1,8 @@
 """
-Sort Strategy Comparison Module - v4.10
+Sort Strategy Comparison Module
 
-Runs two optimization scenarios:
-1. Baseline: All destinations sorted to market level (CONSTRAINED)
-2. Optimized: Model freely chooses optimal sort level per OD (UNRESTRICTED)
+Compares constrained baseline (market sort only) against unrestricted optimization
+(free sort level choice per OD). Quantifies cost and capacity impacts of sort decisions.
 """
 
 import pandas as pd

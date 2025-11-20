@@ -1,22 +1,14 @@
 """
-Reporting Module - v4.11
+Reporting Module
 
-FIXED v4.11:
-- Corrected _determine_intermediate_operation_type() logic
-- Region sort ALWAYS needs full sort at intermediate
-- Market/sort_group use crossdock (already sorted)
-- No hardcoded values - all from input parameters
+Generates facility-level and network-level metrics from optimization results.
+Calculates operational volumes, network characteristics, and aggregated summaries.
 
-ZONE 0 FIX:
-- Zone 0 is ONLY for direct injection (tracked separately in direct_day)
-- Middle-mile O=D uses zone from mileage_bands for distance=0
-- Zone distribution includes both od_selected AND direct_day
-
-Updates:
-1. facility_network_profile now includes direct injection for zone 0
-2. zone_cost_analysis uses consistent zone normalization
-3. All percentages as decimals (not multiplied by 100)
-4. Added zone_miles to od_selected for validation
+Key Functions:
+- build_facility_volume: Daily operational metrics by facility
+- build_facility_network_profile: Zone/sort/distance/touch characteristics
+- calculate_network_*: Network-level aggregations
+- validate_network_aggregations: Data quality checks
 """
 
 import pandas as pd

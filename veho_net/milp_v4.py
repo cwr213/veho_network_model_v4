@@ -1,34 +1,14 @@
 """
-MILP Optimization Module - v4.11
+MILP Network Optimization Module
 
-Updates v4.11:
-- Added scenario_row parameter for capacity override passthrough
-- No other logic changes
+Solves minimum-cost network configuration using arc-pooled Mixed Integer Linear Programming.
+Supports container and fluid loading strategies with optional sort level optimization.
 
-CRITICAL FIX v4.10:
-- Fixed intermediate sort vs. crossdock logic for region sort
-- Region sort ALWAYS requires full intermediate sort at regional hub
-- Market/sort_group use crossdock/container handling (already sorted)
-- No hardcoded values - all parameters from input file
-
-CRITICAL FIX v4.8:
-- Fixed container handling cost allocation using containers_per_package
-- Previously was charging 1 full container per package (always returned max(1, ...))
-- Now correctly allocates fractional container cost (e.g., 0.02 for 50 pkgs/container)
-- This fixes the $10+ cost discrepancy for multi-touch flows
-
-IMPROVED MESSAGING v4.9:
-- Clearer solver status reporting
-- Shows optimization is finding minimum, not hitting target
-- Reconciles MILP integer objective with actual float costs
-- Better progress indicators
-
-Changes:
-1. O=D middle-mile cost calculation fixed (injection sort required)
-2. Sort capacity constraints tightened (proper point counting)
-3. Path nodes preservation maintained
-4. Container handling cost now uses calculate_containers_per_package() helper
-5. Enhanced user messaging to show genuine optimization
+Key Features:
+- Arc-pooled formulation for computational efficiency
+- Sort level optimization (region/market/sort_group)
+- Capacity constraints at origin facilities
+- Premium economy dwell logic for partial truck utilization
 """
 
 from ortools.sat.python import cp_model

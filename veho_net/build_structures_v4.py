@@ -1,20 +1,17 @@
 """
-Network Structure Generation Module - v4.6
+Network Structure Generation Module
 
-CRITICAL FIX: Ensures similar OD pairs take common paths through regional hubs.
-- PHL→LAX1, PHL→LAX2, PHL→LAX3 all route via same hub (e.g., ONT)
-- Prevents inconsistent routing (e.g., PHL→IND→LAX3)
-- Uses regional hub hierarchy to enforce network topology
+Creates OD matrix and generates candidate paths through the network.
+Enforces regional hub hierarchy to ensure consistent routing.
 
 Key Functions:
-    - build_od_and_direct: Create OD matrix from demand forecast
-    - candidate_paths: Generate feasible routing alternatives with consistency
+- build_od_and_direct: Create OD matrix from demand forecast
+- candidate_paths: Generate feasible routing alternatives
 
 Business Rules:
-    - O=D paths allowed only for hybrid facilities
-    - Launch facilities cannot be intermediate stops
-    - Regional hub hierarchy respected in path construction
-    - All destinations in same region route through same hub from any origin
+- O=D paths allowed only for hybrid facilities
+- Launch facilities cannot be intermediate stops
+- All destinations in same region route through same regional hub
 """
 
 import pandas as pd
