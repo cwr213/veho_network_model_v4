@@ -35,38 +35,17 @@ def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     """
     Calculate great-circle distance between two points using Haversine formula.
 
-    The Haversine formula calculates the shortest distance over the Earth's
-    surface, giving an "as-the-crow-flies" distance. For transportation
-    networks, this is multiplied by a circuity factor to account for actual
-    road routing.
-
-    Formula:
-        a = sin²(Δφ/2) + cos(φ1) × cos(φ2) × sin²(Δλ/2)
-        c = 2 × atan2(√a, √(1-a))
-        d = R × c
-
-    Where:
-        φ = latitude, λ = longitude, R = Earth radius
+    Returns straight-line distance; multiply by circuity factor for actual routing distance.
 
     Args:
         lat1, lon1: Origin coordinates in decimal degrees
         lat2, lon2: Destination coordinates in decimal degrees
 
     Returns:
-        Distance in miles (great-circle distance)
+        Distance in miles
 
     Raises:
-        ValueError: If coordinates are invalid (not in valid lat/lon ranges)
-
-    Example:
-        >>> # New York to Los Angeles
-        >>> haversine_miles(40.7128, -74.0060, 34.0522, -118.2437)
-        2451.1  # miles
-
-    Notes:
-        - Accuracy is within 0.5% for most transportation applications
-        - Assumes spherical Earth (ignores ellipsoid corrections)
-        - Returns 0 for identical coordinates
+        ValueError: If coordinates outside valid ranges
     """
     # Validate coordinate ranges
     if not (-90 <= lat1 <= 90) or not (-90 <= lat2 <= 90):
@@ -152,38 +131,15 @@ def band_lookup(
     """
     Look up mileage band parameters for a given distance.
 
-    Mileage bands define cost and routing parameters that vary by distance.
-    For example, short distances may have higher fixed costs and lower speeds
-    (urban routing), while long distances have lower fixed costs and higher
-    speeds (highway routing).
-
     Args:
-        raw_haversine_miles: Straight-line distance in miles (no circuity)
-        mileage_bands: DataFrame with columns:
-            - mileage_band_min: Lower bound of distance range
-            - mileage_band_max: Upper bound of distance range
-            - fixed_cost_per_truck: Fixed cost component
-            - variable_cost_per_mile: Variable cost per mile
-            - circuity_factor: Multiplier for actual vs straight-line distance
-            - mph: Average speed for this distance range
+        raw_haversine_miles: Straight-line distance in miles
+        mileage_bands: Mileage bands with cost, circuity, and speed parameters
 
     Returns:
         Tuple of (fixed_cost_per_truck, variable_cost_per_mile, circuity_factor, mph)
 
     Raises:
-        ValueError: If distance not found in any band and exceeds maximum range
-
-    Example:
-        >>> # 500 mile distance lookup
-        >>> fixed, variable, circuity, mph = band_lookup(500, mileage_bands)
-        >>> # Returns parameters for 500-mile distance band
-        >>> actual_distance = 500 * circuity  # Apply circuity
-        >>> cost = fixed + variable * actual_distance
-
-    Notes:
-        - Uses first matching band if distance falls in multiple ranges
-        - For distances exceeding all bands, uses last (longest) band parameters
-        - Circuity typically ranges from 1.1 (rural) to 1.4 (urban)
+        ValueError: If distance not found in any band
     """
     distance = float(raw_haversine_miles)
 
@@ -258,42 +214,17 @@ def calculate_zone_from_distance(
     """
     Calculate zone classification based on straight-line distance.
 
-    SIMPLIFIED v4.7: Returns integer zone 0-8, or -1 for unknown.
-
-    Zone Assignment Logic:
-    ----------------------
-    - Calculate haversine distance (O=D returns 0.0)
-    - Look up zone in mileage_bands based on distance
-    - Return integer zone directly from mileage_bands.zone column
-    - Zone 0 is ONLY for direct injection (handled separately)
-    - Middle-mile O=D uses mileage_bands for distance=0
-
-    Input Requirements:
-    -------------------
-    - mileage_bands.zone must be integer 0-8
-    - mileage_bands must have band starting at 0 for O=D flows
+    Looks up zone from mileage_bands based on haversine distance between facilities.
+    Zone 0 is for direct injection only (handled separately in direct_day flows).
 
     Args:
         origin: Origin facility name
         dest: Destination facility name
         facilities: Facility master data with lat/lon
-        mileage_bands: Mileage bands with integer 'zone' column
+        mileage_bands: Mileage bands with integer zone column (0-8)
 
     Returns:
-        Integer zone 0-8, or -1 for unknown/error
-
-    Example:
-        >>> # O=D flow
-        >>> zone = calculate_zone_from_distance('DFW02', 'DFW02', facilities, bands)
-        >>> # Returns 1 if mileage_bands has band starting at 0 with zone=1
-
-        >>> # Long-haul flow
-        >>> zone = calculate_zone_from_distance('DFW02', 'SEA01', facilities, bands)
-        >>> # Returns 8 for ~2000 mile distance
-
-        >>> # Error case
-        >>> zone = calculate_zone_from_distance('INVALID', 'SEA01', facilities, bands)
-        >>> # Returns -1
+        Integer zone 0-8, or -1 if classification fails
     """
     try:
         from .utils import get_facility_lookup

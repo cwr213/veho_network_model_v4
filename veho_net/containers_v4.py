@@ -29,24 +29,13 @@ from .utils import safe_divide
 
 def weighted_pkg_cube(package_mix: pd.DataFrame) -> float:
     """
-    Calculate weighted average cube per package across package mix.
-
-    Formula: Σ(share_of_pkgs × avg_cube_cuft)
+    Calculate weighted average cubic feet per package.
 
     Args:
-        package_mix: DataFrame with columns:
-            - share_of_pkgs: Package type distribution (must sum to 1.0)
-            - avg_cube_cuft: Average cubic feet per package type
+        package_mix: Package distribution with share_of_pkgs and avg_cube_cuft columns
 
     Returns:
-        Weighted average cubic feet per package
-
-    Example:
-        >>> mix = pd.DataFrame({
-        ...     'share_of_pkgs': [0.6, 0.4],
-        ...     'avg_cube_cuft': [1.5, 2.5]
-        ... })
-        >>> weighted_pkg_cube(mix)  # Returns 1.9
+        Weighted average cube per package
     """
     return float((package_mix["share_of_pkgs"] * package_mix["avg_cube_cuft"]).sum())
 
@@ -60,33 +49,17 @@ def calculate_containers_per_package(
         container_params: pd.DataFrame
 ) -> float:
     """
-    Calculate the fraction of a container that one average package represents.
+    Calculate fraction of container per package for cost allocation.
 
-    This is the INVERSE of packages per container. Used for allocating
-    container handling costs on a per-package basis.
-
-    Formula:
-        1. weighted_cube = average cubic feet per package
-        2. effective_container_cube = usable_cube × pack_utilization
-        3. packages_per_container = effective_container_cube / weighted_cube
-        4. containers_per_package = 1 / packages_per_container
+    Returns inverse of packages per container (e.g., 0.02 if 50 pkgs fit per container).
+    Used to allocate container handling costs on per-package basis.
 
     Args:
-        package_mix: Package distribution with cube factors
+        package_mix: Package distribution
         container_params: Container parameters
 
     Returns:
-        Fraction of container per package (e.g., 0.02 = 50 pkgs per container)
-
-    Example:
-        >>> # If 50 packages fit in a container on average
-        >>> containers_per_pkg = calculate_containers_per_package(mix, params)
-        >>> containers_per_pkg  # Returns 0.02
-        >>>
-        >>> # Used for cost allocation:
-        >>> container_handling_cost = 5.00  # $5 per container touch
-        >>> cost_per_pkg = container_handling_cost * containers_per_pkg
-        >>> cost_per_pkg  # Returns 0.10 ($0.10 per package)
+        Containers per package (decimal fraction)
     """
     weighted_cube = weighted_pkg_cube(package_mix)
 
@@ -121,22 +94,16 @@ def calculate_truck_capacity(
     """
     Calculate packages per truck capacity based on loading strategy.
 
-    Container Strategy Formula:
-        capacity = ((usable_cube × pack_util_container) ÷ weighted_pkg_cube) × containers_per_truck
-
-    Fluid Strategy Formula:
-        capacity = (trailer_cube × pack_util_fluid) ÷ weighted_pkg_cube
+    Container: capacity through gaylords with pack utilization
+    Fluid: direct trailer capacity with pack utilization
 
     Args:
-        package_mix: Package distribution data
-        container_params: Container/trailer capacity parameters
-        strategy: Loading strategy ('container' or 'fluid')
+        package_mix: Package distribution
+        container_params: Container/trailer parameters
+        strategy: 'container' or 'fluid'
 
     Returns:
-        Packages per truck capacity (effective capacity with utilization)
-
-    Raises:
-        ValueError: If strategy is not 'container' or 'fluid'
+        Effective packages per truck capacity
     """
     weighted_avg_pkg_cube = weighted_pkg_cube(package_mix)
 
@@ -184,59 +151,22 @@ def calculate_trucks_and_fill_rates(
         dwell_threshold: float
 ) -> Dict[str, float]:
     """
-    Calculate truck requirements and fill rates with premium economy dwell logic.
+    Calculate truck requirements with premium economy dwell logic.
 
-    Premium Economy Dwell Logic:
-    -----------------------------
-    The "premium economy" approach optimizes asset utilization by avoiding
-    dispatch of nearly-empty trucks. Instead of always rounding up fractional
-    trucks, we apply business rules:
+    Premium economy dwell: If fractional truck usage is below threshold, round down
+    and dwell excess packages to next day rather than dispatch nearly-empty truck.
 
-    1. Calculate exact trucks needed based on effective cube capacity
-    2. If raw_trucks <= 1.0: Always use 1 truck (never round to 0)
-    3. If raw_trucks > 1.0:
-       - fractional_part = raw_trucks - floor(raw_trucks)
-       - If fractional_part < dwell_threshold:
-           → Round DOWN, dwell excess packages to next day
-           → Saves cost of nearly-empty truck dispatch
-       - If fractional_part >= dwell_threshold:
-           → Round UP, dispatch the partial truck
-           → Meets service commitments
-
-    Fill Rate Calculation:
-    ----------------------
-    Fill rates use RAW (not effective) capacity per executive reporting standard.
-    This measures actual cube utilization against theoretical maximum, providing
-    visibility into operational efficiency and equipment sizing decisions.
+    Fill rates use raw capacity (not effective) for executive reporting standard.
 
     Args:
-        total_packages: Total package volume
-        package_mix: Package distribution with cube factors
+        total_packages: Package volume
+        package_mix: Package distribution
         container_params: Container/trailer parameters
-        strategy: Loading strategy ('container' or 'fluid')
-        dwell_threshold: Fractional truck threshold (e.g., 0.10 = 10%)
+        strategy: 'container' or 'fluid'
+        dwell_threshold: Fractional truck threshold for rounding decision
 
     Returns:
-        Dictionary with:
-            - physical_containers: Container count (container strategy only)
-            - trucks_needed: Number of trucks required
-            - container_fill_rate: Container utilization (0-1)
-            - truck_fill_rate: Truck utilization (0-1)
-            - packages_dwelled: Packages delayed to next day
-            - total_cube_cuft: Total package cube
-            - cube_per_truck: Average cube per truck
-
-    Example:
-        >>> # 540 packages requiring 1.08 trucks with 10% threshold
-        >>> result = calculate_trucks_and_fill_rates(
-        ...     total_packages=540,
-        ...     package_mix=mix,
-        ...     container_params=params,
-        ...     strategy='container',
-        ...     dwell_threshold=0.10
-        ... )
-        >>> result['trucks_needed']  # Returns 1 (rounded down)
-        >>> result['packages_dwelled']  # Returns ~40 (8% of capacity)
+        Dict with trucks_needed, fill rates, packages_dwelled, and cube metrics
     """
     # Handle zero-package case
     if total_packages <= 0:
