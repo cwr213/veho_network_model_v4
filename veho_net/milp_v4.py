@@ -270,7 +270,7 @@ def solve_network_optimization(
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         error_msg = status_messages.get(status, f"Solver failed with status code: {status}")
-        print(f"    ❌ Optimization failed: {error_msg}")
+        print(f"    ERROR: Optimization failed: {error_msg}")
 
         empty_kpis = {
             "solver_status": error_msg,
@@ -327,7 +327,7 @@ def solve_network_optimization(
     cost_delta = actual_total_cost - milp_objective
     delta_pct = safe_divide(abs(cost_delta), milp_objective) * 100
 
-    print(f"    ✅ Optimization complete:")
+    print(f"    Optimization complete:")
     print(f"       Network cost: ${actual_total_cost:,.2f} (${actual_cpp:.3f}/pkg)")
     if abs(delta_pct) > 0.01:
         print(f"       (MILP integer objective: ${milp_objective:,.0f}, Δ=${cost_delta:+,.0f} from rounding)")

@@ -1,15 +1,12 @@
 """
-Main Execution Script - v4.15 FLUID ANALYSIS FIX
+Main Execution Script
 
-Updates v4.15:
-1. Fluid analysis now runs per-scenario (not just last one)
-2. Executive summary and comparison work correctly with all scenarios
-3. Proper scenario tracking throughout
-
-Updates v4.14:
-1. Added max_sort_points_capacity override in scenarios sheet
-2. Smart run_id auto-generation from scenario characteristics
-3. Capacity passthrough to MILP solver
+Orchestrates end-to-end network optimization:
+- Loads and validates input data
+- Generates candidate paths through network
+- Solves MILP optimization per scenario
+- Produces facility-level and network-level outputs
+- Supports sort strategy comparison and fluid load analysis
 """
 
 import argparse
@@ -131,7 +128,7 @@ def validate_arc_summary(arc_summary: pd.DataFrame, context: str = "") -> bool:
     Validate arc summary has required columns.
     """
     if arc_summary.empty:
-        print(f"  ⚠️  {context}: Arc summary is empty")
+        print(f"  WARNING:  {context}: Arc summary is empty")
         return False
 
     required_cols = ['from_facility', 'to_facility', 'distance_miles',
@@ -139,7 +136,7 @@ def validate_arc_summary(arc_summary: pd.DataFrame, context: str = "") -> bool:
     missing = [col for col in required_cols if col not in arc_summary.columns]
 
     if missing:
-        print(f"  ⚠️  {context}: Arc summary missing columns: {missing}")
+        print(f"  WARNING:  {context}: Arc summary missing columns: {missing}")
         print(f"     Available: {list(arc_summary.columns)}")
         return False
 
@@ -159,8 +156,8 @@ def main(input_path: str, output_dir: str):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    print(f"\n📁 Input: {input_path.name}")
-    print(f"📁 Output: {output_dir}")
+    print(f"\n Input: {input_path.name}")
+    print(f" Output: {output_dir}")
 
     print(f"\n{'=' * 70}")
     print("LOADING INPUTS")
@@ -170,7 +167,7 @@ def main(input_path: str, output_dir: str):
         dfs = load_workbook(input_path)
         print("✓ Workbook loaded successfully")
     except Exception as e:
-        print(f"\n❌ FATAL: Could not load workbook")
+        print(f"\n ERROR FATAL: Could not load workbook")
         print(f"   Error: {e}")
         return 1
 
@@ -178,7 +175,7 @@ def main(input_path: str, output_dir: str):
         validate_inputs(dfs)
         print("✓ Input validation passed")
     except Exception as e:
-        print(f"\n❌ FATAL: Input validation failed")
+        print(f"\n ERROR FATAL: Input validation failed")
         print(f"   Error: {e}")
         return 1
 
@@ -193,7 +190,7 @@ def main(input_path: str, output_dir: str):
 
         print("✓ Parameters parsed successfully")
     except Exception as e:
-        print(f"\n❌ FATAL: Could not parse parameters")
+        print(f"\n ERROR FATAL: Could not parse parameters")
         print(f"   Error: {e}")
         return 1
 
@@ -210,7 +207,7 @@ def main(input_path: str, output_dir: str):
         )
         print("✓ Cost parameters created")
     except Exception as e:
-        print(f"\n❌ FATAL: Invalid cost parameters")
+        print(f"\n ERROR FATAL: Invalid cost parameters")
         print(f"   Error: {e}")
         return 1
 
@@ -221,7 +218,7 @@ def main(input_path: str, output_dir: str):
             else LoadStrategy.FLUID
         )
     except Exception as e:
-        print(f"\n❌ FATAL: Invalid load_strategy in run_settings")
+        print(f"\n ERROR FATAL: Invalid load_strategy in run_settings")
         print(f"   Error: {e}")
         return 1
 
@@ -272,7 +269,7 @@ def main(input_path: str, output_dir: str):
 
         is_valid, error_msg = validate_scenario_data(scenario_row, dfs)
         if not is_valid:
-            print(f"  ❌ Skipping scenario: {error_msg}")
+            print(f"  ERROR: Skipping scenario: {error_msg}")
             continue
 
         try:
@@ -280,7 +277,7 @@ def main(input_path: str, output_dir: str):
             year_demand = dfs["demand"].query("year == @year").copy()
 
             if year_demand.empty:
-                print(f"  ❌ No demand data for year {year}")
+                print(f"  ERROR: No demand data for year {year}")
                 continue
 
             od, direct_day, dest_pop = build_od_and_direct(
@@ -297,7 +294,7 @@ def main(input_path: str, output_dir: str):
             od = od[od["pkgs_day"] > 0].copy()
 
             if od.empty:
-                print(f"  ❌ No OD pairs with volume for {day_type}")
+                print(f"  ERROR: No OD pairs with volume for {day_type}")
                 continue
 
             print(f"  ✓ Generated {len(od)} OD pairs")
@@ -318,13 +315,13 @@ def main(input_path: str, output_dir: str):
                     around_factor
                 )
             except Exception as e:
-                print(f"  ❌ Path generation failed: {e}")
+                print(f"  ERROR: Path generation failed: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
 
             if paths.empty:
-                print(f"  ❌ No valid paths generated")
+                print(f"  ERROR: No valid paths generated")
                 continue
 
             paths = paths.merge(
@@ -341,7 +338,7 @@ def main(input_path: str, output_dir: str):
 
             if enable_sort_opt:
                 print(f"\n{'─' * 70}")
-                print("🔍 RUNNING BASELINE COMPARISON")
+                print(" RUNNING BASELINE COMPARISON")
                 print("   (Market Sort vs. Optimized Sort Level)")
                 print("─" * 70)
 
@@ -386,7 +383,7 @@ def main(input_path: str, output_dir: str):
 
                     else:
                         print(f"\n{'─' * 70}")
-                        print("⚠️  Comparison didn't return results, solving again...")
+                        print("WARNING:  Comparison didn't return results, solving again...")
                         print("─" * 70)
                         print("\n3. Running MILP optimization...")
 
@@ -406,7 +403,7 @@ def main(input_path: str, output_dir: str):
                         )
 
                 except Exception as e:
-                    print(f"  ⚠️  Sort comparison failed: {e}")
+                    print(f"  WARNING:  Sort comparison failed: {e}")
                     import traceback
                     traceback.print_exc()
 
@@ -447,13 +444,13 @@ def main(input_path: str, output_dir: str):
                         scenario_row
                     )
                 except Exception as e:
-                    print(f"  ❌ Optimization failed: {e}")
+                    print(f"  ERROR: Optimization failed: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
 
             if od_selected.empty:
-                print(f"  ❌ Optimization returned no paths")
+                print(f"  ERROR: Optimization returned no paths")
                 continue
 
             print(f"  ✓ Selected {len(od_selected)} optimal paths")
@@ -477,7 +474,7 @@ def main(input_path: str, output_dir: str):
             if not unknown_zones.empty:
                 unknown_pkgs = unknown_zones['pkgs_day'].sum()
                 unknown_pct = (unknown_pkgs / od_selected['pkgs_day'].sum()) * 100
-                print(f"  ⚠️  WARNING: {unknown_pct:.1f}% of packages in unknown zone")
+                print(f"  WARNING: {unknown_pct:.1f}% of packages in unknown zone")
                 print(f"     {len(unknown_zones)} OD pairs affected")
 
                 print(f"\n     Example unknown zone ODs:")
@@ -489,7 +486,7 @@ def main(input_path: str, output_dir: str):
             print("\n5. Applying container flow correction...")
 
             if not validate_arc_summary(arc_summary_original, "Original"):
-                print("  ⚠️  Original arc summary invalid, proceeding with correction anyway...")
+                print("  WARNING:  Original arc summary invalid, proceeding with correction anyway...")
 
             try:
                 od_selected = build_od_container_map(
@@ -512,7 +509,7 @@ def main(input_path: str, output_dir: str):
                 if validate_arc_summary(arc_summary_corrected, "Corrected"):
                     print("  ✓ Corrected arc summary validated")
                 else:
-                    print("  ⚠️  Corrected arc summary validation failed, using original")
+                    print("  WARNING:  Corrected arc summary validation failed, using original")
                     arc_summary_corrected = arc_summary_original
 
                 sort_container_impact = analyze_sort_level_container_impact(
@@ -531,13 +528,13 @@ def main(input_path: str, output_dir: str):
                 print(diagnostic)
 
                 if not sort_container_impact.empty:
-                    print("\n📊 Sort Level Container Analysis:")
+                    print("\n Sort Level Container Analysis:")
                     print(sort_container_impact.to_string(index=False))
 
                 arc_summary = arc_summary_corrected
 
             except Exception as e:
-                print(f"  ⚠️  Container flow correction failed: {e}")
+                print(f"  WARNING:  Container flow correction failed: {e}")
                 import traceback
                 traceback.print_exc()
                 print("  → Using original arc summary")
@@ -559,7 +556,7 @@ def main(input_path: str, output_dir: str):
                 if not zone_cost_analysis.empty:
                     print(create_zone_cost_summary_table(zone_cost_analysis))
             except Exception as e:
-                print(f"  ⚠️  Zone cost analysis failed: {e}")
+                print(f"  WARNING:  Zone cost analysis failed: {e}")
 
             try:
                 path_steps = build_path_steps(
@@ -570,7 +567,7 @@ def main(input_path: str, output_dir: str):
                 )
                 print("  ✓ Path steps built")
             except Exception as e:
-                print(f"  ⚠️  Path steps generation failed: {e}")
+                print(f"  WARNING:  Path steps generation failed: {e}")
                 path_steps = pd.DataFrame()
 
             try:
@@ -586,7 +583,7 @@ def main(input_path: str, output_dir: str):
                 )
                 print("  ✓ Facility volume calculated")
             except Exception as e:
-                print(f"  ⚠️  Facility volume calculation failed: {e}")
+                print(f"  WARNING:  Facility volume calculation failed: {e}")
                 import traceback
                 traceback.print_exc()
                 facility_volume = pd.DataFrame()
@@ -600,7 +597,7 @@ def main(input_path: str, output_dir: str):
                 )
                 print("  ✓ Facility network profile built")
             except Exception as e:
-                print(f"  ⚠️  Facility network profile failed: {e}")
+                print(f"  WARNING:  Facility network profile failed: {e}")
                 facility_network_profile = pd.DataFrame()
 
             try:
@@ -621,7 +618,7 @@ def main(input_path: str, output_dir: str):
 
                 print("  ✓ Network metrics calculated")
             except Exception as e:
-                print(f"  ⚠️  Network metrics calculation failed: {e}")
+                print(f"  WARNING:  Network metrics calculation failed: {e}")
                 distance_metrics = {}
                 touch_metrics = {}
                 zone_distribution = {}
@@ -635,13 +632,13 @@ def main(input_path: str, output_dir: str):
                 )
 
                 if not validation_results.get('package_consistency', True):
-                    print("  ⚠️  Warning: Package volume inconsistency detected")
+                    print("  WARNING:  Warning: Package volume inconsistency detected")
 
                 if validation_results.get('unknown_zone_pct', 0) > 0:
-                    print(f"  ⚠️  {validation_results['unknown_zone_pct']:.1f}% of packages in unknown zone")
+                    print(f"  WARNING:  {validation_results['unknown_zone_pct']:.1f}% of packages in unknown zone")
 
             except Exception as e:
-                print(f"  ⚠️  Validation check failed: {e}")
+                print(f"  WARNING:  Validation check failed: {e}")
 
             total_cost = od_selected["total_cost"].sum()
             total_pkgs = od_selected["pkgs_day"].sum()
@@ -702,7 +699,7 @@ def main(input_path: str, output_dir: str):
                         dfs["facilities"]
                     )
                 except Exception as e:
-                    print(f"  ⚠️  Sort analysis build failed: {e}")
+                    print(f"  WARNING:  Sort analysis build failed: {e}")
                     sort_analysis = sort_summary
             else:
                 sort_analysis = sort_summary
@@ -726,10 +723,10 @@ def main(input_path: str, output_dir: str):
                     print(f"  ✓ Wrote: {output_filename}")
                     print(f"  ✓ Total cost: ${total_cost:,.0f} (${cost_per_pkg:.3f}/pkg)")
                 else:
-                    print(f"  ❌ Failed to write output file")
+                    print(f"  ERROR: Failed to write output file")
                     continue
             except Exception as e:
-                print(f"  ❌ Error writing output file: {e}")
+                print(f"  ERROR: Error writing output file: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
@@ -748,7 +745,7 @@ def main(input_path: str, output_dir: str):
                     created_files.append(f"container_impact_{scenario_id}.xlsx")
                     print(f"  ✓ Saved container impact to: container_impact_{scenario_id}.xlsx")
                 except Exception as e:
-                    print(f"  ⚠️  Could not save container impact: {e}")
+                    print(f"  WARNING:  Could not save container impact: {e}")
 
             print("\n7. Running fluid load analysis for this scenario...")
 
@@ -757,7 +754,7 @@ def main(input_path: str, output_dir: str):
                 missing_cols = [col for col in required_for_fluid if col not in od_selected.columns]
 
                 if missing_cols:
-                    print(f"  ⚠️  Skipping fluid analysis - missing columns: {missing_cols}")
+                    print(f"  WARNING:  Skipping fluid analysis - missing columns: {missing_cols}")
                 else:
                     fluid_opportunities = analyze_fluid_load_opportunities(
                         od_selected=od_selected,
@@ -785,12 +782,12 @@ def main(input_path: str, output_dir: str):
                             print(f"    ({len(fluid_opportunities)} arcs analyzed)")
                             created_files.append(f"fluid_opportunities_{scenario_id}.xlsx")
                         except Exception as e:
-                            print(f"  ⚠️  Could not save fluid opportunities: {e}")
+                            print(f"  WARNING:  Could not save fluid opportunities: {e}")
                     else:
                         print("  ✓ All arcs optimally utilized - no fluid opportunities found")
 
             except Exception as e:
-                print(f"  ⚠️  Fluid load analysis failed: {e}")
+                print(f"  WARNING:  Fluid load analysis failed: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -803,7 +800,7 @@ def main(input_path: str, output_dir: str):
             }
 
         except Exception as e:
-            print(f"\n❌ Error processing {scenario_id}: {e}")
+            print(f"\n ERROR: Error processing {scenario_id}: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -825,7 +822,7 @@ def main(input_path: str, output_dir: str):
                 created_files.append(f"comparison_{run_id}.xlsx")
                 print(f"  ✓ Created: comparison_{run_id}.xlsx")
         except Exception as e:
-            print(f"  ⚠️  Could not create comparison workbook: {e}")
+            print(f"  WARNING:  Could not create comparison workbook: {e}")
 
         try:
             exec_path = output_dir / f"executive_summary_{run_id}.xlsx"
@@ -839,22 +836,22 @@ def main(input_path: str, output_dir: str):
                 created_files.append(f"executive_summary_{run_id}.xlsx")
                 print(f"  ✓ Created: executive_summary_{run_id}.xlsx")
         except Exception as e:
-            print(f"  ⚠️  Could not create executive summary: {e}")
+            print(f"  WARNING:  Could not create executive summary: {e}")
 
     elapsed = datetime.now() - start_time
 
     print(f"\n{'=' * 70}")
     print("OPTIMIZATION COMPLETE")
     print("=" * 70)
-    print(f"⏱️  Elapsed time: {elapsed}")
-    print(f"📋 Processed: {len(all_results)} scenarios")
-    print(f"📄 Created files: {len(created_files)}")
-    print(f"✅ Container flow correction: APPLIED")
-    print(f"✅ Zone tracking: 0 (DI) + 1-8 + Unknown")
-    print(f"✅ Zone miles validation: ADDED")
-    print(f"✅ Fluid analysis: Per-scenario (arc-based)")
-    print(f"✅ Scenario capacity override: SUPPORTED")
-    print(f"✅ Smart run_id generation: ENABLED")
+    print(f"Elapsed time: {elapsed}")
+    print(f"Processed: {len(all_results)} scenarios")
+    print(f"Created files: {len(created_files)}")
+    print(f"Container flow correction: APPLIED")
+    print(f"Zone tracking: 0 (DI) + 1-8 + Unknown")
+    print(f"Zone miles validation: ADDED")
+    print(f"Fluid analysis: Per-scenario (arc-based)")
+    print(f"Scenario capacity override: SUPPORTED")
+    print(f"Smart run_id generation: ENABLED")
 
     if created_files:
         print(f"\nOutput files in {output_dir}:")
@@ -917,10 +914,10 @@ For input file validation, run the diagnostic script first:
         exit_code = main(args.input, args.output_dir)
         sys.exit(exit_code)
     except KeyboardInterrupt:
-        print("\n\n⚠️  Interrupted by user")
+        print("\n\nWARNING:  Interrupted by user")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ FATAL ERROR: {e}")
+        print(f"\nERROR: FATAL ERROR: {e}")
         import traceback
 
         traceback.print_exc()

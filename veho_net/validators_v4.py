@@ -15,7 +15,6 @@ def validate_referential_integrity(dfs: dict) -> None:
     """
     Validate foreign key relationships across sheets.
 
-    ENHANCED v4.7:
     - Check injection facilities have is_injection_node=1
     - Check injection facilities are hub/hybrid
     - Verify mileage_bands start at 0
@@ -111,7 +110,7 @@ def validate_referential_integrity(dfs: dict) -> None:
             f"Error: {e}"
         )
 
-    print("✓ Referential integrity validated")
+    print("Referential integrity validated")
 
 def validate_inputs(dfs: dict) -> None:
     """
@@ -128,42 +127,42 @@ def validate_inputs(dfs: dict) -> None:
     print("=" * 60)
 
     _validate_facilities(dfs["facilities"])
-    print("✓ facilities validated")
+    print("facilities validated")
 
     _validate_zips(dfs["zips"])
-    print("✓ zips validated")
+    print("zips validated")
 
     _validate_demand(dfs["demand"])
-    print("✓ demand validated")
+    print("demand validated")
 
     _validate_injection_distribution(dfs["injection_distribution"])
-    print("✓ injection_distribution validated")
+    print("injection_distribution validated")
 
     _validate_mileage_bands(dfs["mileage_bands"])
-    print("✓ mileage_bands validated")
+    print("mileage_bands validated")
 
     _validate_timing_params(dfs["timing_params"])
-    print("✓ timing_params validated")
+    print("timing_params validated")
 
     _validate_cost_params(dfs["cost_params"])
-    print("✓ cost_params validated")
+    print("cost_params validated")
 
     _validate_container_params(dfs["container_params"])
-    print("✓ container_params validated")
+    print("container_params validated")
 
     _validate_package_mix(dfs["package_mix"])
-    print("✓ package_mix validated")
+    print("package_mix validated")
 
     _validate_run_settings(dfs["run_settings"])
-    print("✓ run_settings validated")
+    print("run_settings validated")
 
     _validate_scenarios(dfs["scenarios"])
-    print("✓ scenarios validated")
+    print("scenarios validated")
 
     validate_referential_integrity(dfs)
 
     print("=" * 60)
-    print("✅ VALIDATION COMPLETE - ALL REQUIRED FIELDS PRESENT")
+    print("VALIDATION COMPLETE - ALL REQUIRED FIELDS PRESENT")
     print("=" * 60)
 
 
@@ -312,7 +311,6 @@ def _validate_mileage_bands(df: pd.DataFrame) -> None:
     """
     Validate mileage band cost structure and zone mapping.
 
-    ENHANCED v4.7:
     - Zone must be integer 0-8 (no strings allowed)
     - Must have band starting at 0 for O=D flows
     """
@@ -413,7 +411,7 @@ def _validate_timing_params(df: pd.DataFrame) -> None:
     middle_mile_hours = float(df[df["key"] == "middle_mile_va_hours"]["value"].iloc[0])
 
     if crossdock_hours >= middle_mile_hours:
-        print(f"  ⚠️  Warning: crossdock_va_hours ({crossdock_hours}) should typically be less than "
+        print(f"Warning: crossdock_va_hours ({crossdock_hours}) should typically be less than "
               f"middle_mile_va_hours ({middle_mile_hours})")
 
 

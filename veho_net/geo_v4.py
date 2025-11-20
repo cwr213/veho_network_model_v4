@@ -1,21 +1,15 @@
 """
 Geographic Utilities Module
 
-Provides distance calculations and mileage band lookups for transportation network modeling.
-Uses only physical constants - all parameters from input data.
+Provides distance calculations and zone classification for transportation network modeling.
 
 Key Functions:
-    - haversine_miles: Great-circle distance between coordinates
-    - band_lookup: Retrieve mileage band parameters for distance
-    - calculate_zone_from_distance: Zone classification for pricing
+- haversine_miles: Great-circle distance between coordinates
+- band_lookup: Retrieve mileage band cost/speed parameters by distance
+- calculate_zone_from_distance: Zone classification from facility coordinates
 
-Distance Calculation:
-    Uses Haversine formula for great-circle distance on a sphere.
-    Suitable for transportation network planning where accuracy within
-    0.5% is acceptable (ignores Earth's ellipsoid shape).
-
-CRITICAL CHANGE v4.7: Zones are now integers 0-8, or -1 for unknown.
-No more string parsing. Input must have integer zone column.
+Distance calculations use Haversine formula for great-circle distance.
+Zones are integers 0-8 (from mileage_bands) or -1 for unknown.
 """
 
 import math
@@ -202,7 +196,7 @@ def get_mileage_band_for_distance(
 
 
 # ============================================================================
-# ZONE CLASSIFICATION - FIXED v4.5
+# ZONE CLASSIFICATION
 # ============================================================================
 
 def calculate_zone_from_distance(
@@ -212,19 +206,15 @@ def calculate_zone_from_distance(
         mileage_bands: pd.DataFrame
 ) -> int:
     """
-    Calculate zone classification based on straight-line distance.
-
-    Looks up zone from mileage_bands based on haversine distance between facilities.
-    Zone 0 is for direct injection only (handled separately in direct_day flows).
+    Calculate zone classification from coordinates directly.
 
     Args:
-        origin: Origin facility name
-        dest: Destination facility name
-        facilities: Facility master data with lat/lon
-        mileage_bands: Mileage bands with integer zone column (0-8)
+        lat1, lon1: Origin coordinates
+        lat2, lon2: Destination coordinates
+        mileage_bands: Mileage bands with integer zone column
 
     Returns:
-        Integer zone 0-8, or -1 if classification fails
+        Integer zone 0-8, or -1 for unknown
     """
     try:
         from .utils import get_facility_lookup
@@ -314,8 +304,6 @@ def calculate_zone_from_coordinates(
 ) -> int:
     """
     Calculate zone classification from coordinates directly.
-
-    SIMPLIFIED v4.7: Returns integer zone 0-8, or -1 for unknown.
 
     Args:
         lat1, lon1: Origin coordinates

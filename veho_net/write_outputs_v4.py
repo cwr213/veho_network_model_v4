@@ -1,13 +1,12 @@
 """
 Output Writing Module
 
-Generates Excel workbooks with optimization results using v4 reporting structure.
+Generates Excel workbooks with optimization results.
 
-Major Changes in v4:
-    - Two facility sheets: facility_volume and facility_network_profile
-    - Added network-level zone/sort/distance/touch metrics
-    - Enhanced comparison and executive summary
-    - Added zone cost analysis sheet
+Key Output Files:
+- Scenario workbooks: Detailed results per scenario
+- Comparison workbook: Side-by-side scenario comparison
+- Executive summary: High-level business metrics
 """
 
 import pandas as pd
