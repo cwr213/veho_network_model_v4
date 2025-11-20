@@ -718,17 +718,64 @@ def main(input_path: str, output_dir: str):
                 try:
                     container_impact_path = output_dir / f"container_impact_{scenario_id}.xlsx"
                     with pd.ExcelWriter(container_impact_path, engine='xlsxwriter') as writer:
+                        # Sort container impact analysis
                         sort_container_impact.to_excel(
                             writer, sheet_name='sort_container_impact', index=False
                         )
-                        pd.DataFrame([{'diagnostic': diagnostic}]).to_excel(
+
+                        # Container flow diagnostic as structured data
+                        diagnostic_data = []
+
+                        # Network fill rates
+                        orig_fill = arc_summary_original[
+                            'truck_fill_rate'].mean() if 'truck_fill_rate' in arc_summary_original.columns else 0
+                        corr_fill = arc_summary['truck_fill_rate'].mean()
+
+                        diagnostic_data.append({
+                            'metric': 'Network Avg Truck Fill (Original)',
+                            'value': round(orig_fill, 4)
+                        })
+                        diagnostic_data.append({
+                            'metric': 'Network Avg Truck Fill (Corrected)',
+                            'value': round(corr_fill, 4)
+                        })
+                        diagnostic_data.append({
+                            'metric': 'Fill Rate Difference',
+                            'value': round(corr_fill - orig_fill, 4)
+                        })
+
+                        # Sort level impacts
+                        for sort_level in ['region', 'market', 'sort_group']:
+                            level_ods = od_selected[od_selected.get('chosen_sort_level', 'market') == sort_level]
+                            if not level_ods.empty:
+                                total_pkgs = level_ods['pkgs_day'].sum()
+                                total_containers = level_ods[
+                                    'origin_containers'].sum() if 'origin_containers' in level_ods.columns else 0
+
+                                diagnostic_data.append({
+                                    'metric': f'{sort_level.title()} - Packages',
+                                    'value': int(total_pkgs)
+                                })
+                                diagnostic_data.append({
+                                    'metric': f'{sort_level.title()} - Containers',
+                                    'value': int(total_containers)
+                                })
+                                diagnostic_data.append({
+                                    'metric': f'{sort_level.title()} - Pkgs per Container',
+                                    'value': round(total_pkgs / max(total_containers, 1), 1)
+                                })
+
+                        diagnostic_df = pd.DataFrame(diagnostic_data)
+                        diagnostic_df.to_excel(
                             writer, sheet_name='diagnostic', index=False
                         )
 
                     created_files.append(f"container_impact_{scenario_id}.xlsx")
-                    print(f"  ✓ Saved container impact to: container_impact_{scenario_id}.xlsx")
+                    print(f"  Saved container impact to: container_impact_{scenario_id}.xlsx")
                 except Exception as e:
-                    print(f"  WARNING:  Could not save container impact: {e}")
+                    print(f"  WARNING: Could not save container impact - {e}")
+                    import traceback
+                    traceback.print_exc()
 
             print("\n7. Running fluid load analysis for this scenario...")
 
@@ -755,19 +802,44 @@ def main(input_path: str, output_dir: str):
                         try:
                             fluid_output = output_dir / f"fluid_opportunities_{scenario_id}.xlsx"
                             with pd.ExcelWriter(fluid_output, engine='xlsxwriter') as writer:
+                                # Detailed opportunities
                                 fluid_opportunities.to_excel(
                                     writer,
                                     sheet_name='opportunities',
                                     index=False
                                 )
 
-                            print(f"\n  ✓ Saved fluid opportunities to: fluid_opportunities_{scenario_id}.xlsx")
+                                # Summary metrics
+                                fluid_summary = pd.DataFrame([{
+                                    'metric': 'Total Arcs Analyzed',
+                                    'value': len(fluid_opportunities)
+                                }, {
+                                    'metric': 'Total Daily Savings Potential',
+                                    'value': fluid_opportunities['net_benefit_daily'].sum()
+                                }, {
+                                    'metric': 'Total Annual Savings Potential',
+                                    'value': fluid_opportunities['annual_benefit'].sum()
+                                }, {
+                                    'metric': 'Total Trucks Saved Per Day',
+                                    'value': fluid_opportunities['trucks_saved'].sum()
+                                }, {
+                                    'metric': 'Avg Savings Per Arc',
+                                    'value': fluid_opportunities['net_benefit_daily'].mean()
+                                }])
+
+                                fluid_summary.to_excel(
+                                    writer,
+                                    sheet_name='summary',
+                                    index=False
+                                )
+
+                            print(f"\n  Saved fluid opportunities to: fluid_opportunities_{scenario_id}.xlsx")
                             print(f"    ({len(fluid_opportunities)} arcs analyzed)")
                             created_files.append(f"fluid_opportunities_{scenario_id}.xlsx")
                         except Exception as e:
-                            print(f"  WARNING:  Could not save fluid opportunities: {e}")
+                            print(f"  WARNING: Could not save fluid opportunities - {e}")
                     else:
-                        print("  ✓ All arcs optimally utilized - no fluid opportunities found")
+                        print("All arcs optimally utilized - no fluid opportunities found")
 
             except Exception as e:
                 print(f"  WARNING:  Fluid load analysis failed: {e}")
