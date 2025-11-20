@@ -149,7 +149,6 @@ def main(input_path: str, output_dir: str):
 
     print("=" * 70)
     print("VEHO NETWORK OPTIMIZATION")
-    print("Network Flows & Capacity Analysis")
     print("=" * 70)
 
     input_path = Path(input_path)
@@ -233,14 +232,11 @@ def main(input_path: str, output_dir: str):
         run_id = generate_run_id(dfs["scenarios"])
         print(f"\n✓ Auto-generated run_id: {run_id}")
 
-    print(f"\n✓ Configuration:")
-    print(f"  - Global strategy: {global_strategy.value}")
-    print(f"  - Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
-    print(f"  - Container flow correction: ENABLED")
-    print(f"  - Zone tracking: 0-8 + Unknown")
-    print(f"  - Zone miles validation: ENABLED")
-    print(f"  - Path around factor: {around_factor}")
-    print(f"  - Run ID: {run_id}")
+    print(f"\nConfiguration:")
+    print(f"  Strategy: {global_strategy.value}")
+    print(f"  Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
+    print(f"  Path around factor: {around_factor}")
+    print(f"  Run ID: {run_id}")
 
     all_results = []
     created_files = []
@@ -255,7 +251,7 @@ def main(input_path: str, output_dir: str):
         year = int(scenario_row["year"])
         day_type = str(scenario_row["day_type"]).strip().lower()
 
-        print(f"\n{'─' * 70}")
+        print(f"\n{'-' * 70}")
         print(f"SCENARIO {scenario_idx + 1}/{len(dfs['scenarios'])}: {scenario_id}")
         print(f"  Year: {year}, Day Type: {day_type}")
 
@@ -265,7 +261,7 @@ def main(input_path: str, output_dir: str):
         else:
             print(f"  Capacity: Using facilities defaults")
 
-        print("─" * 70)
+        print("-" * 70)
 
         is_valid, error_msg = validate_scenario_data(scenario_row, dfs)
         if not is_valid:
@@ -337,10 +333,10 @@ def main(input_path: str, output_dir: str):
             print(f"  ✓ Generated {len(paths)} candidate paths")
 
             if enable_sort_opt:
-                print(f"\n{'─' * 70}")
+                print(f"\n{'-' * 70}")
                 print(" RUNNING BASELINE COMPARISON")
                 print("   (Market Sort vs. Optimized Sort Level)")
-                print("─" * 70)
+                print("-" * 70)
 
                 try:
                     comparison_summary, detailed_comparison, facility_comparison, optimized_results = (
@@ -367,7 +363,7 @@ def main(input_path: str, output_dir: str):
                             if not facility_comparison.empty:
                                 facility_comparison.to_excel(writer, sheet_name='facility_comparison', index=False)
 
-                        print(f"\n  ✓ Saved comparison to: {comp_output.name}")
+                        print(f"\n  Saved: {comp_output.name}")
                         created_files.append(comp_output.name)
 
                         print("\n" + create_comparison_summary_report(
@@ -375,16 +371,12 @@ def main(input_path: str, output_dir: str):
                         ))
 
                     if optimized_results is not None:
-                        print(f"\n{'─' * 70}")
-                        print("✓ USING OPTIMIZED RESULTS FROM COMPARISON")
-                        print("─" * 70)
+                        print(f"\nUsing optimized results from comparison")
 
                         od_selected, arc_summary_original, network_kpis, sort_summary = optimized_results
 
                     else:
-                        print(f"\n{'─' * 70}")
-                        print("WARNING:  Comparison didn't return results, solving again...")
-                        print("─" * 70)
+                        print(f"\nWARNING: Comparison didn't return results, solving again...")
                         print("\n3. Running MILP optimization...")
 
                         od_selected, arc_summary_original, network_kpis, sort_summary = (
@@ -409,7 +401,7 @@ def main(input_path: str, output_dir: str):
 
                     print(f"\n{'─' * 70}")
                     print("Running optimization without comparison...")
-                    print("─" * 70)
+                    print("-" * 70)
                     print("\n3. Running MILP optimization...")
 
                     od_selected, arc_summary_original, network_kpis, sort_summary = (
@@ -845,20 +837,14 @@ def main(input_path: str, output_dir: str):
     print("=" * 70)
     print(f"Elapsed time: {elapsed}")
     print(f"Processed: {len(all_results)} scenarios")
-    print(f"Created files: {len(created_files)}")
-    print(f"Container flow correction: APPLIED")
-    print(f"Zone tracking: 0 (DI) + 1-8 + Unknown")
-    print(f"Zone miles validation: ADDED")
-    print(f"Fluid analysis: Per-scenario (arc-based)")
-    print(f"Scenario capacity override: SUPPORTED")
-    print(f"Smart run_id generation: ENABLED")
+    print(f"Created: {len(created_files)} output files")
 
     if created_files:
         print(f"\nOutput files in {output_dir}:")
         for filename in sorted(created_files):
             print(f"  📄 {filename}")
 
-    print("\n" + "=" * 70)
+    print("=" * 70)
 
     return 0
 
