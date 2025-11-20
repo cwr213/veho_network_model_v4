@@ -602,19 +602,12 @@ def main(input_path: str, output_dir: str):
                     od_selected,
                     dfs["facilities"]
                 )
-                zone_distribution = calculate_network_zone_distribution(od_selected, direct_day)
 
-                sort_distribution = {}
-                if enable_sort_opt and not sort_summary.empty:
-                    sort_distribution = calculate_network_sort_distribution(od_selected)
-
-                print("  ✓ Network metrics calculated")
+                print("  Network metrics calculated")
             except Exception as e:
-                print(f"  WARNING:  Network metrics calculation failed: {e}")
+                print(f"  WARNING: Network metrics calculation failed - {e}")
                 distance_metrics = {}
                 touch_metrics = {}
-                zone_distribution = {}
-                sort_distribution = {}
 
             try:
                 validation_results = validate_network_aggregations(
@@ -649,9 +642,7 @@ def main(input_path: str, output_dir: str):
                 "num_ods": len(od_selected),
                 **network_kpis,
                 **distance_metrics,
-                **touch_metrics,
-                **zone_distribution,
-                **sort_distribution
+                **touch_metrics
             })
 
             scenario_summary = pd.DataFrame([

@@ -627,7 +627,8 @@ def calculate_network_zone_distribution(
     """
     Calculate network-level zone distribution.
 
-    SIMPLIFIED v4.7: Uses integer zones directly.
+    NOTE: Used for comparison workbooks only, not in scenario KPIs.
+    For facility-level zone detail, see facility_network_profile.
 
     Includes:
     - Zone 0: Direct injection (from direct_day)
@@ -694,7 +695,12 @@ def calculate_network_zone_distribution(
 
 
 def calculate_network_sort_distribution(od_selected: pd.DataFrame) -> Dict:
-    """Calculate network-level sort level distribution."""
+    """
+    Calculate network-level sort level distribution.
+
+    NOTE: Used for comparison workbooks only, not in scenario KPIs.
+    For OD-level sort detail, see sort_analysis sheet.
+    """
     result = {
         'region_sort_pkgs': 0,
         'region_sort_pct_pkgs': 0.0,
