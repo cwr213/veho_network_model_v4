@@ -52,9 +52,9 @@ def solve_network_optimization(
         mileage_bands: pd.DataFrame,
         package_mix: pd.DataFrame,
         container_params: pd.DataFrame,
-        cost_params: Union[CostParameters, Dict],
-        timing_params: Union[TimingParameters, Dict],
-        global_strategy: Union[LoadStrategy, str],
+        cost_params: CostParameters,
+        timing_params: Dict,
+        global_strategy: LoadStrategy,
         enable_sort_optimization: bool,
         scenario_row: pd.Series = None
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float], Optional[pd.DataFrame]]:
@@ -67,9 +67,6 @@ def solve_network_optimization(
 
     ALL PARAMETERS COME FROM INPUT FILE - NO HARDCODING.
     """
-    cost_params = _ensure_cost_parameters(cost_params)
-    timing_params = _ensure_timing_parameters(timing_params)
-    global_strategy = _ensure_load_strategy(global_strategy)
 
     cand = candidates.reset_index(drop=True).copy()
 
@@ -496,46 +493,6 @@ def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
         })
 
     return pd.DataFrame(data)
-
-
-def _ensure_cost_parameters(cp) -> CostParameters:
-    """Convert to CostParameters if dict."""
-    if isinstance(cp, CostParameters):
-        return cp
-    return CostParameters(
-        injection_sort_cost_per_pkg=float(cp.get('injection_sort_cost_per_pkg', 0)),
-        intermediate_sort_cost_per_pkg=float(cp.get('intermediate_sort_cost_per_pkg', 0)),
-        last_mile_sort_cost_per_pkg=float(cp.get('last_mile_sort_cost_per_pkg', 0)),
-        last_mile_delivery_cost_per_pkg=float(cp.get('last_mile_delivery_cost_per_pkg', 0)),
-        container_handling_cost=float(cp.get('container_handling_cost', 0)),
-        premium_economy_dwell_threshold=float(cp.get('premium_economy_dwell_threshold', 0.1)),
-        dwell_cost_per_pkg_per_day=float(cp.get('dwell_cost_per_pkg_per_day', 0)),
-        sla_penalty_per_touch_per_pkg=float(cp.get('sla_penalty_per_touch_per_pkg', 0))
-    )
-
-
-def _ensure_timing_parameters(tp) -> TimingParameters:
-    """Convert to TimingParameters if dict."""
-    if isinstance(tp, TimingParameters):
-        return tp
-    return TimingParameters(
-        hours_per_touch=float(tp.get('hours_per_touch', 8)),
-        load_hours=float(tp.get('load_hours', 2)),
-        unload_hours=float(tp.get('unload_hours', 2)),
-        injection_va_hours=float(tp.get('injection_va_hours', 8)),
-        middle_mile_va_hours=float(tp.get('middle_mile_va_hours', 16)),
-        crossdock_va_hours=float(tp.get('crossdock_va_hours', 3)),
-        last_mile_va_hours=float(tp.get('last_mile_va_hours', 4)),
-        sort_points_per_destination=float(tp.get('sort_points_per_destination', 1))
-    )
-
-
-def _ensure_load_strategy(gs) -> LoadStrategy:
-    """Convert to LoadStrategy if string."""
-    if isinstance(gs, LoadStrategy):
-        return gs
-    return LoadStrategy.CONTAINER if str(gs).lower() == 'container' else LoadStrategy.FLUID
-
 
 def _create_sort_decision_variables(model, groups, cand, facilities, timing_params):
     """Create sort level decision variables."""
