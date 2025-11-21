@@ -100,7 +100,7 @@ def calculate_truck_capacity(
     Args:
         package_mix: Package distribution
         container_params: Container/trailer parameters
-        strategy: 'container' or 'fluid'
+        strategy: 'container' or 'fluid' (fluid used for opportunity analysis)
 
     Returns:
         Effective packages per truck capacity
@@ -162,7 +162,7 @@ def calculate_trucks_and_fill_rates(
         total_packages: Package volume
         package_mix: Package distribution
         container_params: Container/trailer parameters
-        strategy: 'container' or 'fluid'
+        strategy: 'container' or 'fluid' (fluid used for opportunity analysis)
         dwell_threshold: Fractional truck threshold for rounding decision
 
     Returns:

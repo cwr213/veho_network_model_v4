@@ -2,7 +2,8 @@
 MILP Network Optimization Module
 
 Solves minimum-cost network configuration using arc-pooled Mixed Integer Linear Programming.
-Supports container and fluid loading strategies with optional sort level optimization.
+Uses container loading strategy as baseline with optional sort level optimization.
+Fluid load opportunities are identified post-optimization via separate analysis.
 
 Key Features:
 - Arc-pooled formulation for computational efficiency

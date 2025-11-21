@@ -202,7 +202,6 @@ def main(input_path: str, output_dir: str):
             container_handling_cost=float(cost_params_dict["container_handling_cost"]),
             premium_economy_dwell_threshold=float(cost_params_dict["premium_economy_dwell_threshold"]),
             dwell_cost_per_pkg_per_day=float(cost_params_dict["dwell_cost_per_pkg_per_day"]),
-            sla_penalty_per_touch_per_pkg=float(cost_params_dict["sla_penalty_per_touch_per_pkg"])
         )
         print("✓ Cost parameters created")
     except Exception as e:
@@ -210,16 +209,9 @@ def main(input_path: str, output_dir: str):
         print(f"   Error: {e}")
         return 1
 
-    try:
-        global_strategy = (
-            LoadStrategy.CONTAINER
-            if str(run_settings_dict["load_strategy"]).lower() == "container"
-            else LoadStrategy.FLUID
-        )
-    except Exception as e:
-        print(f"\n ERROR FATAL: Invalid load_strategy in run_settings")
-        print(f"   Error: {e}")
-        return 1
+        # Always use container strategy as baseline
+        # Fluid opportunities are identified post-optimization via fluid_load_analysis
+        global_strategy = LoadStrategy.CONTAINER
 
     enable_sort_opt = bool(run_settings_dict.get("enable_sort_optimization", False))
     around_factor = float(run_settings_dict.get("path_around_the_world_factor", 1.3))
@@ -233,7 +225,7 @@ def main(input_path: str, output_dir: str):
         print(f"\n✓ Auto-generated run_id: {run_id}")
 
     print(f"\nConfiguration:")
-    print(f"  Strategy: {global_strategy.value}")
+    print(f"  Strategy: Container (fluid opportunities analyzed post-optimization)")
     print(f"  Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
     print(f"  Path around factor: {around_factor}")
     print(f"  Run ID: {run_id}")

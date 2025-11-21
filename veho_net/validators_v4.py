@@ -379,9 +379,6 @@ def _validate_timing_params(df: pd.DataFrame) -> None:
     Enhanced validation includes crossdock_va_hours for sort vs. crossdock distinction.
     """
     required_keys = {
-        "hours_per_touch",
-        "load_hours",
-        "unload_hours",
         "injection_va_hours",
         "middle_mile_va_hours",
         "crossdock_va_hours",
@@ -510,10 +507,13 @@ def _validate_package_mix(df: pd.DataFrame) -> None:
 
 
 def _validate_run_settings(df: pd.DataFrame) -> None:
-    """Validate run settings parameters."""
+    """
+    Validate run settings parameters.
+
+    Note: load_strategy parameter removed - model always uses container baseline
+    with fluid opportunities identified via post-optimization analysis.
+    """
     required_keys = {
-        "load_strategy",
-        "sla_target_days",
         "path_around_the_world_factor",
         "enable_sort_optimization"
     }
@@ -524,14 +524,6 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
             f"run_settings missing REQUIRED keys: {sorted(missing)}\n"
             f"All run settings must be specified."
         )
-
-    strategy_row = df[df["key"] == "load_strategy"]
-    if not strategy_row.empty:
-        strategy_val = str(strategy_row.iloc[0]["value"]).lower()
-        if strategy_val not in ["container", "fluid"]:
-            raise ValueError(
-                f"load_strategy must be 'container' or 'fluid' (found: {strategy_val})"
-            )
 
     around_row = df[df["key"] == "path_around_the_world_factor"]
     if not around_row.empty:

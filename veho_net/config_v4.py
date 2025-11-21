@@ -136,7 +136,6 @@ class CostParameters:
     container_handling_cost: float
     premium_economy_dwell_threshold: float
     dwell_cost_per_pkg_per_day: float
-    sla_penalty_per_touch_per_pkg: float
 
     def __post_init__(self):
         """Validate all costs are non-negative."""
