@@ -42,8 +42,8 @@ class OptimizationConstants:
     CUBE_SCALE_FACTOR: int = 1000  # Scale cube values by 1000x for integer arithmetic
     COST_SCALE_FACTOR: int = 1  # Keep costs at original scale
 
-    # Fallback values
-    DEFAULT_SORT_GROUPS: int = 4  # Conservative fallback when data missing
+    # Default strategy settings
+    DEFAULT_SORT_LEVEL: str = 'market'  # Baseline sort level when optimization disabled
 
 
 class ValidationTolerances:
