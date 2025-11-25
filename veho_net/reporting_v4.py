@@ -922,46 +922,7 @@ def build_path_steps(
     return pd.DataFrame(path_steps)
 
 
-def build_sort_summary(
-        selected_paths: pd.DataFrame,
-        sort_decisions: Dict,
-        facilities: pd.DataFrame
-) -> pd.DataFrame:
-    """Build sort decision summary."""
-    summary_data = []
-
-    fac_lookup = get_facility_lookup(facilities)
-
-    for _, od_row in selected_paths.iterrows():
-        group_key = (od_row['scenario_id'], od_row['origin'],
-                     od_row['dest'], od_row['day_type'])
-        chosen_sort_level = sort_decisions.get(group_key, 'market')
-
-        origin_region_hub = ''
-        dest_region_hub = ''
-
-        if od_row['origin'] in fac_lookup.index:
-            origin_region_hub = fac_lookup.at[od_row['origin'], 'regional_sort_hub']
-            if pd.isna(origin_region_hub):
-                origin_region_hub = od_row['origin']
-
-        if od_row['dest'] in fac_lookup.index:
-            dest_region_hub = fac_lookup.at[od_row['dest'], 'regional_sort_hub']
-            if pd.isna(dest_region_hub):
-                dest_region_hub = od_row['dest']
-
-        summary_data.append({
-            'origin': od_row['origin'],
-            'origin_region_hub': origin_region_hub,
-            'dest': od_row['dest'],
-            'dest_region_hub': dest_region_hub,
-            'pkgs_day': od_row['pkgs_day'],
-            'chosen_sort_level': chosen_sort_level,
-            'total_cost': od_row['total_cost'],
-            'processing_cost': od_row['processing_cost']
-        })
-
-    return pd.DataFrame(summary_data)
+# build_sort_summary removed - use _build_sort_summary from milp_v4.py instead
 
 
 def validate_network_aggregations(

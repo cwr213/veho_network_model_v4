@@ -34,7 +34,6 @@ from veho_net.reporting_v4 import (
     add_direct_injection_zone_classification,
     add_zone_miles_to_od_selected,
     build_path_steps,
-    build_sort_summary,
     validate_network_aggregations
 )
 from veho_net.write_outputs_v4 import (
@@ -665,19 +664,7 @@ def main(input_path: str, output_dir: str):
             )
             output_path = output_dir / output_filename
 
-            if enable_sort_opt and not sort_summary.empty:
-                try:
-                    sort_analysis = build_sort_summary(
-                        od_selected,
-                        {(row['scenario_id'], row['origin'], row['dest'], row['day_type']): row['chosen_sort_level']
-                         for _, row in od_selected.iterrows()},
-                        dfs["facilities"]
-                    )
-                except Exception as e:
-                    print(f"  WARNING:  Sort analysis build failed: {e}")
-                    sort_analysis = sort_summary
-            else:
-                sort_analysis = sort_summary
+            sort_analysis = sort_summary
 
             try:
                 write_success = write_workbook(
