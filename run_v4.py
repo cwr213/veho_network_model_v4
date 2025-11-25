@@ -765,6 +765,8 @@ def main(input_path: str, output_dir: str):
                 if missing_cols:
                     print(f"  WARNING:  Skipping fluid analysis - missing columns: {missing_cols}")
                 else:
+                    fluid_fill_threshold = float(run_settings_dict.get("fluid_opportunity_fill_threshold", 0.75))
+
                     fluid_opportunities = analyze_fluid_load_opportunities(
                         od_selected=od_selected,
                         arc_summary=arc_summary,
@@ -772,7 +774,8 @@ def main(input_path: str, output_dir: str):
                         package_mix=dfs["package_mix"],
                         container_params=dfs["container_params"],
                         mileage_bands=dfs["mileage_bands"],
-                        cost_params=cost_params
+                        cost_params=cost_params,
+                        fluid_fill_threshold=fluid_fill_threshold
                     )
 
                     if not fluid_opportunities.empty:

@@ -516,7 +516,8 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
     """
     required_keys = {
         "path_around_the_world_factor",
-        "enable_sort_optimization"
+        "enable_sort_optimization",
+        "fluid_opportunity_fill_threshold"
     }
 
     missing = required_keys - set(df["key"])

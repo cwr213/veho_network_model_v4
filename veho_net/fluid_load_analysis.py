@@ -24,7 +24,8 @@ def analyze_fluid_load_opportunities(
         package_mix: pd.DataFrame,
         container_params: pd.DataFrame,
         mileage_bands: pd.DataFrame,
-        cost_params: CostParameters
+        cost_params: CostParameters,
+        fluid_fill_threshold: float
 ) -> pd.DataFrame:
     """
     Identify planned arcs where fluid loading would be more economical.
@@ -77,7 +78,7 @@ def analyze_fluid_load_opportunities(
 
         # Only consider arcs with low fill rates (opportunity for improvement)
         current_fill = arc.get('truck_fill_rate', 0)
-        if current_fill >= PerformanceThresholds.FLUID_OPPORTUNITY_FILL_THRESHOLD:
+        if current_fill >= fluid_fill_threshold:
             continue
 
         # Current state
