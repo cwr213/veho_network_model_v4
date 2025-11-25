@@ -74,8 +74,6 @@ def calculate_zone_cost_analysis(
         direct_col = 'dir_pkgs_day'
         if direct_col in direct_day.columns:
             total_network_pkgs += direct_day[direct_col].sum()
-            # Note: Direct injection has no transport cost, only last-mile delivery
-            # which is not included in this cost analysis
 
     # Process Zone 0: Direct Injection (if data provided)
     if direct_day is not None and not direct_day.empty:
@@ -89,24 +87,24 @@ def calculate_zone_cost_analysis(
                     'zone_number': 0,
                     'total_packages': int(direct_pkgs),
                     'pct_of_total_packages': round(safe_divide(direct_pkgs, total_network_pkgs), 4),
-                    'total_cost': 0.0,  # No middle-mile cost for direct injection
+                    'total_cost': 0.0,
                     'pct_of_total_cost': 0.0,
                     'cost_per_pkg': 0.0,
                     'linehaul_cost_per_pkg': 0.0,
                     'processing_cost_per_pkg': 0.0,
-                    'avg_zone_miles': 0.0,  # No transport
+                    'avg_zone_miles': 0.0,
                     'avg_transit_miles': 0.0,
                     'circuity_factor': 0.0,
-                    'avg_total_touches': 1.0,  # Destination only
-                    'avg_hub_touches': 0.0,  # No hubs touched
+                    'avg_total_touches': 1.0,
+                    'avg_hub_touches': 0.0,
                     'cost_per_mile': 0.0,
                 })
 
-        # Process Zones 1-8 from middle mile flows
-        if not od_selected.empty:
-            for zone_num in range(1, 9):
-                zone_mask = od_selected['zone'] == zone_num
-                zone_ods = od_selected[zone_mask].copy()
+    # Process Zones 1-8 from middle mile flows
+    if not od_selected.empty:
+        for zone_num in range(1, 9):
+            zone_mask = od_selected['zone'] == zone_num
+            zone_ods = od_selected[zone_mask].copy()
 
             if zone_ods.empty:
                 continue
@@ -263,7 +261,7 @@ def calculate_zone_cost_analysis(
 
             zone_analysis.append({
                 'zone': 'Unknown',
-                'zone_number': 999,  # Sort last
+                'zone_number': 999,
                 'total_packages': int(total_pkgs),
                 'pct_of_total_packages': round(pct_pkgs, 4),
                 'total_cost': round(total_cost, 2),
