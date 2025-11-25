@@ -472,7 +472,8 @@ def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
 
         total_cost = transport_cost + proc_cost_total
 
-        nodes = path_data.get('path_nodes', [path_data['origin'], path_data['dest']])
+        # path_nodes guaranteed to be list from candidate_paths() generation
+        nodes = path_data['path_nodes']
 
         data.append({
             'scenario_id': path_data['scenario_id'],

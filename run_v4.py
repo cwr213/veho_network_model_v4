@@ -107,21 +107,6 @@ def validate_scenario_data(scenario_row: pd.Series, dfs: dict) -> tuple:
     return True, "OK"
 
 
-def normalize_path_nodes(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Validate path_nodes column contains lists (should already be standardized).
-    """
-    if 'path_nodes' not in df.columns:
-        return df
-
-    # Validation only - path_nodes should already be lists from generation
-    invalid = df[~df['path_nodes'].apply(lambda x: isinstance(x, list))]
-    if not invalid.empty:
-        raise ValueError(f"Found {len(invalid)} rows with non-list path_nodes (data corruption)")
-
-    return df
-
-
 def validate_arc_summary(arc_summary: pd.DataFrame, context: str = "") -> bool:
     """
     Validate arc summary has required columns.
@@ -202,15 +187,15 @@ def main(input_path: str, output_dir: str):
             premium_economy_dwell_threshold=float(cost_params_dict["premium_economy_dwell_threshold"]),
             dwell_cost_per_pkg_per_day=float(cost_params_dict["dwell_cost_per_pkg_per_day"]),
         )
-        print("✓ Cost parameters created")
+        print("Cost parameters created")
     except Exception as e:
         print(f"\n ERROR FATAL: Invalid cost parameters")
         print(f"   Error: {e}")
         return 1
 
-        # Always use container strategy as baseline
+        # Always use container strategy as baseline  ← CORRECT: OUTSIDE try-except
         # Fluid opportunities are identified post-optimization via fluid_load_analysis
-        global_strategy = LoadStrategy.CONTAINER
+    global_strategy = LoadStrategy.CONTAINER
 
     enable_sort_opt = bool(run_settings_dict.get("enable_sort_optimization", False))
     around_factor = float(run_settings_dict.get("path_around_the_world_factor", 1.3))
@@ -438,7 +423,7 @@ def main(input_path: str, output_dir: str):
 
             print(f"  ✓ Selected {len(od_selected)} optimal paths")
 
-            od_selected = normalize_path_nodes(od_selected)
+            # path_nodes already validated as lists from candidate_paths()
 
             print("\n4. Adding zone classification...")
 

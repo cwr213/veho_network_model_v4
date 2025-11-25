@@ -295,7 +295,7 @@ def candidate_paths(
         print(f"  Removed {removed_count} invalid paths (launch facility violations)")
 
     # Remove duplicate paths
-    df = df.drop_duplicates(subset=["origin", "dest", "path_nodes"]).reset_index(drop=True)
+    df = df.drop_duplicates(subset=["origin", "dest", "path_str"]).reset_index(drop=True)
 
     return df
 
