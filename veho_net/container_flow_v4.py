@@ -227,17 +227,7 @@ def recalculate_arc_summary_with_container_flow(
         od_selected, package_mix, container_params, facilities
     )
 
-    # CRITICAL FIX: Parse path_nodes from path_str if corrupted
-    print("    Validating path_nodes for arc aggregation...")
-    nodes_fixed = 0
-    for idx, row in od_with_containers.iterrows():
-        nodes = extract_path_nodes(row)
-        if len(nodes) != len(row.get('path_nodes', [])):
-            od_with_containers.at[idx, 'path_nodes'] = nodes
-            nodes_fixed += 1
-
-    if nodes_fixed > 0:
-        print(f"    Fixed {nodes_fixed} path_nodes entries from path_str")
+    # Path nodes validated as lists during generation
 
     # Get facility coordinates for distance calculations
     fac = facilities.set_index('facility_name')[['lat', 'lon']].astype(float)

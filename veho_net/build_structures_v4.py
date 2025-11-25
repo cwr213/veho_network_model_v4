@@ -265,7 +265,7 @@ def candidate_paths(
                 "origin": origin,
                 "dest": dest,
                 "path_type": path_type,
-                "path_nodes": tuple(path_nodes),
+                "path_nodes": list(path_nodes),
                 "path_str": "->".join(path_nodes),
                 "strategy_hint": None
             })

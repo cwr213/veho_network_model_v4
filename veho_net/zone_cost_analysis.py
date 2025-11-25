@@ -162,9 +162,6 @@ def calculate_zone_cost_analysis(
                 pkgs = row['pkgs_day']
                 path_nodes = row.get('path_nodes', [row['origin'], row['dest']])
 
-                if not isinstance(path_nodes, (list, tuple)):
-                    path_nodes = [row['origin'], row['dest']]
-
                 # Total touches
                 total_touches = len(path_nodes)
                 touch_weighted.extend([total_touches] * int(pkgs))
@@ -247,8 +244,6 @@ def calculate_zone_cost_analysis(
 
                 # Touches
                 path_nodes = row.get('path_nodes', [row['origin'], row['dest']])
-                if not isinstance(path_nodes, (list, tuple)):
-                    path_nodes = [row['origin'], row['dest']]
 
                 total_touches = len(path_nodes)
                 touch_weighted.extend([total_touches] * int(pkgs))
@@ -302,12 +297,6 @@ def _calculate_path_transit_miles(
 ) -> float:
     """Calculate total transit miles for a path (sum of all arcs)."""
     path_nodes = od_row.get('path_nodes', [od_row['origin'], od_row['dest']])
-
-    if not isinstance(path_nodes, (list, tuple)):
-        path_nodes = [od_row['origin'], od_row['dest']]
-
-    if isinstance(path_nodes, tuple):
-        path_nodes = list(path_nodes)
 
     total_miles = 0.0
 

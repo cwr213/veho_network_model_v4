@@ -118,9 +118,6 @@ def build_facility_volume(
                     if not isinstance(path_nodes, (list, tuple)):
                         continue
 
-                    if isinstance(path_nodes, tuple):
-                        path_nodes = list(path_nodes)
-
                     final_dest = path_row['dest']
                     path_strategy = path_row.get('effective_strategy', strategy)
                     chosen_sort_level = path_row.get('chosen_sort_level', 'market')
@@ -453,8 +450,6 @@ def _calculate_touch_metrics_for_ods(
 
     for _, od_row in ods.iterrows():
         path_nodes = od_row.get('path_nodes', [od_row['origin'], od_row['dest']])
-        if not isinstance(path_nodes, list):
-            path_nodes = [od_row['origin'], od_row['dest']]
 
         pkgs = od_row['pkgs_day']
 

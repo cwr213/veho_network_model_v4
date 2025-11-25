@@ -110,16 +110,16 @@ def validate_scenario_data(scenario_row: pd.Series, dfs: dict) -> tuple:
 
 def normalize_path_nodes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure path_nodes column contains lists (not tuples) for downstream processing.
+    Validate path_nodes column contains lists (should already be standardized).
     """
     if 'path_nodes' not in df.columns:
         return df
 
-    df = df.copy()
-    df['path_nodes'] = df['path_nodes'].apply(
-        lambda x: list(x) if isinstance(x, tuple) else
-        (x if isinstance(x, list) else [])
-    )
+    # Validation only - path_nodes should already be lists from generation
+    invalid = df[~df['path_nodes'].apply(lambda x: isinstance(x, list))]
+    if not invalid.empty:
+        raise ValueError(f"Found {len(invalid)} rows with non-list path_nodes (data corruption)")
+
     return df
 
 
