@@ -102,12 +102,11 @@ def calculate_zone_cost_analysis(
                     'cost_per_mile': 0.0,
                 })
 
-    # Process Zones 1-8 from middle-mile flows
-    if not od_selected.empty:
-        for zone_num in range(1, 9):
-            zone_str = str(zone_num)
-            zone_mask = od_selected['zone'].astype(str).str.strip() == zone_str
-            zone_ods = od_selected[zone_mask].copy()
+        # Process Zones 1-8 from middle mile flows
+        if not od_selected.empty:
+            for zone_num in range(1, 9):
+                zone_mask = od_selected['zone'] == zone_num
+                zone_ods = od_selected[zone_mask].copy()
 
             if zone_ods.empty:
                 continue
@@ -203,7 +202,7 @@ def calculate_zone_cost_analysis(
             })
 
         # Process Unknown Zone (data quality flag)
-        unknown_mask = od_selected['zone'].astype(str).str.strip() == 'unknown'
+        unknown_mask = od_selected['zone'] == -1
         unknown_ods = od_selected[unknown_mask].copy()
 
         if not unknown_ods.empty:
