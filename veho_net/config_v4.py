@@ -70,6 +70,9 @@ class PerformanceThresholds:
 
     LOW_CONTAINER_FILL_THRESHOLD: float = 0.60  # Warn if container fill < 60%
 
+    # Analysis thresholds
+    FLUID_OPPORTUNITY_FILL_THRESHOLD: float = 0.75  # Only analyze arcs below this fill rate
+
     # Capacity warnings
     SORT_CAPACITY_WARNING_THRESHOLD: float = 0.85  # Warn at 85% of max capacity
     SORT_CAPACITY_CRITICAL_THRESHOLD: float = 0.95  # Critical at 95% of max capacity

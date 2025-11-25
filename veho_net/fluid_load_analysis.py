@@ -14,7 +14,7 @@ from .containers_v4 import (
     get_raw_trailer_cube
 )
 from .utils import safe_divide, get_facility_lookup
-from .config_v4 import CostParameters
+from .config_v4 import CostParameters, PerformanceThresholds
 
 
 def analyze_fluid_load_opportunities(
@@ -77,7 +77,7 @@ def analyze_fluid_load_opportunities(
 
         # Only consider arcs with low fill rates (opportunity for improvement)
         current_fill = arc.get('truck_fill_rate', 0)
-        if current_fill >= 0.75:  # Already well-utilized
+        if current_fill >= PerformanceThresholds.FLUID_OPPORTUNITY_FILL_THRESHOLD:
             continue
 
         # Current state
