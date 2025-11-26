@@ -47,6 +47,350 @@ def safe_int_cost(value: float, context: str = "") -> int:
         )
     return int_val
 
+
+def _build_arc_structures(cand, facilities, mileage_bands, path_keys):
+    """Build arc-pooling data structures with ROBUST path_nodes handling."""
+    arc_index_map = {}
+    arc_meta = []
+    path_arcs = {}
+    path_od_data = {}
+
+    for i in path_keys:
+        r = cand.loc[i]
+
+        nodes = extract_path_nodes(r)
+
+        legs = []
+        for u, v in zip(nodes[:-1], nodes[1:]):
+            legs.append(_calc_arc(u, v, facilities, mileage_bands))
+
+        path_od_data[i] = {
+            'origin': r["origin"],
+            'dest': r["dest"],
+            'pkgs_day': float(r["pkgs_day"]),
+            'scenario_id': r.get("scenario_id", "default"),
+            'day_type': r.get("day_type", "peak"),
+            'path_str': r.get("path_str", "->".join(nodes)),
+            'path_type': r.get("path_type", "direct"),
+            'path_nodes': nodes,
+            'effective_strategy': r.get("strategy_hint") or "container"
+        }
+
+        arc_ids = []
+        for (u, v, dist, cost, mph) in legs:
+            key = (u, v)
+            if key not in arc_index_map:
+                arc_index_map[key] = len(arc_meta)
+                arc_meta.append({
+                    "from": u, "to": v,
+                    "distance_miles": dist,
+                    "cost_per_truck": cost,
+                    "mph": mph
+                })
+            arc_ids.append(arc_index_map[key])
+
+        path_arcs[i] = arc_ids
+
+    return arc_index_map, arc_meta, path_arcs, path_od_data
+
+
+def _calc_arc(u, v, facilities, mileage_bands):
+    """Calculate arc metrics from mileage_bands."""
+    fac = facilities.set_index("facility_name")[["lat", "lon"]].astype(float)
+
+    lat1, lon1 = fac.at[u, "lat"], fac.at[u, "lon"]
+    lat2, lon2 = fac.at[v, "lat"], fac.at[v, "lon"]
+
+    raw = haversine_miles(lat1, lon1, lat2, lon2)
+
+    if u == v:
+        return (u, v, 0.0, 0.0, 0.0)
+
+    fixed, var, circuit, mph = band_lookup(raw, mileage_bands)
+    dist = raw * circuit
+
+    return (u, v, dist, fixed + var * dist, mph)
+
+
+def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
+                               facilities, package_mix, container_params):
+    """
+    Calculate per-package processing cost.
+
+    FIXED v4.10: Correct intermediate sort vs. crossdock logic
+    - Region sort ALWAYS requires full intermediate sort at regional hub
+    - Market/sort_group use crossdock/container handling (already sorted)
+    - ALL COSTS FROM cost_params INPUT FILE
+
+    FIXED v4.8: Container handling now uses containers_per_package fraction
+    instead of always charging for 1 full container per package.
+    """
+    nodes = path_data['path_nodes']
+    origin = path_data['origin']
+    dest = path_data['dest']
+
+    cost = cost_params.injection_sort_cost_per_pkg
+
+    if origin == dest:
+        cost += cost_params.last_mile_sort_cost_per_pkg
+        cost += cost_params.last_mile_delivery_cost_per_pkg
+        return cost
+
+    intermediates = nodes[1:-1] if len(nodes) > 2 else []
+
+    if intermediates:
+        containers_per_package = calculate_containers_per_package(
+            package_mix, container_params
+        )
+
+        if sort_level == 'region':
+            cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+
+        elif sort_level == 'sort_group':
+            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+
+        elif sort_level == 'market':
+            if strategy.lower() == 'container':
+                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+            else:
+                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+
+        else:
+            if strategy.lower() == 'container':
+                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+            else:
+                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+
+    if sort_level != 'sort_group':
+        cost += cost_params.last_mile_sort_cost_per_pkg
+
+    cost += cost_params.last_mile_delivery_cost_per_pkg
+
+    return cost
+
+
+def _create_sort_decision_variables(model, groups, cand, facilities, timing_params):
+    """Create sort level decision variables."""
+    sort_decision = {}
+    fac_lookup = get_facility_lookup(facilities)
+
+    for group_name in groups.keys():
+        scenario_id, origin, dest, day_type = group_name
+
+        valid_levels = _get_valid_sort_levels(origin, dest, fac_lookup)
+
+        group_vars = {}
+        for level in ['region', 'market', 'sort_group']:
+            if level in valid_levels:
+                group_vars[level] = model.NewBoolVar(
+                    f"sort_{scenario_id}_{origin}_{dest}_{day_type}_{level}"
+                )
+            else:
+                group_vars[level] = None
+
+        sort_decision[group_name] = group_vars
+
+        valid_vars = [v for v in group_vars.values() if v is not None]
+        if valid_vars:
+            model.Add(sum(valid_vars) == 1)
+
+    return sort_decision
+
+
+def _get_valid_sort_levels(origin, dest, fac_lookup):
+    """Determine valid sort levels for OD pair."""
+    if origin == dest:
+        return ['sort_group']
+
+    regional_hub_map = {}
+    for facility in fac_lookup.index:
+        hub = fac_lookup.at[facility, 'regional_sort_hub']
+        if pd.isna(hub) or hub == "":
+            hub = facility
+        regional_hub_map[facility] = hub
+
+    dest_hub = regional_hub_map.get(dest, dest)
+
+    if origin == dest_hub:
+        return ['market', 'sort_group']
+
+    return ['region', 'market', 'sort_group']
+
+
+def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
+                                   facilities, timing_params, cand, scenario_row=None):
+    """Enforce sort capacity limits with proper point counting."""
+    from .utils import get_facility_lookup
+    from .config_v4 import OptimizationConstants
+
+    fac_lookup = get_facility_lookup(facilities)
+
+    if hasattr(timing_params, 'sort_points_per_destination'):
+        sort_points_per_dest = float(timing_params.sort_points_per_destination)
+    else:
+        sort_points_per_dest = float(timing_params['sort_points_per_destination'])
+
+    hub_facilities = facilities[
+        facilities['type'].str.lower().isin(['hub', 'hybrid'])
+    ]['facility_name'].tolist()
+
+    facility_day_combos = set()
+    for group_name in groups.keys():
+        scenario_id, origin, dest, day_type = group_name
+        if origin in hub_facilities:
+            facility_day_combos.add((origin, day_type))
+
+    scenario_capacity_override = None
+    if scenario_row is not None and 'max_sort_points_capacity' in scenario_row.index:
+        override_val = scenario_row['max_sort_points_capacity']
+        if pd.notna(override_val) and override_val > 0:
+            scenario_capacity_override = int(override_val)
+
+    for (facility, day_type) in facility_day_combos:
+        if facility not in fac_lookup.index:
+            continue
+
+        if scenario_capacity_override is not None:
+            max_capacity = scenario_capacity_override
+        else:
+            max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity']
+            if pd.isna(max_capacity) or max_capacity <= 0:
+                continue
+            max_capacity = int(max_capacity)
+
+        facility_groups = [
+            (group_name, group_idxs)
+            for group_name, group_idxs in groups.items()
+            if group_name[1] == facility and group_name[3] == day_type
+        ]
+
+        if not facility_groups:
+            continue
+
+        regional_hubs = {}
+        dest_to_hub = {}
+
+        for (group_name, _) in facility_groups:
+            _, _, dest, _ = group_name
+
+            if dest in fac_lookup.index:
+                hub = fac_lookup.at[dest, 'regional_sort_hub']
+                if pd.isna(hub) or hub == '':
+                    hub = dest
+                dest_to_hub[dest] = hub
+
+                if hub not in regional_hubs:
+                    regional_hubs[hub] = []
+                regional_hubs[hub].append(dest)
+
+        facility_sort_points = model.NewIntVar(
+            0, max_capacity,
+            f"sort_pts_{facility}_{day_type}"
+        )
+
+        point_terms = []
+
+        for region_hub, dests_in_region in regional_hubs.items():
+            region_var = model.NewBoolVar(
+                f"region_{facility}_{day_type}_{region_hub}"
+            )
+
+            region_sort_vars = []
+            for (group_name, _) in facility_groups:
+                _, _, dest, _ = group_name
+                if dest_to_hub.get(dest) == region_hub:
+                    sort_vars = sort_decision.get(group_name, {})
+                    if sort_vars.get('region') is not None:
+                        region_sort_vars.append(sort_vars['region'])
+
+            if region_sort_vars:
+                model.AddMaxEquality(region_var, region_sort_vars)
+                point_terms.append(region_var * int(sort_points_per_dest))
+
+        for (group_name, _) in facility_groups:
+            _, _, dest, _ = group_name
+            sort_vars = sort_decision.get(group_name, {})
+
+            if sort_vars.get('market') is not None:
+                point_terms.append(
+                    sort_vars['market'] * int(sort_points_per_dest)
+                )
+
+        for (group_name, _) in facility_groups:
+            _, _, dest, _ = group_name
+            sort_vars = sort_decision.get(group_name, {})
+
+            if sort_vars.get('sort_group') is not None:
+                if dest not in fac_lookup.index:
+                    raise ValueError(
+                        f"Destination facility '{dest}' not found in facilities master data"
+                    )
+
+                groups_count = fac_lookup.at[dest, 'last_mile_sort_groups_count']
+                if pd.isna(groups_count) or groups_count <= 0:
+                    raise ValueError(
+                        f"Destination facility '{dest}' missing valid last_mile_sort_groups_count. "
+                        f"Required for sort group capacity calculation. "
+                        f"This should have been caught by input validation."
+                    )
+                groups_count = int(groups_count)
+
+                point_terms.append(
+                    sort_vars['sort_group'] * int(sort_points_per_dest * groups_count)
+                )
+
+        if point_terms:
+            model.Add(facility_sort_points == sum(point_terms))
+            model.Add(facility_sort_points <= max_capacity)
+
+
+def _create_decision_variables(
+        model: cp_model.CpModel,
+        path_keys: List[int],
+        groups: Dict,
+        arc_meta: List[Dict],
+        enable_sort_optimization: bool,
+        cand: pd.DataFrame,
+        facilities: pd.DataFrame,
+        timing_params: Dict
+) -> Dict:
+    """
+    Create all MILP decision variables.
+
+    Returns dictionary with:
+        x: Path selection {path_idx: BoolVar}
+        arc_pkgs: Packages per arc {arc_idx: IntVar}
+        arc_trucks: Trucks per arc {arc_idx: IntVar}
+        sort_decision: Sort choices {group_key: {level: BoolVar}} (if enabled)
+    """
+    variables = {}
+
+    # Path selection variables (one per candidate path)
+    variables['x'] = {i: model.NewBoolVar(f"x_{i}") for i in path_keys}
+
+    # Arc package variables (volume flowing on each arc)
+    variables['arc_pkgs'] = {
+        a_idx: model.NewIntVar(0, 1000000, f"arc_pkgs_{a_idx}")
+        for a_idx in range(len(arc_meta))
+    }
+
+    # Arc truck variables (trucks needed for each arc)
+    variables['arc_trucks'] = {
+        a_idx: model.NewIntVar(0, 1000, f"arc_trucks_{a_idx}")
+        for a_idx in range(len(arc_meta))
+    }
+
+    # Sort decision variables (if optimization enabled)
+    if enable_sort_optimization:
+        variables['sort_decision'] = _create_sort_decision_variables(
+            model, groups, cand, facilities, timing_params
+        )
+    else:
+        variables['sort_decision'] = {}
+
+    return variables
+
+
 def solve_network_optimization(
         candidates: pd.DataFrame,
         facilities: pd.DataFrame,
@@ -85,24 +429,25 @@ def solve_network_optimization(
 
     model = cp_model.CpModel()
 
-    x = {i: model.NewBoolVar(f"x_{i}") for i in path_keys}
-
     groups = cand.groupby(["scenario_id", "origin", "dest", "day_type"]).indices
 
+    # Create all decision variables
+    variables = _create_decision_variables(
+        model, path_keys, groups, arc_meta,
+        enable_sort_optimization, cand, facilities, timing_params
+    )
+    x = variables['x']
+    arc_pkgs = variables['arc_pkgs']
+    arc_trucks = variables['arc_trucks']
+    sort_decision = variables['sort_decision']
+
+    # Add OD selection constraints (one path per OD)
     for group_name, idxs in groups.items():
         model.Add(sum(x[i] for i in idxs) == 1)
 
     print(f"    Constraints: {len(groups)} OD pairs (1 path per OD)")
 
-    sort_decision = {}
-    if enable_sort_optimization:
-        sort_decision = _create_sort_decision_variables(
-            model, groups, cand, facilities, timing_params
-        )
-
-    arc_pkgs = {a_idx: model.NewIntVar(0, 1000000, f"arc_pkgs_{a_idx}")
-                for a_idx in range(len(arc_meta))}
-
+    # Package aggregation constraints
     for a_idx in range(len(arc_meta)):
         terms = []
         for i in path_keys:
@@ -115,15 +460,13 @@ def solve_network_optimization(
         else:
             model.Add(arc_pkgs[a_idx] == 0)
 
+    # Arc capacity constraints
     raw_trailer_cube = get_raw_trailer_cube(container_params)
     container_capacity = get_container_capacity(container_params) * get_containers_per_truck(container_params)
     fluid_capacity = get_trailer_capacity(container_params)
 
-    arc_trucks = {}
-
     for a_idx in range(len(arc_meta)):
-        arc_trucks[a_idx] = model.NewIntVar(0, 1000, f"arc_trucks_{a_idx}")
-
+        # Determine predominant strategy for this arc
         strategies = [global_strategy.value]
         for i in path_keys:
             if a_idx in path_arcs[i]:
@@ -309,125 +652,27 @@ def solve_network_optimization(
     return selected_paths, arc_summary, kpis, sort_summary
 
 
-def _build_arc_structures(cand, facilities, mileage_bands, path_keys):
-    """Build arc-pooling data structures with ROBUST path_nodes handling."""
-    arc_index_map = {}
-    arc_meta = []
-    path_arcs = {}
-    path_od_data = {}
+def _determine_arc_strategies(arc_meta, chosen_idx, path_od_data, path_arcs, global_strategy):
+    """Determine effective strategy per arc."""
+    arc_strategies = {}
 
-    for i in path_keys:
-        r = cand.loc[i]
+    for a_idx in range(len(arc_meta)):
+        strategies = []
+        for i in chosen_idx:
+            if a_idx in path_arcs[i]:
+                strategies.append(path_od_data[i]['effective_strategy'])
 
-        nodes = extract_path_nodes(r)
-
-        legs = []
-        for u, v in zip(nodes[:-1], nodes[1:]):
-            legs.append(_calc_arc(u, v, facilities, mileage_bands))
-
-        path_od_data[i] = {
-            'origin': r["origin"],
-            'dest': r["dest"],
-            'pkgs_day': float(r["pkgs_day"]),
-            'scenario_id': r.get("scenario_id", "default"),
-            'day_type': r.get("day_type", "peak"),
-            'path_str': r.get("path_str", "->".join(nodes)),
-            'path_type': r.get("path_type", "direct"),
-            'path_nodes': nodes,
-            'effective_strategy': r.get("strategy_hint") or "container"
-        }
-
-        arc_ids = []
-        for (u, v, dist, cost, mph) in legs:
-            key = (u, v)
-            if key not in arc_index_map:
-                arc_index_map[key] = len(arc_meta)
-                arc_meta.append({
-                    "from": u, "to": v,
-                    "distance_miles": dist,
-                    "cost_per_truck": cost,
-                    "mph": mph
-                })
-            arc_ids.append(arc_index_map[key])
-
-        path_arcs[i] = arc_ids
-
-    return arc_index_map, arc_meta, path_arcs, path_od_data
-
-
-def _calc_arc(u, v, facilities, mileage_bands):
-    """Calculate arc metrics from mileage_bands."""
-    fac = facilities.set_index("facility_name")[["lat", "lon"]].astype(float)
-
-    lat1, lon1 = fac.at[u, "lat"], fac.at[u, "lon"]
-    lat2, lon2 = fac.at[v, "lat"], fac.at[v, "lon"]
-
-    raw = haversine_miles(lat1, lon1, lat2, lon2)
-
-    if u == v:
-        return (u, v, 0.0, 0.0, 0.0)
-
-    fixed, var, circuit, mph = band_lookup(raw, mileage_bands)
-    dist = raw * circuit
-
-    return (u, v, dist, fixed + var * dist, mph)
-
-
-def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
-                               facilities, package_mix, container_params):
-    """
-    Calculate per-package processing cost.
-
-    FIXED v4.10: Correct intermediate sort vs. crossdock logic
-    - Region sort ALWAYS requires full intermediate sort at regional hub
-    - Market/sort_group use crossdock/container handling (already sorted)
-    - ALL COSTS FROM cost_params INPUT FILE
-
-    FIXED v4.8: Container handling now uses containers_per_package fraction
-    instead of always charging for 1 full container per package.
-    """
-    nodes = path_data['path_nodes']
-    origin = path_data['origin']
-    dest = path_data['dest']
-
-    cost = cost_params.injection_sort_cost_per_pkg
-
-    if origin == dest:
-        cost += cost_params.last_mile_sort_cost_per_pkg
-        cost += cost_params.last_mile_delivery_cost_per_pkg
-        return cost
-
-    intermediates = nodes[1:-1] if len(nodes) > 2 else []
-
-    if intermediates:
-        containers_per_package = calculate_containers_per_package(
-            package_mix, container_params
-        )
-
-        if sort_level == 'region':
-            cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
-
-        elif sort_level == 'sort_group':
-            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
-
-        elif sort_level == 'market':
-            if strategy.lower() == 'container':
-                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
-            else:
-                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
-
+        if strategies:
+            counts = {}
+            for s in strategies:
+                counts[s] = counts.get(s, 0) + 1
+            predominant = max(counts, key=counts.get)
         else:
-            if strategy.lower() == 'container':
-                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
-            else:
-                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
+            predominant = global_strategy.value
 
-    if sort_level != 'sort_group':
-        cost += cost_params.last_mile_sort_cost_per_pkg
+        arc_strategies[a_idx] = predominant
 
-    cost += cost_params.last_mile_delivery_cost_per_pkg
-
-    return cost
+    return arc_strategies
 
 
 def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
@@ -493,203 +738,6 @@ def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
         })
 
     return pd.DataFrame(data)
-
-def _create_sort_decision_variables(model, groups, cand, facilities, timing_params):
-    """Create sort level decision variables."""
-    sort_decision = {}
-    fac_lookup = get_facility_lookup(facilities)
-
-    for group_name in groups.keys():
-        scenario_id, origin, dest, day_type = group_name
-
-        valid_levels = _get_valid_sort_levels(origin, dest, fac_lookup)
-
-        group_vars = {}
-        for level in ['region', 'market', 'sort_group']:
-            if level in valid_levels:
-                group_vars[level] = model.NewBoolVar(
-                    f"sort_{scenario_id}_{origin}_{dest}_{day_type}_{level}"
-                )
-            else:
-                group_vars[level] = None
-
-        sort_decision[group_name] = group_vars
-
-        valid_vars = [v for v in group_vars.values() if v is not None]
-        if valid_vars:
-            model.Add(sum(valid_vars) == 1)
-
-    return sort_decision
-
-
-def _get_valid_sort_levels(origin, dest, fac_lookup):
-    """Determine valid sort levels for OD pair."""
-    if origin == dest:
-        return ['sort_group']
-
-    regional_hub_map = {}
-    for facility in fac_lookup.index:
-        hub = fac_lookup.at[facility, 'regional_sort_hub']
-        if pd.isna(hub) or hub == "":
-            hub = facility
-        regional_hub_map[facility] = hub
-
-    dest_hub = regional_hub_map.get(dest, dest)
-
-    if origin == dest_hub:
-        return ['market', 'sort_group']
-
-    return ['region', 'market', 'sort_group']
-
-
-def _add_sort_capacity_constraints(model, sort_decision, groups, path_od_data,
-                                   facilities, timing_params, cand, scenario_row=None):
-    """Enforce sort capacity limits with proper point counting."""
-    from .utils import get_facility_lookup
-    from .config_v4 import OptimizationConstants
-
-    fac_lookup = get_facility_lookup(facilities)
-
-    if hasattr(timing_params, 'sort_points_per_destination'):
-        sort_points_per_dest = float(timing_params.sort_points_per_destination)
-    else:
-        sort_points_per_dest = float(timing_params['sort_points_per_destination'])
-
-    hub_facilities = facilities[
-        facilities['type'].str.lower().isin(['hub', 'hybrid'])
-    ]['facility_name'].tolist()
-
-    facility_day_combos = set()
-    for group_name in groups.keys():
-        scenario_id, origin, dest, day_type = group_name
-        if origin in hub_facilities:
-            facility_day_combos.add((origin, day_type))
-
-    scenario_capacity_override = None
-    if scenario_row is not None and 'max_sort_points_capacity' in scenario_row.index:
-        override_val = scenario_row['max_sort_points_capacity']
-        if pd.notna(override_val) and override_val > 0:
-            scenario_capacity_override = int(override_val)
-
-    for (facility, day_type) in facility_day_combos:
-        if facility not in fac_lookup.index:
-            continue
-
-        if scenario_capacity_override is not None:
-            max_capacity = scenario_capacity_override
-        else:
-            max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity']
-            if pd.isna(max_capacity) or max_capacity <= 0:
-                continue
-            max_capacity = int(max_capacity)
-
-        facility_groups = [
-            (group_name, group_idxs)
-            for group_name, group_idxs in groups.items()
-            if group_name[1] == facility and group_name[3] == day_type
-        ]
-
-        if not facility_groups:
-            continue
-
-        regional_hubs = {}
-        dest_to_hub = {}
-
-        for (group_name, _) in facility_groups:
-            _, _, dest, _ = group_name
-
-            if dest in fac_lookup.index:
-                hub = fac_lookup.at[dest, 'regional_sort_hub']
-                if pd.isna(hub) or hub == '':
-                    hub = dest
-                dest_to_hub[dest] = hub
-
-                if hub not in regional_hubs:
-                    regional_hubs[hub] = []
-                regional_hubs[hub].append(dest)
-
-        facility_sort_points = model.NewIntVar(
-            0, max_capacity,
-            f"sort_pts_{facility}_{day_type}"
-        )
-
-        point_terms = []
-
-        for region_hub, dests_in_region in regional_hubs.items():
-            region_var = model.NewBoolVar(
-                f"region_{facility}_{day_type}_{region_hub}"
-            )
-
-            region_sort_vars = []
-            for (group_name, _) in facility_groups:
-                _, _, dest, _ = group_name
-                if dest_to_hub.get(dest) == region_hub:
-                    sort_vars = sort_decision.get(group_name, {})
-                    if sort_vars.get('region') is not None:
-                        region_sort_vars.append(sort_vars['region'])
-
-            if region_sort_vars:
-                model.AddMaxEquality(region_var, region_sort_vars)
-                point_terms.append(region_var * int(sort_points_per_dest))
-
-        for (group_name, _) in facility_groups:
-            _, _, dest, _ = group_name
-            sort_vars = sort_decision.get(group_name, {})
-
-            if sort_vars.get('market') is not None:
-                point_terms.append(
-                    sort_vars['market'] * int(sort_points_per_dest)
-                )
-
-        for (group_name, _) in facility_groups:
-            _, _, dest, _ = group_name
-            sort_vars = sort_decision.get(group_name, {})
-
-            if sort_vars.get('sort_group') is not None:
-                if dest not in fac_lookup.index:
-                    raise ValueError(
-                        f"Destination facility '{dest}' not found in facilities master data"
-                    )
-
-                groups_count = fac_lookup.at[dest, 'last_mile_sort_groups_count']
-                if pd.isna(groups_count) or groups_count <= 0:
-                    raise ValueError(
-                        f"Destination facility '{dest}' missing valid last_mile_sort_groups_count. "
-                        f"Required for sort group capacity calculation. "
-                        f"This should have been caught by input validation."
-                    )
-                groups_count = int(groups_count)
-
-                point_terms.append(
-                    sort_vars['sort_group'] * int(sort_points_per_dest * groups_count)
-                )
-
-        if point_terms:
-            model.Add(facility_sort_points == sum(point_terms))
-            model.Add(facility_sort_points <= max_capacity)
-
-
-def _determine_arc_strategies(arc_meta, chosen_idx, path_od_data, path_arcs, global_strategy):
-    """Determine effective strategy per arc."""
-    arc_strategies = {}
-
-    for a_idx in range(len(arc_meta)):
-        strategies = []
-        for i in chosen_idx:
-            if a_idx in path_arcs[i]:
-                strategies.append(path_od_data[i]['effective_strategy'])
-
-        if strategies:
-            counts = {}
-            for s in strategies:
-                counts[s] = counts.get(s, 0) + 1
-            predominant = max(counts, key=counts.get)
-        else:
-            predominant = global_strategy.value
-
-        arc_strategies[a_idx] = predominant
-
-    return arc_strategies
 
 
 def _build_arc_summary(arc_meta, arc_pkgs, arc_trucks, arc_strategies, w_cube,
