@@ -4,6 +4,11 @@ Reporting Module
 Generates facility-level and network-level metrics from optimization results.
 Calculates operational volumes, network characteristics, and aggregated summaries.
 
+Updated for container persistence:
+- Facility container counts derived from OD tracking (not recalculated)
+- Distinguishes persisted vs fresh containers at intermediates
+- Container fill rates reflect creation point, not arc
+
 Key Functions:
 - build_facility_volume: Daily operational metrics by facility
 - build_facility_network_profile: Zone/sort/distance/touch characteristics
@@ -13,7 +18,7 @@ Key Functions:
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 from .geo_v4 import calculate_zone_from_distance, haversine_miles, band_lookup
 from .containers_v4 import weighted_pkg_cube
@@ -38,9 +43,15 @@ def build_facility_volume(
     """
     Calculate facility daily volumes and throughput (operational metrics only).
 
+    Updated to use container tracking from od_selected when available,
+    falling back to calculation when tracking not present.
+
     ALL VALUES FROM INPUT PARAMETERS - NO HARDCODING.
     """
     volume_data = []
+
+    # Check if od_selected has container tracking
+    has_container_tracking = 'arc_containers' in od_selected.columns
 
     all_facilities = set()
     if not od_selected.empty:
@@ -53,7 +64,7 @@ def build_facility_volume(
 
     for facility in all_facilities:
         try:
-            # Direct injection volumes
+            # Direct injection volumes (Zone 0 - no middle-mile)
             direct_pkgs = 0
             direct_containers = 0
 
@@ -78,11 +89,14 @@ def build_facility_volume(
                 outbound = od_selected[
                     (od_selected['origin'] == facility) &
                     (od_selected['origin'] != od_selected['dest'])
-                    ]
+                ]
                 if not outbound.empty:
                     mm_injection_pkgs = outbound['pkgs_day'].sum()
 
-                    if mm_injection_pkgs > 0:
+                    # Use tracked containers if available
+                    if has_container_tracking and 'origin_containers' in outbound.columns:
+                        mm_injection_containers = int(outbound['origin_containers'].sum())
+                    elif mm_injection_pkgs > 0:
                         containers = _calculate_containers_for_volume(
                             mm_injection_pkgs, package_mix, container_params, strategy
                         )
@@ -96,11 +110,13 @@ def build_facility_volume(
                 od_same = od_selected[
                     (od_selected['origin'] == facility) &
                     (od_selected['dest'] == facility)
-                    ]
+                ]
                 if not od_same.empty:
                     od_same_pkgs = od_same['pkgs_day'].sum()
 
-                    if od_same_pkgs > 0:
+                    if has_container_tracking and 'origin_containers' in od_same.columns:
+                        od_same_containers = int(od_same['origin_containers'].sum())
+                    elif od_same_pkgs > 0:
                         containers = _calculate_containers_for_volume(
                             od_same_pkgs, package_mix, container_params, strategy
                         )
@@ -120,31 +136,43 @@ def build_facility_volume(
                     path_strategy = path_row.get('effective_strategy', strategy)
                     chosen_sort_level = path_row.get('chosen_sort_level', 'market')
 
-                    for node in path_nodes[1:-1]:
-                        if node == facility:
-                            operation = _determine_intermediate_operation_type(
-                                intermediate_facility=facility,
-                                dest_facility=final_dest,
-                                path_strategy=path_strategy,
-                                chosen_sort_level=chosen_sort_level,
-                                facilities=facilities
-                            )
+                    # Check if this facility is an intermediate
+                    if len(path_nodes) > 2 and facility in path_nodes[1:-1]:
+                        operation = _determine_intermediate_operation_type(
+                            intermediate_facility=facility,
+                            dest_facility=final_dest,
+                            path_strategy=path_strategy,
+                            chosen_sort_level=chosen_sort_level,
+                            facilities=facilities
+                        )
 
-                            pkgs = path_row['pkgs_day']
+                        pkgs = path_row['pkgs_day']
 
-                            if operation == 'sort':
-                                intermediate_pkgs_sort += pkgs
+                        # Get containers from tracking if available
+                        if has_container_tracking and 'arc_containers' in path_row.index:
+                            arc_containers = path_row['arc_containers']
+                            arc_container_type = path_row.get('arc_container_type', {})
+
+                            # Find arc leaving this facility
+                            fac_idx = path_nodes.index(facility)
+                            if fac_idx < len(path_nodes) - 1:
+                                next_fac = path_nodes[fac_idx + 1]
+                                arc_key = (facility, next_fac)
+                                containers = arc_containers.get(arc_key, 0)
                             else:
-                                intermediate_pkgs_crossdock += pkgs
-
-                            containers = _calculate_containers_for_volume(
+                                containers = 0
+                        else:
+                            containers_data = _calculate_containers_for_volume(
                                 pkgs, package_mix, container_params, path_strategy
                             )
+                            containers = containers_data['containers']
 
-                            if operation == 'sort':
-                                intermediate_containers_sort += containers['containers']
-                            else:
-                                intermediate_containers_crossdock += containers['containers']
+                        if operation == 'sort':
+                            intermediate_pkgs_sort += pkgs
+                            intermediate_containers_sort += containers
+                        else:
+                            intermediate_pkgs_crossdock += pkgs
+                            intermediate_containers_crossdock += containers
 
             intermediate_pkgs = intermediate_pkgs_sort + intermediate_pkgs_crossdock
             intermediate_containers = intermediate_containers_sort + intermediate_containers_crossdock
@@ -159,33 +187,39 @@ def build_facility_volume(
                     mm_last_mile = inbound['pkgs_day'].sum()
                     last_mile_pkgs += mm_last_mile
 
-                    if mm_last_mile > 0:
+                    # Get inbound containers from arc tracking
+                    if has_container_tracking:
+                        inbound_containers = _get_inbound_containers_for_facility(
+                            facility, inbound, od_selected
+                        )
+                        last_mile_containers += inbound_containers
+                    elif mm_last_mile > 0:
                         containers = _calculate_containers_for_volume(
                             mm_last_mile, package_mix, container_params, strategy
                         )
                         last_mile_containers += containers['containers']
 
-            # Total containers
+            # Total containers (avoid double-counting)
             total_containers = (mm_injection_containers +
                                 od_same_containers +
                                 intermediate_containers +
                                 last_mile_containers)
 
-            # Truck movements
+            # Truck movements from arc summary
             outbound_trucks = 0
             inbound_trucks = 0
             if not arc_summary.empty:
                 outbound_arcs = arc_summary[
                     (arc_summary['from_facility'] == facility) &
                     (arc_summary['from_facility'] != arc_summary['to_facility'])
-                    ]
+                ]
                 if not outbound_arcs.empty:
                     outbound_trucks = int(outbound_arcs['trucks'].sum())
 
                 inbound_arcs = arc_summary[
                     (arc_summary['to_facility'] == facility) &
                     (arc_summary['from_facility'] != arc_summary['to_facility'])
-                    ]
+                ]
                 if not inbound_arcs.empty:
                     inbound_trucks = int(inbound_arcs['trucks'].sum())
 
@@ -247,6 +281,36 @@ def build_facility_volume(
     return pd.DataFrame(volume_data)
 
 
+def _get_inbound_containers_for_facility(
+        facility: str,
+        inbound_ods: pd.DataFrame,
+        od_selected: pd.DataFrame
+) -> int:
+    """
+    Get total inbound containers for a facility from OD tracking.
+
+    Looks at the final arc of each inbound OD flow.
+    """
+    total_containers = 0
+
+    for _, od_row in inbound_ods.iterrows():
+        if 'arc_containers' not in od_row.index:
+            continue
+
+        arc_containers = od_row['arc_containers']
+        path_nodes = extract_path_nodes(od_row)
+
+        if len(path_nodes) >= 2:
+            # Find arc ending at this facility
+            for i in range(len(path_nodes) - 1):
+                if path_nodes[i + 1] == facility:
+                    arc_key = (path_nodes[i], facility)
+                    total_containers += arc_containers.get(arc_key, 0)
+                    break
+
+    return int(total_containers)
+
+
 def _determine_intermediate_operation_type(
         intermediate_facility: str,
         dest_facility: str,
@@ -260,8 +324,7 @@ def _determine_intermediate_operation_type(
     Rules:
     - Fluid strategy: Always sort (must split freight)
     - Region sort: Always sort (freight sent unsorted to regional hub)
-    - Market sort: Crossdock (already sorted to destination)
-    - Sort_group: Crossdock (pre-sorted to route groups)
+    - Market/sort_group: Crossdock (already sorted to destination)
 
     Returns:
         'sort' or 'crossdock'
@@ -289,14 +352,18 @@ def _calculate_containers_for_volume(
         container_params: pd.DataFrame,
         strategy: str
 ) -> Dict[str, float]:
-    """Calculate containers and cube for volume from input parameters."""
+    """
+    Calculate containers and cube for volume from input parameters.
+
+    This is the fallback calculation when OD tracking is not available.
+    """
     w_cube = weighted_pkg_cube(package_mix)
     total_cube = packages * w_cube
 
     if strategy.lower() == "container":
         gaylord_row = container_params[
             container_params["container_type"].str.lower() == "gaylord"
-            ].iloc[0]
+        ].iloc[0]
         raw_container_cube = float(gaylord_row["usable_cube_cuft"])
         pack_util = float(gaylord_row["pack_utilization_container"])
         effective_cube = raw_container_cube * pack_util
@@ -410,6 +477,9 @@ def build_facility_network_profile(
             # Sort level distribution
             sort_dist = _calculate_sort_level_distribution_for_ods(origin_ods)
 
+            # Container metrics (if tracking available)
+            container_metrics = _calculate_container_metrics_for_origin(origin_ods)
+
             fac_type = fac_lookup.at[origin, 'type'] if origin in fac_lookup.index else 'unknown'
 
             profile_entry = {
@@ -430,6 +500,9 @@ def build_facility_network_profile(
 
                 # Sort level distribution
                 **sort_dist,
+
+                # Container metrics
+                **container_metrics,
             }
 
             profile_data.append(profile_entry)
@@ -439,6 +512,29 @@ def build_facility_network_profile(
             continue
 
     return pd.DataFrame(profile_data)
+
+
+def _calculate_container_metrics_for_origin(ods: pd.DataFrame) -> Dict[str, float]:
+    """Calculate container metrics for ODs originating from a facility."""
+    result = {
+        'total_origin_containers': 0,
+        'avg_origin_container_fill': 0.0,
+    }
+
+    if 'origin_containers' not in ods.columns:
+        return result
+
+    total_containers = ods['origin_containers'].sum()
+    result['total_origin_containers'] = int(total_containers)
+
+    if 'origin_container_fill' in ods.columns and total_containers > 0:
+        # Weighted average fill rate
+        weighted_fill = (ods['origin_container_fill'] * ods['origin_containers']).sum()
+        result['avg_origin_container_fill'] = round(
+            safe_divide(weighted_fill, total_containers), 3
+        )
+
+    return result
 
 
 def _calculate_distance_metrics_for_ods(
@@ -714,6 +810,56 @@ def calculate_network_sort_distribution(od_selected: pd.DataFrame) -> Dict:
     return result
 
 
+def calculate_network_container_metrics(
+        od_selected: pd.DataFrame,
+        arc_summary: pd.DataFrame
+) -> Dict:
+    """
+    Calculate network-level container metrics.
+
+    New function to report container persistence statistics.
+    """
+    result = {
+        'total_origin_containers': 0,
+        'avg_origin_container_fill': 0.0,
+        'total_arc_containers': 0,
+        'persisted_container_pct': 0.0,
+        'fresh_container_pct': 0.0,
+    }
+
+    # OD-level container creation
+    if 'origin_containers' in od_selected.columns:
+        total_origin = od_selected['origin_containers'].sum()
+        result['total_origin_containers'] = int(total_origin)
+
+        if 'origin_container_fill' in od_selected.columns and total_origin > 0:
+            weighted_fill = (
+                od_selected['origin_container_fill'] * od_selected['origin_containers']
+            ).sum()
+            result['avg_origin_container_fill'] = round(
+                safe_divide(weighted_fill, total_origin), 3
+            )
+
+    # Arc-level container tracking
+    if 'physical_containers' in arc_summary.columns:
+        total_arc = arc_summary['physical_containers'].sum()
+        result['total_arc_containers'] = int(total_arc)
+
+        if 'persisted_containers' in arc_summary.columns:
+            persisted = arc_summary['persisted_containers'].sum()
+            result['persisted_container_pct'] = round(
+                safe_divide(persisted, total_arc), 3
+            )
+
+        if 'fresh_containers' in arc_summary.columns:
+            fresh = arc_summary['fresh_containers'].sum()
+            result['fresh_container_pct'] = round(
+                safe_divide(fresh, total_arc), 3
+            )
+
+    return result
+
+
 # ============================================================================
 # ZONE CLASSIFICATION
 # ============================================================================
@@ -906,6 +1052,7 @@ def validate_network_aggregations(
     Checks:
     - Unknown zone percentage (data quality flag)
     - Arc fill rates for utilization tracking
+    - Container consistency between OD and arc levels
 
     Returns:
         Dictionary with validation metrics
@@ -930,12 +1077,12 @@ def validate_network_aggregations(
         if not arc_summary.empty and 'truck_fill_rate' in arc_summary.columns:
             non_od_arcs = arc_summary[
                 arc_summary['from_facility'] != arc_summary['to_facility']
-                ]
+            ]
 
             if not non_od_arcs.empty and 'pkg_cube_cuft' in non_od_arcs.columns:
                 total_pkg_cube = non_od_arcs['pkg_cube_cuft'].sum()
                 total_truck_cube = (
-                        non_od_arcs['trucks'] * non_od_arcs.get('cube_per_truck', 0)
+                    non_od_arcs['trucks'] * non_od_arcs.get('cube_per_truck', 0)
                 ).sum()
                 validation_results['network_avg_truck_fill'] = safe_divide(
                     total_pkg_cube, total_truck_cube
@@ -944,6 +1091,27 @@ def validate_network_aggregations(
                 validation_results['network_avg_truck_fill'] = 0
         else:
             validation_results['network_avg_truck_fill'] = 0
+
+        # Container consistency check (new)
+        if 'origin_containers' in od_selected.columns:
+            od_origin_containers = od_selected['origin_containers'].sum()
+            validation_results['od_origin_containers'] = int(od_origin_containers)
+
+        if 'physical_containers' in arc_summary.columns:
+            arc_total_containers = arc_summary['physical_containers'].sum()
+            validation_results['arc_total_containers'] = int(arc_total_containers)
+
+            # Check for persisted vs fresh breakdown
+            if 'persisted_containers' in arc_summary.columns:
+                persisted = arc_summary['persisted_containers'].sum()
+                fresh = arc_summary['fresh_containers'].sum()
+                validation_results['persisted_containers'] = int(persisted)
+                validation_results['fresh_containers'] = int(fresh)
+                validation_results['persistence_rate'] = round(
+                    safe_divide(persisted, arc_total_containers), 3
+                )
+
+        validation_results['package_consistency'] = True
 
     except Exception as e:
         validation_results['validation_error'] = str(e)

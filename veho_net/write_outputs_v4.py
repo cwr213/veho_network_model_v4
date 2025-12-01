@@ -101,6 +101,19 @@ def write_workbook(
             # 6. Arc Summary
             if not arc_summary.empty:
                 arc_summary.to_excel(writer, sheet_name="arc_summary", index=False)
+
+                # 6b. Container persistence summary (if tracking available)
+                if 'persisted_containers' in arc_summary.columns:
+                    container_summary = arc_summary[[
+                        'from_facility', 'to_facility', 'pkgs_day',
+                        'physical_containers', 'persisted_containers', 'fresh_containers',
+                        'container_fill_rate', 'truck_fill_rate'
+                    ]].copy()
+                    container_summary['persist_pct'] = (
+                            container_summary['persisted_containers'] /
+                            container_summary['physical_containers'].replace(0, 1)
+                    ).round(3)
+                    container_summary.to_excel(writer, sheet_name="container_tracking", index=False)
             else:
                 pd.DataFrame([{"note": "No arc data"}]).to_excel(
                     writer, sheet_name="arc_summary", index=False

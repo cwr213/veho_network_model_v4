@@ -81,6 +81,16 @@ class PerformanceThresholds:
     MAX_PATH_LENGTH: int = 5  # Maximum facilities in a single path
     MAX_OD_PAIRS_WARNING: int = 10000  # Warn if OD matrix exceeds this size
 
+class DiagnosticSettings:
+    """
+    Diagnostic and debugging settings.
+    """
+    # Enable comparison output between old and new container methods
+    CONTAINER_DIAGNOSTIC_MODE: bool = True
+
+    # Show detailed per-arc container breakdown
+    VERBOSE_CONTAINER_TRACKING: bool = False
+
 
 # ============================================================================
 # ENUMERATIONS

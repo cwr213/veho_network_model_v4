@@ -517,3 +517,65 @@ def extract_path_nodes(row: pd.Series) -> List[str]:
 
     # Last resort: direct path
     return [row.get("origin", ""), row.get("dest", "")]
+
+# ============================================================================
+# CONTAINER FLOW HELPERS
+# ============================================================================
+
+def is_container_creation_point(
+        facility: str,
+        path_nodes: List[str],
+        sort_level: str,
+        origin: str
+) -> bool:
+    """
+    Determine if containers are created/recreated at this facility.
+
+    Rules:
+    - Origin always creates containers
+    - Region sort: intermediate facilities also create (after sort)
+    - Market/sort_group: only origin creates
+
+    Args:
+        facility: Facility to check
+        path_nodes: Full path
+        sort_level: Sort level for this OD
+        origin: Origin facility
+
+    Returns:
+        True if containers are created at this facility
+    """
+    if facility == origin:
+        return True
+
+    if sort_level == 'region' and facility in path_nodes[1:-1]:
+        return True
+
+    return False
+
+
+def get_intermediate_operation_type(
+        facility: str,
+        path_nodes: List[str],
+        sort_level: str,
+        origin: str,
+        dest: str
+) -> str:
+    """
+    Get operation type at intermediate facility.
+
+    Returns:
+        'sort', 'crossdock', 'origin', or 'destination'
+    """
+    if facility == origin:
+        return 'origin'
+    if facility == dest:
+        return 'destination'
+
+    if facility in path_nodes[1:-1]:
+        if sort_level == 'region':
+            return 'sort'
+        else:
+            return 'crossdock'
+
+    return 'unknown'

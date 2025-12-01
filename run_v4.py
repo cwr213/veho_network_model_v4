@@ -55,6 +55,7 @@ from veho_net.sort_strategy_comparison import (
 )
 from veho_net.container_flow_v4 import (
     build_od_container_map,
+    build_od_container_map_with_persistence,
     recalculate_arc_summary_with_container_flow,
     analyze_sort_level_container_impact,
     create_container_flow_diagnostic
@@ -148,7 +149,7 @@ def main(input_path: str, output_dir: str):
 
     try:
         dfs = load_workbook(input_path)
-        print("✓ Workbook loaded successfully")
+        print("Workbook loaded successfully")
     except Exception as e:
         print(f"\n ERROR FATAL: Could not load workbook")
         print(f"   Error: {e}")
@@ -156,7 +157,7 @@ def main(input_path: str, output_dir: str):
 
     try:
         validate_inputs(dfs)
-        print("✓ Input validation passed")
+        print("Input validation passed")
     except Exception as e:
         print(f"\n ERROR FATAL: Input validation failed")
         print(f"   Error: {e}")
@@ -171,7 +172,7 @@ def main(input_path: str, output_dir: str):
         cost_params_dict = params_to_dict(dfs["cost_params"])
         run_settings_dict = params_to_dict(dfs["run_settings"])
 
-        print("✓ Parameters parsed successfully")
+        print("Parameters parsed successfully")
     except Exception as e:
         print(f"\n ERROR FATAL: Could not parse parameters")
         print(f"   Error: {e}")
@@ -200,10 +201,10 @@ def main(input_path: str, output_dir: str):
     user_run_id = run_settings_dict.get("run_id", None)
     if user_run_id and str(user_run_id).strip():
         run_id = str(user_run_id).strip()
-        print(f"\n✓ Using provided run_id: {run_id}")
+        print(f"\nUsing provided run_id: {run_id}")
     else:
         run_id = generate_run_id(dfs["scenarios"])
-        print(f"\n✓ Auto-generated run_id: {run_id}")
+        print(f"\nAuto-generated run_id: {run_id}")
 
     print(f"\nConfiguration:")
     print(f"  Strategy: Container (fluid opportunities analyzed post-optimization)")
@@ -265,13 +266,13 @@ def main(input_path: str, output_dir: str):
                 print(f"  ERROR: No OD pairs with volume for {day_type}")
                 continue
 
-            print(f"  ✓ Generated {len(od)} OD pairs")
+            print(f"  Generated {len(od)} OD pairs")
 
             direct_day["dir_pkgs_day"] = direct_day[direct_col]
 
             direct_day = add_direct_injection_zone_classification(direct_day)
             direct_pkgs_total = direct_day["dir_pkgs_day"].sum()
-            print(f"  ✓ Direct injection (Zone 0): {direct_pkgs_total:,.0f} packages")
+            print(f"  Direct injection (Zone 0): {direct_pkgs_total:,.0f} packages")
 
             print("\n2. Generating candidate paths...")
 
@@ -300,7 +301,7 @@ def main(input_path: str, output_dir: str):
             paths["scenario_id"] = scenario_id
             paths["day_type"] = day_type
 
-            print(f"  ✓ Generated {len(paths)} candidate paths")
+            print(f"  Generated {len(paths)} candidate paths")
 
             if enable_sort_opt:
                 print(f"\n{'-' * 70}")
@@ -415,7 +416,7 @@ def main(input_path: str, output_dir: str):
                 print(f"  ERROR: Optimization returned no paths")
                 continue
 
-            print(f"  ✓ Selected {len(od_selected)} optimal paths")
+            print(f"  Selected {len(od_selected)} optimal paths")
 
             # path_nodes already validated as lists from candidate_paths()
 
@@ -443,21 +444,21 @@ def main(input_path: str, output_dir: str):
                 for _, row in unknown_zones.head(5).iterrows():
                     print(f"     {row['origin']} -> {row['dest']}: {row['zone_miles']:.1f} miles")
             else:
-                print(f"  ✓ All OD pairs successfully classified")
+                print(f"  All OD pairs successfully classified")
 
-            print("\n5. Applying container flow correction...")
+            print("\n5. Building container flow tracking (with persistence)...")
 
             if not validate_arc_summary(arc_summary_original, "Original"):
                 print("  WARNING:  Original arc summary invalid, proceeding with correction anyway...")
 
             try:
-                od_selected = build_od_container_map(
+                od_selected = build_od_container_map_with_persistence(
                     od_selected,
                     dfs["package_mix"],
                     dfs["container_params"],
                     dfs["facilities"]
                 )
-                print("  ✓ Container map built")
+                print("  Container map built with persistence tracking")
 
                 arc_summary_corrected = recalculate_arc_summary_with_container_flow(
                     od_selected,
@@ -466,10 +467,17 @@ def main(input_path: str, output_dir: str):
                     dfs["facilities"],
                     dfs["mileage_bands"]
                 )
-                print("  ✓ Arc summary recalculated")
+                print("  Arc summary recalculated")
 
                 if validate_arc_summary(arc_summary_corrected, "Corrected"):
-                    print("  ✓ Corrected arc summary validated")
+                    print("  Corrected arc summary validated")
+                    # Log persistence statistics
+                    if 'persisted_containers' in arc_summary_corrected.columns:
+                        total_cont = arc_summary_corrected['physical_containers'].sum()
+                        persisted = arc_summary_corrected['persisted_containers'].sum()
+                        persist_pct = (persisted / total_cont * 100) if total_cont > 0 else 0
+                        print(
+                            f"  Container persistence: {persist_pct:.1f}% of containers persisted through crossdock")
                 else:
                     print("  WARNING:  Corrected arc summary validation failed, using original")
                     arc_summary_corrected = arc_summary_original
@@ -499,7 +507,7 @@ def main(input_path: str, output_dir: str):
                 print(f"  WARNING:  Container flow correction failed: {e}")
                 import traceback
                 traceback.print_exc()
-                print("  → Using original arc summary")
+                print("  Using original arc summary")
                 arc_summary = arc_summary_original
                 sort_container_impact = pd.DataFrame()
 
@@ -556,7 +564,7 @@ def main(input_path: str, output_dir: str):
                     dfs["mileage_bands"],
                     direct_day
                 )
-                print("  ✓ Facility network profile built")
+                print("  Facility network profile built")
             except Exception as e:
                 print(f"  WARNING:  Facility network profile failed: {e}")
                 facility_network_profile = pd.DataFrame()
@@ -660,8 +668,8 @@ def main(input_path: str, output_dir: str):
 
                 if write_success:
                     created_files.append(output_filename)
-                    print(f"  ✓ Wrote: {output_filename}")
-                    print(f"  ✓ Total cost: ${total_cost:,.0f} (${cost_per_pkg:.3f}/pkg)")
+                    print(f"  Wrote: {output_filename}")
+                    print(f"  Total cost: ${total_cost:,.0f} (${cost_per_pkg:.3f}/pkg)")
                 else:
                     print(f"  ERROR: Failed to write output file")
                     continue
@@ -835,7 +843,7 @@ def main(input_path: str, output_dir: str):
 
             if compare_success:
                 created_files.append(f"comparison_{run_id}.xlsx")
-                print(f"  ✓ Created: comparison_{run_id}.xlsx")
+                print(f"  Created: comparison_{run_id}.xlsx")
         except Exception as e:
             print(f"  WARNING:  Could not create comparison workbook: {e}")
 
@@ -849,7 +857,7 @@ def main(input_path: str, output_dir: str):
 
             if exec_success:
                 created_files.append(f"executive_summary_{run_id}.xlsx")
-                print(f"  ✓ Created: executive_summary_{run_id}.xlsx")
+                print(f"  Created: executive_summary_{run_id}.xlsx")
         except Exception as e:
             print(f"  WARNING:  Could not create executive summary: {e}")
 

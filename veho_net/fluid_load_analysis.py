@@ -122,6 +122,11 @@ def analyze_fluid_load_opportunities(
         if net_benefit <= 0:
             continue
 
+        # Get container breakdown if available
+        persisted = arc.get('persisted_containers', 0)
+        fresh = arc.get('fresh_containers', 0)
+        physical = arc.get('physical_containers', current_trucks * 22)  # Fallback estimate
+
         opportunities.append({
             'from_facility': from_fac,
             'to_facility': to_fac,
@@ -129,6 +134,9 @@ def analyze_fluid_load_opportunities(
             'current_strategy': 'container',
             'current_trucks': int(current_trucks),
             'current_fill_rate': round(current_fill, 3),
+            'physical_containers': int(physical),
+            'persisted_containers': int(persisted),
+            'fresh_containers': int(fresh),
             'potential_trucks_fluid': int(potential_trucks_fluid),
             'potential_fill_rate_fluid': round(min(potential_fill_fluid, 1.0), 3),
             'trucks_saved': int(trucks_saved),
