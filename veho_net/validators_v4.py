@@ -379,7 +379,6 @@ def _validate_timing_params(df: pd.DataFrame) -> None:
     Enhanced validation includes crossdock_va_hours for sort vs. crossdock distinction.
     """
     required_keys = {
-        "hours_per_touch",
         "injection_va_hours",
         "middle_mile_va_hours",
         "crossdock_va_hours",

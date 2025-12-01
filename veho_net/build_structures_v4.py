@@ -21,9 +21,7 @@ from typing import Tuple, List, Set, Dict
 from .geo_v4 import haversine_miles, cached_haversine
 from .utils import (
     get_facility_lookup,
-    ensure_columns_exist,
-    validate_shares_sum_to_one,
-    check_for_duplicates,
+    ensure_columns_exist
 )
 from .config_v4 import OptimizationConstants
 

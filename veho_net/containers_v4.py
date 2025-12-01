@@ -17,7 +17,7 @@ Business Logic:
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict
 
 from .config_v4 import OptimizationConstants
 from .utils import safe_divide
@@ -137,139 +137,6 @@ def calculate_truck_capacity(
         raise ValueError(f"Invalid strategy '{strategy}'. Must be 'container' or 'fluid'")
 
     return packages_per_truck
-
-
-# ============================================================================
-# PREMIUM ECONOMY DWELL LOGIC
-# ============================================================================
-
-def calculate_trucks_and_fill_rates(
-        total_packages: float,
-        package_mix: pd.DataFrame,
-        container_params: pd.DataFrame,
-        strategy: str,
-        dwell_threshold: float
-) -> Dict[str, float]:
-    """
-    Calculate truck requirements with premium economy dwell logic.
-
-    Premium economy dwell: If fractional truck usage is below threshold, round down
-    and dwell excess packages to next day rather than dispatch nearly-empty truck.
-
-    Fill rates use raw capacity (not effective) for executive reporting standard.
-
-    Args:
-        total_packages: Package volume
-        package_mix: Package distribution
-        container_params: Container/trailer parameters
-        strategy: 'container' or 'fluid' (fluid used for opportunity analysis)
-        dwell_threshold: Fractional truck threshold for rounding decision
-
-    Returns:
-        Dict with trucks_needed, fill rates, packages_dwelled, and cube metrics
-    """
-    # Handle zero-package case
-    if total_packages <= 0:
-        return {
-            'physical_containers': 0,
-            'trucks_needed': 1,  # Always minimum 1 truck
-            'container_fill_rate': 0.0,
-            'truck_fill_rate': 0.0,
-            'packages_dwelled': 0,
-            'total_cube_cuft': 0.0,
-            'cube_per_truck': 0.0
-        }
-
-    # Calculate total cube and get raw trailer capacity
-    weighted_cube = weighted_pkg_cube(package_mix)
-    total_cube = total_packages * weighted_cube
-    raw_trailer_cube = float(container_params["trailer_air_cube_cuft"].iloc[0])
-
-    # Get truck capacity from parameters
-    packages_per_truck_capacity = calculate_truck_capacity(package_mix, container_params, strategy)
-
-    if strategy.lower() == "container":
-        # ===== CONTAINER STRATEGY =====
-        gaylord_row = container_params[
-            container_params["container_type"].str.lower() == "gaylord"
-            ].iloc[0]
-
-        raw_container_cube = float(gaylord_row["usable_cube_cuft"])
-        pack_util_container = float(gaylord_row["pack_utilization_container"])
-        effective_container_cube = raw_container_cube * pack_util_container
-        containers_per_truck_val = int(gaylord_row["containers_per_truck"])
-
-        # Calculate containers needed (based on effective capacity)
-        exact_containers = total_cube / effective_container_cube
-        physical_containers = max(1, int(np.ceil(exact_containers)))
-
-        # Calculate raw trucks needed
-        raw_trucks = total_packages / packages_per_truck_capacity
-
-        # Apply premium economy dwell logic
-        if raw_trucks <= 1.0:
-            # Always use at least 1 truck (never round to 0)
-            final_trucks = 1
-            packages_dwelled = 0
-        else:
-            fractional_part = raw_trucks - int(raw_trucks)
-
-            if fractional_part < dwell_threshold:
-                # Round down and dwell excess packages
-                final_trucks = int(raw_trucks)
-                missing_capacity = (raw_trucks - final_trucks) * packages_per_truck_capacity
-                packages_dwelled = missing_capacity
-            else:
-                # Round up and dispatch partial truck
-                final_trucks = int(np.ceil(raw_trucks))
-                packages_dwelled = 0
-
-        # Fill rates use raw capacities (executive reporting standard)
-        container_fill_rate = min(1.0, total_cube / (physical_containers * raw_container_cube))
-        truck_fill_rate = min(1.0, total_cube / (final_trucks * raw_trailer_cube))
-
-    else:
-        # ===== FLUID STRATEGY =====
-        # Calculate raw trucks needed
-        raw_trucks = total_packages / packages_per_truck_capacity
-
-        # Apply premium economy dwell logic
-        if raw_trucks <= 1.0:
-            # Always use at least 1 truck (never round to 0)
-            final_trucks = 1
-            packages_dwelled = 0
-        else:
-            fractional_part = raw_trucks - int(raw_trucks)
-
-            if fractional_part < dwell_threshold:
-                # Round down and dwell excess packages
-                final_trucks = int(raw_trucks)
-                missing_capacity = (raw_trucks - final_trucks) * packages_per_truck_capacity
-                packages_dwelled = missing_capacity
-            else:
-                # Round up and dispatch partial truck
-                final_trucks = int(np.ceil(raw_trucks))
-                packages_dwelled = 0
-
-        # No containers in fluid strategy
-        physical_containers = 0
-        container_fill_rate = 0.0
-
-        # Truck fill rate uses raw capacity
-        truck_fill_rate = min(1.0, total_cube / (final_trucks * raw_trailer_cube))
-
-    # Calculate cube per truck
-    cube_per_truck = safe_divide(total_cube, final_trucks, default=0.0)
-
-    return {
-        'physical_containers': physical_containers,
-        'trucks_needed': final_trucks,
-        'container_fill_rate': container_fill_rate,
-        'truck_fill_rate': truck_fill_rate,
-        'packages_dwelled': packages_dwelled,
-        'total_cube_cuft': total_cube,
-        'cube_per_truck': cube_per_truck,
-    }
 
 
 # ============================================================================

@@ -525,9 +525,8 @@ def main(input_path: str, output_dir: str):
                     od_selected,
                     dfs["facilities"],
                     dfs["mileage_bands"],
-                    timing_params_dict
                 )
-                print("  ✓ Path steps built")
+                print("  Path steps built")
             except Exception as e:
                 print(f"  WARNING:  Path steps generation failed: {e}")
                 path_steps = pd.DataFrame()
@@ -543,7 +542,7 @@ def main(input_path: str, output_dir: str):
                     dfs["facilities"],
                     timing_params_dict
                 )
-                print("  ✓ Facility volume calculated")
+                print("  Facility volume calculated")
             except Exception as e:
                 print(f"  WARNING:  Facility volume calculation failed: {e}")
                 import traceback

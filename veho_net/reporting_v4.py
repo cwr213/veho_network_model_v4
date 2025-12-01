@@ -834,7 +834,6 @@ def build_path_steps(
     path_steps = []
 
     fac_lookup = facilities.set_index('facility_name')[['lat', 'lon']].astype(float)
-    hours_per_touch = float(timing_params['hours_per_touch'])
 
     for _, od_row in od_selected.iterrows():
         path_nodes = extract_path_nodes(od_row)
@@ -862,8 +861,7 @@ def build_path_steps(
                     'to_lat': to_lat,
                     'to_lon': to_lon,
                     'distance_miles': 0.0,
-                    'drive_hours': 0.0,
-                    'processing_hours_at_destination': hours_per_touch
+                    'drive_hours': 0.0
                 })
                 continue
 
@@ -888,8 +886,7 @@ def build_path_steps(
                     'to_lat': lat2,
                     'to_lon': lon2,
                     'distance_miles': actual_dist,
-                    'drive_hours': drive_hours,
-                    'processing_hours_at_destination': hours_per_touch
+                    'drive_hours': drive_hours
                 })
 
     return pd.DataFrame(path_steps)
