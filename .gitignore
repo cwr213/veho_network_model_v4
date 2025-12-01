@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output files
+outputs/
+*.xlsx
+
+# IDE
+.idea/
+.vscode/
+*.swp
