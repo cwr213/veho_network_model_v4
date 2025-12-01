@@ -171,8 +171,6 @@ def build_od_and_direct(
 def candidate_paths(
         od: pd.DataFrame,
         facilities: pd.DataFrame,
-        mileage_bands: pd.DataFrame,
-        around_factor: float
 ) -> pd.DataFrame:
     """
     Generate candidate paths with REGIONAL HUB CONSISTENCY.
@@ -203,8 +201,6 @@ def candidate_paths(
     Args:
         od: OD matrix with origin, dest, and volume columns
         facilities: Facility master data
-        mileage_bands: Mileage bands for distance calculations (unused in v4.6)
-        around_factor: Maximum circuity multiplier (unused in v4.6 - topology-driven)
 
     Returns:
         DataFrame with columns:

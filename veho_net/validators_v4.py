@@ -171,16 +171,16 @@ def _validate_facilities(df: pd.DataFrame) -> None:
     Validate facilities sheet.
 
     Required columns:
-    - facility_name, type, market, region
-    - lat, lon, timezone
+    - facility_name, type
+    - lat, lon
     - parent_hub_name, regional_sort_hub
     - is_injection_node
     - max_sort_points_capacity (for hub/hybrid)
     - last_mile_sort_groups_count (for launch/hybrid)
     """
     required_cols = {
-        "facility_name", "type", "market", "region",
-        "lat", "lon", "timezone",
+        "facility_name", "type",
+        "lat", "lon",
         "parent_hub_name", "regional_sort_hub",
         "is_injection_node",
         "max_sort_points_capacity",
@@ -253,7 +253,7 @@ def _validate_facilities(df: pd.DataFrame) -> None:
 
 def _validate_zips(df: pd.DataFrame) -> None:
     """Validate ZIP code assignment data."""
-    required_cols = {"zip", "facility_name_assigned", "market", "population"}
+    required_cols = {"zip", "facility_name_assigned", "population"}
 
     missing = required_cols - set(df.columns)
     if missing:
@@ -423,9 +423,6 @@ def _validate_cost_params(df: pd.DataFrame) -> None:
         "last_mile_sort_cost_per_pkg",
         "last_mile_delivery_cost_per_pkg",
         "container_handling_cost",
-        "premium_economy_dwell_threshold",
-        "dwell_cost_per_pkg_per_day",
-        "sla_penalty_per_touch_per_pkg"
     }
 
     missing = required_keys - set(df["key"])
@@ -444,14 +441,6 @@ def _validate_cost_params(df: pd.DataFrame) -> None:
                     raise ValueError(f"cost_params: {key} must be non-negative (found: {value})")
             except (ValueError, TypeError):
                 raise ValueError(f"cost_params: {key} must be numeric (found: {row['value']})")
-
-    dwell_row = df[df["key"] == "premium_economy_dwell_threshold"]
-    if not dwell_row.empty:
-        dwell_val = float(dwell_row.iloc[0]["value"])
-        if not (0 <= dwell_val <= 1):
-            raise ValueError(
-                f"premium_economy_dwell_threshold must be in [0,1] (found: {dwell_val})"
-            )
 
 
 def _validate_container_params(df: pd.DataFrame) -> None:
@@ -515,7 +504,6 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
     with fluid opportunities identified via post-optimization analysis.
     """
     required_keys = {
-        "path_around_the_world_factor",
         "enable_sort_optimization",
         "fluid_opportunity_fill_threshold"
     }
@@ -526,14 +514,6 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
             f"run_settings missing REQUIRED keys: {sorted(missing)}\n"
             f"All run settings must be specified."
         )
-
-    around_row = df[df["key"] == "path_around_the_world_factor"]
-    if not around_row.empty:
-        around_val = float(around_row.iloc[0]["value"])
-        if around_val < 1.0 or around_val > 5.0:
-            raise ValueError(
-                f"path_around_the_world_factor should be in [1.0, 5.0] (found: {around_val})"
-            )
 
 
 def _validate_scenarios(df: pd.DataFrame) -> None:

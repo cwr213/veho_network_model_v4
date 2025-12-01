@@ -137,8 +137,6 @@ class CostParameters:
     last_mile_sort_cost_per_pkg: float
     last_mile_delivery_cost_per_pkg: float
     container_handling_cost: float
-    premium_economy_dwell_threshold: float
-    dwell_cost_per_pkg_per_day: float
 
     def __post_init__(self):
         """Validate all costs are non-negative."""
@@ -182,27 +180,6 @@ class TimingParameters:
                 raise ValueError(f"{field_name} must be positive, got {field_value}")
 
 
-@dataclass(frozen=True)
-class RunSettings:
-    """
-    Run configuration - ALL REQUIRED from run_settings input sheet.
-    NO DEFAULTS ALLOWED.
-    """
-    load_strategy: LoadStrategy
-    sla_target_days: int
-    path_around_the_world_factor: float
-    enable_sort_optimization: bool
-
-    def __post_init__(self):
-        """Validate run settings."""
-        if self.path_around_the_world_factor < 1.0:
-            raise ValueError(
-                f"path_around_the_world_factor must be >= 1.0, "
-                f"got {self.path_around_the_world_factor}"
-            )
-
-        if self.sla_target_days < 1:
-            raise ValueError(f"sla_target_days must be >= 1, got {self.sla_target_days}")
 
 
 # ============================================================================
