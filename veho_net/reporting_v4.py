@@ -827,8 +827,7 @@ def add_zone_miles_to_od_selected(
 def build_path_steps(
         od_selected: pd.DataFrame,
         facilities: pd.DataFrame,
-        mileage_bands: pd.DataFrame,
-        timing_params: Dict
+        mileage_bands: pd.DataFrame
 ) -> pd.DataFrame:
     """Generate path steps from selected OD paths."""
     path_steps = []

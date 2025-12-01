@@ -163,7 +163,6 @@ class TimingParameters:
     - Sort operations require extensive conveyor/automation infrastructure
     - Crossdock operations only need dock space and material handling equipment
     """
-    unload_hours: float
     injection_va_hours: float
     middle_mile_va_hours: float
     crossdock_va_hours: float
