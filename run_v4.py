@@ -16,7 +16,7 @@ from datetime import datetime
 import sys
 
 from veho_net.config_v4 import (
-    CostParameters, TimingParameters, RunSettings,
+    CostParameters, TimingParameters,
     LoadStrategy, OUTPUT_FILE_TEMPLATE
 )
 from veho_net.io_loader_v4 import load_workbook, params_to_dict
@@ -184,8 +184,6 @@ def main(input_path: str, output_dir: str):
             last_mile_sort_cost_per_pkg=float(cost_params_dict["last_mile_sort_cost_per_pkg"]),
             last_mile_delivery_cost_per_pkg=float(cost_params_dict["last_mile_delivery_cost_per_pkg"]),
             container_handling_cost=float(cost_params_dict["container_handling_cost"]),
-            premium_economy_dwell_threshold=float(cost_params_dict["premium_economy_dwell_threshold"]),
-            dwell_cost_per_pkg_per_day=float(cost_params_dict["dwell_cost_per_pkg_per_day"]),
         )
         print("Cost parameters created")
     except Exception as e:
@@ -193,12 +191,11 @@ def main(input_path: str, output_dir: str):
         print(f"   Error: {e}")
         return 1
 
-        # Always use container strategy as baseline  ← CORRECT: OUTSIDE try-except
-        # Fluid opportunities are identified post-optimization via fluid_load_analysis
+    # Always use container strategy as baseline
+    # Fluid opportunities are identified post-optimization via fluid_load_analysis
     global_strategy = LoadStrategy.CONTAINER
 
     enable_sort_opt = bool(run_settings_dict.get("enable_sort_optimization", False))
-    around_factor = float(run_settings_dict.get("path_around_the_world_factor", 1.3))
 
     user_run_id = run_settings_dict.get("run_id", None)
     if user_run_id and str(user_run_id).strip():
@@ -211,7 +208,6 @@ def main(input_path: str, output_dir: str):
     print(f"\nConfiguration:")
     print(f"  Strategy: Container (fluid opportunities analyzed post-optimization)")
     print(f"  Sort optimization: {'ENABLED' if enable_sort_opt else 'DISABLED'}")
-    print(f"  Path around factor: {around_factor}")
     print(f"  Run ID: {run_id}")
 
     all_results = []
@@ -283,8 +279,6 @@ def main(input_path: str, output_dir: str):
                 paths = candidate_paths(
                     od,
                     dfs["facilities"],
-                    dfs["mileage_bands"],
-                    around_factor
                 )
             except Exception as e:
                 print(f"  ERROR: Path generation failed: {e}")
