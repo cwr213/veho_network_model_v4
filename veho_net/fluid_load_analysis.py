@@ -13,7 +13,7 @@ from .containers_v4 import (
     weighted_pkg_cube,
     get_raw_trailer_cube
 )
-from .utils import safe_divide, get_facility_lookup
+from .utils import safe_divide, get_facility_lookup, extract_path_nodes
 from .config_v4 import CostParameters, PerformanceThresholds
 
 
@@ -45,6 +45,7 @@ def analyze_fluid_load_opportunities(
         container_params: Container/trailer parameters
         mileage_bands: Mileage bands (unused, kept for API compatibility)
         cost_params: Cost parameters
+        fluid_fill_threshold: Only analyze arcs below this fill rate
 
     Returns:
         DataFrame with ALL arcs that have positive net benefit from fluid loading.
@@ -188,9 +189,7 @@ def _calculate_incremental_sort_cost(
     # Find OD flows that use this arc
     arc_ods = []
     for _, od_row in od_selected.iterrows():
-        path_nodes = od_row.get('path_nodes', [])
-        if not isinstance(path_nodes, (list, tuple)):
-            continue
+        path_nodes = extract_path_nodes(od_row)
 
         # Check if this arc is in the path
         for i in range(len(path_nodes) - 1):
@@ -277,30 +276,3 @@ def create_fluid_load_summary_report(opportunities: pd.DataFrame) -> str:
     lines.append(f"Note: Full list of {len(opportunities)} opportunities saved to Excel for filtering/sorting")
 
     return "\n".join(lines)
-
-
-def calculate_sort_point_savings(
-        opportunities: pd.DataFrame,
-        timing_params: Dict,
-        facilities: pd.DataFrame
-) -> pd.DataFrame:
-    """
-    Calculate sort point capacity freed up by fluid loading opportunities.
-
-    Note: With simplified arc-based analysis, sort point savings are less
-    directly calculable since we're not tracking origin facility sort decisions.
-    This function is kept for API compatibility but returns empty DataFrame.
-
-    For detailed sort point analysis, use sort_strategy_comparison module.
-
-    Args:
-        opportunities: Fluid load opportunities (arc-based)
-        timing_params: Timing parameters
-        facilities: Facility master data
-
-    Returns:
-        Empty DataFrame (feature not applicable to simplified arc analysis)
-    """
-    # Not applicable to simplified arc-based analysis
-    # Sort point savings require OD-level sort decision tracking
-    return pd.DataFrame()

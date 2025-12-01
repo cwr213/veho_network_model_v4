@@ -13,7 +13,7 @@ import numpy as np
 from typing import Dict, Tuple
 
 from .geo_v4 import haversine_miles, band_lookup
-from .utils import safe_divide, get_facility_lookup
+from .utils import safe_divide, get_facility_lookup, extract_path_nodes
 
 
 def calculate_zone_cost_analysis(
@@ -157,7 +157,7 @@ def calculate_zone_cost_analysis(
 
             for _, row in zone_ods.iterrows():
                 pkgs = row['pkgs_day']
-                path_nodes = row.get('path_nodes', [row['origin'], row['dest']])
+                path_nodes = extract_path_nodes(row)
 
                 # Total touches
                 total_touches = len(path_nodes)
@@ -240,7 +240,7 @@ def calculate_zone_cost_analysis(
                 transit_miles_weighted.extend([transit_miles] * int(pkgs))
 
                 # Touches
-                path_nodes = row.get('path_nodes', [row['origin'], row['dest']])
+                path_nodes = extract_path_nodes(row)
 
                 total_touches = len(path_nodes)
                 touch_weighted.extend([total_touches] * int(pkgs))
@@ -293,7 +293,7 @@ def _calculate_path_transit_miles(
         mileage_bands: pd.DataFrame
 ) -> float:
     """Calculate total transit miles for a path (sum of all arcs)."""
-    path_nodes = od_row.get('path_nodes', [od_row['origin'], od_row['dest']])
+    path_nodes = extract_path_nodes(od_row)
 
     total_miles = 0.0
 

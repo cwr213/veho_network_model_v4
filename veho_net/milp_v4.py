@@ -36,6 +36,9 @@ from .utils import safe_divide, get_facility_lookup, extract_path_nodes
 
 MAX_SAFE_INT = 2 ** 31 - 1
 
+# Valid sort levels - used for validation
+VALID_SORT_LEVELS = frozenset(['region', 'market', 'sort_group'])
+
 
 def safe_int_cost(value: float, context: str = "") -> int:
     """Convert cost to safe integer for MILP solver."""
@@ -117,18 +120,36 @@ def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
     Calculate per-package processing cost.
 
     Handles injection, intermediate, and last-mile costs based on sort level.
+
+    Sort Level Cost Logic:
+    - Region: Freight unsorted to regional hub → intermediate facilities do full sort
+    - Market: Freight sorted to destination → intermediate facilities crossdock only
+    - Sort_group: Freight pre-sorted to route groups → intermediate facilities crossdock only
+
+    Raises:
+        ValueError: If sort_level is not one of: region, market, sort_group
     """
+    # Validate sort_level upfront
+    if sort_level not in VALID_SORT_LEVELS:
+        raise ValueError(
+            f"Invalid sort_level '{sort_level}'. "
+            f"Expected one of: {sorted(VALID_SORT_LEVELS)}"
+        )
+
     nodes = path_data['path_nodes']
     origin = path_data['origin']
     dest = path_data['dest']
 
+    # Injection sort at origin (always required)
     cost = cost_params.injection_sort_cost_per_pkg
 
+    # O=D special case: no linehaul, just last-mile
     if origin == dest:
         cost += cost_params.last_mile_sort_cost_per_pkg
         cost += cost_params.last_mile_delivery_cost_per_pkg
         return cost
 
+    # Intermediate facility costs
     intermediates = nodes[1:-1] if len(nodes) > 2 else []
 
     if intermediates:
@@ -137,21 +158,25 @@ def _calculate_processing_cost(path_data, sort_level, strategy, cost_params,
         )
 
         if sort_level == 'region':
+            # Region sort: freight unsorted → intermediates must do full sort
             cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
-        elif sort_level == 'sort_group':
-            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+
         elif sort_level == 'market':
+            # Market sort: freight sorted to destination
             if strategy.lower() == 'container':
+                # Container: crossdock only (handle containers)
                 cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
             else:
-                cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
-        else:
-            if strategy.lower() == 'container':
-                cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
-            else:
+                # Fluid: must sort at intermediate
                 cost += len(intermediates) * cost_params.intermediate_sort_cost_per_pkg
 
+        elif sort_level == 'sort_group':
+            # Sort_group: freight pre-sorted to route groups → crossdock only
+            cost += len(intermediates) * cost_params.container_handling_cost * containers_per_package
+
+    # Last-mile costs
     if sort_level != 'sort_group':
+        # Region and market require last-mile sort
         cost += cost_params.last_mile_sort_cost_per_pkg
 
     cost += cost_params.last_mile_delivery_cost_per_pkg

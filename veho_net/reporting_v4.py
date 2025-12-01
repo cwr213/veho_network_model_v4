@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 
 from .geo_v4 import calculate_zone_from_distance, haversine_miles, band_lookup
 from .containers_v4 import weighted_pkg_cube
-from .utils import safe_divide, get_facility_lookup
+from .utils import safe_divide, get_facility_lookup, extract_path_nodes
 from .config_v4 import OptimizationConstants
 
 
@@ -114,9 +114,7 @@ def build_facility_volume(
 
             if not od_selected.empty:
                 for _, path_row in od_selected.iterrows():
-                    path_nodes = path_row.get('path_nodes', [])
-                    if not isinstance(path_nodes, (list, tuple)):
-                        continue
+                    path_nodes = extract_path_nodes(path_row)
 
                     final_dest = path_row['dest']
                     path_strategy = path_row.get('effective_strategy', strategy)
@@ -311,6 +309,65 @@ def _calculate_containers_for_volume(
 
 
 # ============================================================================
+# ZONE PACKAGE COUNTING (SHARED HELPER)
+# ============================================================================
+
+def _count_zone_packages(
+        od_df: pd.DataFrame,
+        direct_df: pd.DataFrame = None,
+        facility: str = None
+) -> Tuple[Dict[int, float], float]:
+    """
+    Count packages by zone.
+
+    Shared helper for zone distribution calculations. Handles both facility-level
+    and network-level aggregations.
+
+    Args:
+        od_df: Middle-mile OD flows with 'zone' column
+        direct_df: Direct injection (zone 0), optional
+        facility: If set, only count direct injection for this facility's destinations.
+                  If None, count all direct injection.
+
+    Returns:
+        Tuple of (zone_counts dict {zone_num: pkg_count}, total_packages)
+    """
+    zone_pkgs = {i: 0.0 for i in range(9)}
+    zone_pkgs[-1] = 0.0  # Unknown
+    total_pkgs = 0.0
+
+    # Count middle-mile packages by zone
+    if not od_df.empty and 'zone' in od_df.columns:
+        total_pkgs += od_df['pkgs_day'].sum()
+
+        for zone_num in range(9):
+            zone_pkgs[zone_num] += od_df[od_df['zone'] == zone_num]['pkgs_day'].sum()
+
+        # Unknown zone (-1)
+        zone_pkgs[-1] += od_df[od_df['zone'] == -1]['pkgs_day'].sum()
+
+    # Count direct injection packages (zone 0)
+    if direct_df is not None and not direct_df.empty:
+        direct_col = 'dir_pkgs_day'
+        if direct_col in direct_df.columns:
+            if facility is not None:
+                # Facility-level: only count direct injection where THIS facility is destination
+                if 'dest' in direct_df.columns:
+                    facility_direct = direct_df[direct_df['dest'] == facility]
+                    if not facility_direct.empty:
+                        direct_pkgs = facility_direct[direct_col].sum()
+                        zone_pkgs[0] += direct_pkgs
+                        total_pkgs += direct_pkgs
+            else:
+                # Network-level: count all direct injection
+                direct_pkgs = direct_df[direct_col].sum()
+                zone_pkgs[0] += direct_pkgs
+                total_pkgs += direct_pkgs
+
+    return zone_pkgs, total_pkgs
+
+
+# ============================================================================
 # FACILITY NETWORK PROFILE (NETWORK CHARACTERISTICS)
 # ============================================================================
 
@@ -322,8 +379,6 @@ def build_facility_network_profile(
 ) -> pd.DataFrame:
     """
     Build facility network profile with zone/sort/distance/touch characteristics.
-
-    FIXED: Now includes direct injection (zone 0) in zone distribution.
 
     Includes zones 0-8 and unknown zone tracking.
     """
@@ -349,10 +404,10 @@ def build_facility_network_profile(
 
             touch_metrics = _calculate_touch_metrics_for_ods(origin_ods, facilities)
 
-            # FIXED: Calculate zone distribution including direct injection
+            # Zone distribution (using shared helper)
             zone_dist = _calculate_zone_distribution_for_ods(origin_ods, direct_day, origin)
 
-            # Calculate sort level distribution
+            # Sort level distribution
             sort_dist = _calculate_sort_level_distribution_for_ods(origin_ods)
 
             fac_type = fac_lookup.at[origin, 'type'] if origin in fac_lookup.index else 'unknown'
@@ -370,7 +425,7 @@ def build_facility_network_profile(
                 # Touch metrics
                 **touch_metrics,
 
-                # Zone distribution (0-8 + unknown) - includes direct injection
+                # Zone distribution (0-8 + unknown)
                 **zone_dist,
 
                 # Sort level distribution
@@ -411,9 +466,7 @@ def _calculate_distance_metrics_for_ods(
             zone_miles_list.extend([zone_miles] * int(pkgs))
 
         # Transit miles (sum of all arcs)
-        path_nodes = od_row.get('path_nodes', [origin, dest])
-        if not isinstance(path_nodes, list):
-            path_nodes = [origin, dest]
+        path_nodes = extract_path_nodes(od_row)
 
         transit_miles = 0
         for i in range(len(path_nodes) - 1):
@@ -449,8 +502,7 @@ def _calculate_touch_metrics_for_ods(
     hub_touches_list = []
 
     for _, od_row in ods.iterrows():
-        path_nodes = od_row.get('path_nodes', [od_row['origin'], od_row['dest']])
-
+        path_nodes = extract_path_nodes(od_row)
         pkgs = od_row['pkgs_day']
 
         # Total touches
@@ -484,8 +536,7 @@ def _calculate_zone_distribution_for_ods(
     """
     Calculate zone distribution for OD set.
 
-    SIMPLIFIED v4.7: Uses integer zones directly.
-
+    Uses shared _count_zone_packages helper.
     Returns DECIMALS not percentages (0.25 not 25.0).
 
     Args:
@@ -494,53 +545,18 @@ def _calculate_zone_distribution_for_ods(
         facility: Facility name (for direct injection filtering)
 
     Returns:
-        Dictionary with:
-            - zone_0_pct through zone_8_pct (decimals 0-1)
-            - zone_unknown_pct (decimal 0-1)
+        Dictionary with zone_0_pct through zone_8_pct and zone_unknown_pct (decimals 0-1)
     """
-    from .utils import safe_divide
+    zone_pkgs, total_pkgs = _count_zone_packages(ods, direct_day, facility)
 
-    # Start with middle-mile OD zones
-    total_pkgs = 0
-    zone_pkgs = {i: 0 for i in range(9)}
-    zone_pkgs[-1] = 0  # Unknown
-
-    # Add middle-mile packages
-    if not ods.empty and 'zone' in ods.columns:
-        total_pkgs += ods['pkgs_day'].sum()
-
-        for zone_num in range(9):
-            zone_pkgs[zone_num] += ods[
-                ods['zone'] == zone_num
-                ]['pkgs_day'].sum()
-
-        # Unknown
-        zone_pkgs[-1] += ods[
-            ods['zone'] == -1
-            ]['pkgs_day'].sum()
-
-    # Add direct injection packages (zone 0) if applicable
-    if direct_day is not None and not direct_day.empty and facility is not None:
-        direct_col = 'dir_pkgs_day'
-        if direct_col in direct_day.columns and 'dest' in direct_day.columns:
-            # Direct injection where THIS facility is the destination
-            facility_direct = direct_day[direct_day['dest'] == facility]
-            if not facility_direct.empty:
-                direct_pkgs = facility_direct[direct_col].sum()
-                zone_pkgs[0] += direct_pkgs
-                total_pkgs += direct_pkgs
-
-    # Calculate percentages as DECIMALS
     zone_dist = {}
     for zone_num in range(9):
         zone_dist[f'zone_{zone_num}_pct'] = round(
-            safe_divide(zone_pkgs[zone_num], total_pkgs),
-            4
+            safe_divide(zone_pkgs[zone_num], total_pkgs), 4
         )
 
     zone_dist['zone_unknown_pct'] = round(
-        safe_divide(zone_pkgs[-1], total_pkgs),
-        4
+        safe_divide(zone_pkgs[-1], total_pkgs), 4
     )
 
     return zone_dist
@@ -622,8 +638,7 @@ def calculate_network_zone_distribution(
     """
     Calculate network-level zone distribution.
 
-    NOTE: Used for comparison workbooks only, not in scenario KPIs.
-    For facility-level zone detail, see facility_network_profile.
+    Uses shared _count_zone_packages helper for consistency with facility-level calculations.
 
     Includes:
     - Zone 0: Direct injection (from direct_day)
@@ -641,49 +656,18 @@ def calculate_network_zone_distribution(
             - zone_unknown_pkgs (int)
             - zone_unknown_pct (decimal 0-1)
     """
-    from .utils import safe_divide
+    zone_pkgs, total_pkgs = _count_zone_packages(od_selected, direct_day, facility=None)
 
-    # Initialize
-    zone_pkgs = {i: 0 for i in range(9)}
-    zone_pkgs[-1] = 0  # Unknown
-    total_pkgs = 0
-
-    # Add middle-mile packages (zones 1-8, possibly -1)
-    if not od_selected.empty and 'zone' in od_selected.columns:
-        total_pkgs += od_selected['pkgs_day'].sum()
-
-        for zone_num in range(9):
-            zone_pkgs[zone_num] += od_selected[
-                od_selected['zone'] == zone_num
-                ]['pkgs_day'].sum()
-
-        # Unknown zone (-1)
-        zone_pkgs[-1] += od_selected[
-            od_selected['zone'] == -1
-            ]['pkgs_day'].sum()
-
-    # Add direct injection packages (zone 0)
-    if direct_day is not None and not direct_day.empty:
-        direct_col = 'dir_pkgs_day'
-        if direct_col in direct_day.columns:
-            direct_pkgs = direct_day[direct_col].sum()
-            zone_pkgs[0] += direct_pkgs
-            total_pkgs += direct_pkgs
-
-    # Build result as decimals (not percentages)
     result = {}
-
     for zone_num in range(9):
         result[f'zone_{zone_num}_pkgs'] = int(zone_pkgs[zone_num])
         result[f'zone_{zone_num}_pct'] = round(
-            safe_divide(zone_pkgs[zone_num], total_pkgs),
-            4  # 4 decimal places
+            safe_divide(zone_pkgs[zone_num], total_pkgs), 4
         )
 
     result['zone_unknown_pkgs'] = int(zone_pkgs[-1])
     result['zone_unknown_pct'] = round(
-        safe_divide(zone_pkgs[-1], total_pkgs),
-        4
+        safe_divide(zone_pkgs[-1], total_pkgs), 4
     )
 
     return result
@@ -742,8 +726,6 @@ def add_zone_classification(
     """
     Add zone classification based on distance from mileage_bands.
 
-    SIMPLIFIED v4.7: Uses integer zones directly (0-8 or -1).
-
     Zone Assignment Rules:
     - For ALL flows (including O=D): Use mileage_bands for distance
     - Zone 0 is ONLY for direct injection (handled separately)
@@ -757,8 +739,6 @@ def add_zone_classification(
     Returns:
         DataFrame with added 'zone' column (integer)
     """
-    from .geo_v4 import calculate_zone_from_distance
-
     if od_df.empty:
         return od_df
 
@@ -781,8 +761,6 @@ def add_direct_injection_zone_classification(
 ) -> pd.DataFrame:
     """
     Add zone 0 classification to direct injection flows.
-
-    SIMPLIFIED v4.7: Zone is integer 0.
 
     Direct injection = packages injected at destination without middle-mile transport.
     These are ALWAYS zone 0.
@@ -818,9 +796,6 @@ def add_zone_miles_to_od_selected(
     Returns:
         DataFrame with added 'zone_miles' column (float)
     """
-    from .geo_v4 import haversine_miles
-    from .utils import get_facility_lookup
-
     if od_df.empty:
         return od_df
 
@@ -846,7 +821,7 @@ def add_zone_miles_to_od_selected(
 
 
 # ============================================================================
-# LEGACY FUNCTIONS
+# PATH STEPS (LEGACY - USED BY run_v4.py)
 # ============================================================================
 
 def build_path_steps(
@@ -862,15 +837,13 @@ def build_path_steps(
     hours_per_touch = float(timing_params['hours_per_touch'])
 
     for _, od_row in od_selected.iterrows():
-        path_str = str(od_row.get('path_str', f"{od_row['origin']}->{od_row['dest']}"))
+        path_nodes = extract_path_nodes(od_row)
         scenario_id = od_row.get('scenario_id', 'default')
 
-        if '->' not in path_str:
-            continue
+        for i in range(len(path_nodes) - 1):
+            from_fac = path_nodes[i]
+            to_fac = path_nodes[i + 1]
 
-        nodes = [n.strip() for n in path_str.split('->')]
-
-        for i, (from_fac, to_fac) in enumerate(zip(nodes[:-1], nodes[1:])):
             if from_fac == to_fac:
                 from_lat = fac_lookup.at[from_fac, 'lat'] if from_fac in fac_lookup.index else 0
                 from_lon = fac_lookup.at[from_fac, 'lon'] if from_fac in fac_lookup.index else 0
@@ -922,8 +895,9 @@ def build_path_steps(
     return pd.DataFrame(path_steps)
 
 
-# build_sort_summary removed - use _build_sort_summary from milp_v4.py instead
-
+# ============================================================================
+# VALIDATION
+# ============================================================================
 
 def validate_network_aggregations(
         od_selected: pd.DataFrame,
