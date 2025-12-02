@@ -15,15 +15,15 @@ import pandas as pd
 from datetime import datetime
 import sys
 
-from veho_net.config_v4 import (
+from src.config_v4 import (
     CostParameters, TimingParameters,
     LoadStrategy, OUTPUT_FILE_TEMPLATE
 )
-from veho_net.io_loader_v4 import load_workbook, params_to_dict
-from veho_net.validators_v4 import validate_inputs
-from veho_net.build_structures_v4 import build_od_and_direct, candidate_paths
-from veho_net.milp_v4 import solve_network_optimization
-from veho_net.reporting_v4 import (
+from src.io_loader_v4 import load_workbook, params_to_dict
+from src.validators_v4 import validate_inputs
+from src.build_structures_v4 import build_od_and_direct, candidate_paths
+from src.milp_v4 import solve_network_optimization
+from src.reporting_v4 import (
     build_facility_volume,
     build_facility_network_profile,
     calculate_network_distance_metrics,
@@ -36,24 +36,24 @@ from veho_net.reporting_v4 import (
     build_path_steps,
     validate_network_aggregations
 )
-from veho_net.write_outputs_v4 import (
+from src.write_outputs_v4 import (
     write_workbook,
     write_comparison_workbook,
     write_executive_summary
 )
-from veho_net.zone_cost_analysis import (
+from src.zone_cost_analysis import (
     calculate_zone_cost_analysis,
     create_zone_cost_summary_table
 )
-from veho_net.fluid_load_analysis import (
+from src.fluid_load_analysis import (
     analyze_fluid_load_opportunities,
     create_fluid_load_summary_report
 )
-from veho_net.sort_strategy_comparison import (
+from src.sort_strategy_comparison import (
     run_sort_strategy_comparison,
     create_comparison_summary_report
 )
-from veho_net.container_flow_v4 import (
+from src.container_flow_v4 import (
     build_od_container_map,
     build_od_container_map_with_persistence,
     recalculate_arc_summary_with_container_flow,

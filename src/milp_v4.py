@@ -551,12 +551,20 @@ def _build_objective_function(
                     cost_terms.append(cost_active * total_cost)
                     processing_terms += 1
         else:
-            # Baseline: market sort for all
+            # Baseline: market sort for all EXCEPT O=D which must use sort_group
             for path_idx in group_idxs:
                 strategy = path_od_data[path_idx]['effective_strategy']
+                origin = path_od_data[path_idx]['origin']
+                dest = path_od_data[path_idx]['dest']
+
+                # O=D can only use sort_group
+                if origin == dest:
+                    baseline_sort_level = 'sort_group'
+                else:
+                    baseline_sort_level = 'market'
 
                 proc_cost = _calculate_processing_cost(
-                    path_od_data[path_idx], 'market', strategy,
+                    path_od_data[path_idx], baseline_sort_level, strategy,
                     cost_params, facilities, package_mix, container_params
                 )
 
@@ -801,7 +809,11 @@ def _build_selected_paths(chosen_idx, path_od_data, path_arcs, arc_meta,
         if enable_sort_optimization:
             sort_level = sort_decisions.get(group_key, 'market')
         else:
-            sort_level = 'market'
+            # Baseline: market sort for all EXCEPT O=D which must use sort_group
+            if path_data['origin'] == path_data['dest']:
+                sort_level = 'sort_group'
+            else:
+                sort_level = 'market'
 
         transport_cost = 0
         for a_idx in path_arcs[i]:

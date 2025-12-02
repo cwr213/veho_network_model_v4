@@ -453,6 +453,7 @@ def build_facility_network_profile(
         return pd.DataFrame()
 
     fac_lookup = get_facility_lookup(facilities)
+
     profile_data = []
 
     origins = od_selected['origin'].unique()
