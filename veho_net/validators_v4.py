@@ -504,7 +504,8 @@ def _validate_run_settings(df: pd.DataFrame) -> None:
     """
     required_keys = {
         "enable_sort_optimization",
-        "fluid_opportunity_fill_threshold"
+        "fluid_opportunity_fill_threshold",
+        "path_around_the_world_factor"
     }
 
     missing = required_keys - set(df["key"])

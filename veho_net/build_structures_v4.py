@@ -2,438 +2,637 @@
 Network Structure Generation Module
 
 Creates OD matrix and generates candidate paths through the network.
-Enforces regional hub hierarchy to ensure consistent routing.
+Generates MULTIPLE candidate paths per OD pair (direct, 1-touch, 2-touch, 3-touch)
+to enable MILP optimization of path selection.
 
 Key Functions:
-- build_od_and_direct: Create OD matrix from demand forecast
-- candidate_paths: Generate feasible routing alternatives
+    - build_od_and_direct: Create OD matrix from demand forecast
+    - candidate_paths: Generate multiple feasible routing alternatives per OD
+    - get_facility_lookup: Indexed facility reference data
 
 Business Rules:
-- O=D paths allowed only for hybrid facilities
-- Launch facilities cannot be intermediate stops
-- All destinations in same region route through same regional hub
+    - O=D paths allowed only for hybrid facilities
+    - Launch facilities cannot be intermediate stops
+    - path_around_the_world_factor filters unreasonably circuitous paths
+    - Regional hub hierarchy is a preference, not a hard constraint
 """
 
+from typing import Dict, List, Tuple, Optional, Set
 import pandas as pd
 import numpy as np
-from typing import Tuple, List, Set, Dict
 
-from .geo_v4 import haversine_miles, cached_haversine
-from .utils import (
-    get_facility_lookup,
-    ensure_columns_exist
-)
 from .config_v4 import OptimizationConstants
+from .geo_v4 import haversine_miles
 
 # Progress indicator support
 try:
     from tqdm import tqdm
-
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
 
 
-# ============================================================================
-# OD MATRIX GENERATION (UNCHANGED)
-# ============================================================================
+def get_facility_lookup(facilities: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create indexed facility lookup for efficient access.
+
+    Returns DataFrame indexed by facility_name with key attributes.
+    """
+    return facilities.set_index("facility_name")
+
 
 def build_od_and_direct(
         facilities: pd.DataFrame,
         zips: pd.DataFrame,
-        year_demand: pd.DataFrame,
+        demand: pd.DataFrame,
         injection_distribution: pd.DataFrame
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Generate OD matrix for middle-mile flows and direct injection volumes.
+    Build OD matrix and direct injection volumes from demand data.
 
-    [Documentation unchanged from original]
+    Args:
+        facilities: Facility master data
+        zips: Zip code to facility assignments with population
+        demand: Demand data (already filtered by year in caller)
+        injection_distribution: Origin injection shares by facility
+
+    Returns:
+        od: DataFrame with origin, dest, and volume columns (pkgs_peak_day, pkgs_offpeak_day)
+        direct_day: DataFrame with direct injection (Zone 0) volumes
+        dest_pop: DataFrame with destination population for zone distribution
     """
-    # Validate required columns
-    ensure_columns_exist(
-        facilities,
-        ["facility_name", "type", "lat", "lon", "parent_hub_name",
-         "regional_sort_hub", "is_injection_node"],
-        context="facilities"
-    )
+    fac = get_facility_lookup(facilities)
 
-    ensure_columns_exist(
-        zips,
-        ["zip", "facility_name_assigned", "population"],
-        context="zips"
-    )
+    # Calculate destination shares by population
+    dest_shares = _calculate_destination_shares(zips, fac)
 
-    ensure_columns_exist(
-        year_demand,
-        ["year", "annual_pkgs", "offpeak_pct_of_annual", "peak_pct_of_annual",
-         "middle_mile_share_offpeak", "middle_mile_share_peak"],
-        context="year_demand"
-    )
+    if not dest_shares:
+        raise ValueError("No destination shares calculated - check zips data has valid facility_name_assigned values")
 
-    # Prepare facilities lookup
-    fac = facilities.drop_duplicates(subset=["facility_name"]).reset_index(drop=True)
-    fac["type"] = fac["type"].str.lower()
+    # Build destination population DataFrame
+    if not zips.empty:
+        dest_pop = zips.groupby('facility_name_assigned')['population'].sum().reset_index()
+        dest_pop.columns = ['dest', 'population']
+    else:
+        dest_pop = pd.DataFrame(columns=['dest', 'population'])
 
-    # Calculate destination population shares
-    z = zips[["zip", "facility_name_assigned", "population"]].drop_duplicates(subset=["zip"]).copy()
-    pop_by_dest = z.groupby("facility_name_assigned", as_index=False)["population"].sum()
-    pop_by_dest["dest_pop_share"] = pop_by_dest["population"] / pop_by_dest["population"].sum()
+    # Get demand parameters
+    if demand.empty:
+        raise ValueError("Demand data is empty")
 
-    # Extract demand parameters
-    year_val = int(year_demand["year"].iloc[0])
-    annual_total = float(year_demand["annual_pkgs"].sum())
-    off_pct = float(year_demand["offpeak_pct_of_annual"].iloc[0])
-    peak_pct = float(year_demand["peak_pct_of_annual"].iloc[0])
-    mm_off = float(year_demand["middle_mile_share_offpeak"].iloc[0])
-    mm_peak = float(year_demand["middle_mile_share_peak"].iloc[0])
+    demand_row = demand.iloc[0]
 
-    # Build direct injection volumes
-    direct = pop_by_dest.rename(columns={"facility_name_assigned": "dest"}).copy()
-    direct["year"] = year_val
-    direct["dir_pkgs_offpeak_day"] = annual_total * off_pct * (1.0 - mm_off) * direct["dest_pop_share"]
-    direct["dir_pkgs_peak_day"] = annual_total * peak_pct * (1.0 - mm_peak) * direct["dest_pop_share"]
+    # Required columns - matches input file structure
+    required_demand_cols = {
+        'annual_pkgs',
+        'offpeak_pct_of_annual',
+        'peak_pct_of_annual',
+        'middle_mile_share_peak',
+        'middle_mile_share_offpeak'
+    }
+    missing = required_demand_cols - set(demand.columns)
+    if missing:
+        raise ValueError(f"Demand sheet missing required columns: {sorted(missing)}")
 
-    # Build injection distribution (origin shares)
-    inj = injection_distribution[["facility_name", "absolute_share"]].copy()
-    inj = inj.merge(
-        fac[["facility_name", "is_injection_node", "type", "parent_hub_name"]],
-        on="facility_name",
-        how="left",
-        validate="many_to_one"
-    )
+    # Calculate daily packages from annual totals
+    annual_pkgs = float(demand_row['annual_pkgs'])
+    offpeak_pct = float(demand_row['offpeak_pct_of_annual'])
+    peak_pct = float(demand_row['peak_pct_of_annual'])
+    mm_share_peak = float(demand_row['middle_mile_share_peak'])
+    mm_share_offpeak = float(demand_row['middle_mile_share_offpeak'])
 
-    # Validate injection facilities exist
-    if inj["is_injection_node"].isna().any():
-        missing = inj.loc[inj["is_injection_node"].isna(), "facility_name"].unique().tolist()
-        raise ValueError(f"injection_distribution facilities not found in facilities: {missing}")
+    peak_pkgs = annual_pkgs * peak_pct
+    offpeak_pkgs = annual_pkgs * offpeak_pct
 
-    # Filter to valid injection origins (hub/hybrid with is_injection_node=1)
-    valid_origin_types = ["hub", "hybrid"]
-    inj = inj[
-        (inj["is_injection_node"].astype(int) == 1) &
-        (inj["type"].isin(valid_origin_types))
-        ].copy()
+    if annual_pkgs == 0:
+        raise ValueError("No package volume found in demand data (annual_pkgs = 0)")
 
-    if inj.empty:
-        raise ValueError(
-            "No valid injection origins found. "
-            "Ensure hub/hybrid facilities have is_injection_node=1"
-        )
+    if injection_distribution.empty:
+        raise ValueError("injection_distribution is empty")
 
-    # Normalize injection shares
-    inj["abs_w"] = pd.to_numeric(inj["absolute_share"], errors="coerce").fillna(0.0)
-    total_w = float(inj["abs_w"].sum())
+    od_rows = []
+    direct_rows = []
 
-    if total_w <= OptimizationConstants.EPSILON:
-        raise ValueError("injection_distribution.absolute_share must sum > 0")
+    # Process each origin from injection distribution
+    for _, inj_row in injection_distribution.iterrows():
+        origin = inj_row['facility_name']
+        inj_share = float(inj_row['absolute_share'])
 
-    inj["inj_share"] = inj["abs_w"] / total_w
-    inj = inj[["facility_name", "inj_share"]].rename(columns={"facility_name": "origin"})
+        if inj_share < 0.0001:
+            continue
 
-    # Create OD grid (all origin-destination combinations)
-    dest2 = pop_by_dest.rename(columns={"facility_name_assigned": "dest"})[["dest", "dest_pop_share"]]
-    grid = inj.assign(_k=1).merge(dest2.assign(_k=1), on="_k").drop(columns="_k")
+        # Calculate origin's share of middle-mile volume
+        origin_peak_mm = peak_pkgs * mm_share_peak * inj_share
+        origin_offpeak_mm = offpeak_pkgs * mm_share_offpeak * inj_share
 
-    # Calculate OD volumes
-    od = grid.copy()
-    od["pkgs_offpeak_day"] = annual_total * off_pct * mm_off * od["inj_share"] * od["dest_pop_share"]
-    od["pkgs_peak_day"] = annual_total * peak_pct * mm_peak * od["inj_share"] * od["dest_pop_share"]
+        # Distribute to destinations by population share
+        for dest, dest_share in dest_shares.items():
+            peak_vol = origin_peak_mm * dest_share
+            offpeak_vol = origin_offpeak_mm * dest_share
 
-    # Apply O=D business rules
-    fac_types = fac.set_index("facility_name")["type"].to_dict()
+            if peak_vol < 0.01 and offpeak_vol < 0.01:
+                continue
 
-    od_filtered = []
-    for _, row in od.iterrows():
-        origin = row["origin"]
-        dest = row["dest"]
+            # Skip O=D unless hybrid facility
+            if origin == dest:
+                if origin in fac.index:
+                    fac_type = str(fac.at[origin, 'type']).lower()
+                    if fac_type != 'hybrid':
+                        continue
+                else:
+                    continue
 
-        if origin == dest:
-            # O=D: Only allowed for hybrid facilities
-            origin_type = fac_types.get(origin, "").lower()
-            if origin_type == "hybrid":
-                od_filtered.append(row)
-            # Else: skip O=D for hub/launch facilities
-        else:
-            # O≠D: Always allowed
-            od_filtered.append(row)
+            od_rows.append({
+                'origin': origin,
+                'dest': dest,
+                'pkgs_peak_day': peak_vol,
+                'pkgs_offpeak_day': offpeak_vol
+            })
 
-    od = pd.DataFrame(od_filtered).reset_index(drop=True)
+    # Direct injection (Zone 0) - distributed by population to destinations
+    direct_peak = peak_pkgs * (1 - mm_share_peak)
+    direct_offpeak = offpeak_pkgs * (1 - mm_share_offpeak)
 
-    return od, direct, pop_by_dest
+    for dest, dest_share in dest_shares.items():
+        peak_vol = direct_peak * dest_share
+        offpeak_vol = direct_offpeak * dest_share
+
+        if peak_vol < 0.01 and offpeak_vol < 0.01:
+            continue
+
+        direct_rows.append({
+            'dest': dest,
+            'dir_pkgs_peak_day': peak_vol,
+            'dir_pkgs_offpeak_day': offpeak_vol
+        })
+
+    od = pd.DataFrame(od_rows)
+    direct_day = pd.DataFrame(direct_rows)
+
+    # Ensure expected columns exist even if empty
+    if od.empty:
+        od = pd.DataFrame(columns=['origin', 'dest', 'pkgs_peak_day', 'pkgs_offpeak_day'])
+
+    if direct_day.empty:
+        direct_day = pd.DataFrame(columns=['dest', 'dir_pkgs_peak_day', 'dir_pkgs_offpeak_day'])
+
+    # Aggregate duplicate OD pairs (can happen with multiple injection sources)
+    if not od.empty:
+        od = od.groupby(['origin', 'dest'], as_index=False).agg({
+            'pkgs_peak_day': 'sum',
+            'pkgs_offpeak_day': 'sum'
+        })
+
+    if not direct_day.empty:
+        direct_day = direct_day.groupby('dest', as_index=False).agg({
+            'dir_pkgs_peak_day': 'sum',
+            'dir_pkgs_offpeak_day': 'sum'
+        })
+
+    print(f"  OD matrix built: {len(od)} pairs from {len(injection_distribution)} origins to {len(dest_shares)} destinations")
+
+    return od, direct_day, dest_pop
 
 
-# ============================================================================
-# PATH GENERATION - COMPLETE REWRITE FOR CONSISTENCY
-# ============================================================================
+def _calculate_destination_shares(
+        zips: pd.DataFrame,
+        fac: pd.DataFrame
+) -> Dict[str, float]:
+    """Calculate destination share by population for each delivery facility."""
+    if zips.empty:
+        # Fallback: equal distribution to all facilities with last-mile capability
+        delivery_facs = [f for f in fac.index
+                        if str(fac.at[f, 'type']).lower() in ('hybrid', 'launch')]
+        n = len(delivery_facs)
+        return {f: 1.0/n for f in delivery_facs} if n > 0 else {}
+
+    # Group population by assigned facility
+    pop_by_fac = zips.groupby('facility_name_assigned')['population'].sum()
+    total_pop = pop_by_fac.sum()
+
+    if total_pop == 0:
+        return {}
+
+    return (pop_by_fac / total_pop).to_dict()
+
 
 def candidate_paths(
         od: pd.DataFrame,
         facilities: pd.DataFrame,
+        around_factor: float
 ) -> pd.DataFrame:
     """
-    Generate candidate paths with REGIONAL HUB CONSISTENCY.
+    Generate MULTIPLE candidate paths per OD pair for MILP optimization.
 
-    KEY PRINCIPLE: All destinations in same region should route through
-    their regional hub from any given origin.
+    This is the critical function for network optimization. It generates:
+    - Direct paths (O → D)
+    - 1-touch paths (O → H → D) through each valid intermediate hub
+    - 2-touch paths (O → H1 → H2 → D) through valid hub combinations
+    - 3-touch paths (O → H1 → H2 → H3 → D) for transcontinental routes
 
-    This ensures:
-    - PHL→LAX1, PHL→LAX2, PHL→LAX3 all route via same hub (e.g., ONT)
-    - No inconsistent routing (e.g., PHL→IND→LAX3)
-    - Network topology is respected
-
-    Path Generation Algorithm:
-    --------------------------
-    1. Build regional hub hierarchy
-    2. For each origin:
-        a. Identify regional hubs that serve destinations
-        b. Determine THE canonical path from origin to each regional hub
-        c. For all destinations in that region, use same path to hub
-        d. Extend path to specific destination if needed
-
-    Special Handling:
-    -----------------
-    - O=D paths: Single-facility path (O → D where O=D)
-    - Secondary hubs: Must route through parent hub first
-    - Launch facilities: Cannot be intermediate stops
+    The MILP then selects the optimal path for each OD considering:
+    - Arc consolidation benefits (multiple ODs sharing arcs)
+    - Total network cost
+    - Hub capacity constraints
 
     Args:
-        od: OD matrix with origin, dest, and volume columns
+        od: OD matrix with origin, dest, pkgs_day columns
         facilities: Facility master data
+        around_factor: Maximum path distance as multiple of direct distance.
+            E.g., 1.5 means path can be at most 50% longer than direct route.
+            Paths exceeding this are filtered out as "around the world" routes.
+            Must come from run_settings.path_around_the_world_factor.
 
     Returns:
         DataFrame with columns:
             - origin, dest: OD pair identifiers
-            - path_type: Classification (direct, 1_touch, 2_touch, etc.)
-            - path_nodes: Tuple of facilities in path
-            - path_str: String representation "O->I->D"
+            - path_type: Classification (direct, 1_touch, 2_touch, 3_touch)
+            - path_nodes: List of facilities in path
+            - path_str: String representation "O->H1->H2->D"
             - strategy_hint: Optional strategy override (None = use global)
+            - path_miles: Total path distance
+            - direct_miles: Direct O→D distance
+            - circuity_ratio: path_miles / direct_miles
     """
     fac = get_facility_lookup(facilities)
 
-    # Build regional hub hierarchy
-    region_hierarchy = _build_region_hierarchy(fac)
+    # Get valid intermediate hubs (hub or hybrid, not launch-only)
+    valid_hubs = _get_valid_intermediate_hubs(fac)
 
-    # Build facility relationships
-    parent_map = {}
-    for facility_name in fac.index:
-        parent_hub = fac.at[facility_name, "parent_hub_name"]
-        if pd.isna(parent_hub) or parent_hub == "":
-            parent_hub = facility_name
-        parent_map[facility_name] = parent_hub
+    # Pre-compute distances between all facility pairs for efficiency
+    distance_cache = _build_distance_cache(fac)
 
     rows = []
 
+    # Get unique OD pairs
+    od_pairs = od[['origin', 'dest']].drop_duplicates()
+
     # Progress indicator
     if HAS_TQDM:
-        od_iterator = tqdm(od.iterrows(), total=len(od), desc="Generating paths")
+        od_iterator = tqdm(od_pairs.iterrows(), total=len(od_pairs),
+                          desc="Generating candidate paths")
     else:
-        od_iterator = od.iterrows()
+        od_iterator = od_pairs.iterrows()
 
-    # Process each OD pair
     for _, od_row in od_iterator:
-        origin = od_row["origin"]
-        dest = od_row["dest"]
+        origin = od_row['origin']
+        dest = od_row['dest']
 
-        # Generate path(s) for this OD pair
-        paths = _generate_paths_for_od(
-            origin, dest, fac, region_hierarchy, parent_map
+        # Generate all candidate paths for this OD
+        paths = _generate_all_paths_for_od(
+            origin=origin,
+            dest=dest,
+            fac=fac,
+            valid_hubs=valid_hubs,
+            distance_cache=distance_cache,
+            around_factor=around_factor
         )
 
-        for path_nodes in paths:
-            # Classify path by number of facilities
-            num_facilities = len(path_nodes)
-            if num_facilities == 1:
-                path_type = "direct"  # O=D
-            elif num_facilities == 2:
-                path_type = "direct"
-            elif num_facilities == 3:
-                path_type = "1_touch"
-            elif num_facilities == 4:
-                path_type = "2_touch"
-            elif num_facilities == 5:
-                path_type = "3_touch"
-            else:
-                path_type = "4_touch"
-
+        for path_data in paths:
             rows.append({
-                "origin": origin,
-                "dest": dest,
-                "path_type": path_type,
-                "path_nodes": list(path_nodes),
-                "path_str": "->".join(path_nodes),
-                "strategy_hint": None
+                'origin': origin,
+                'dest': dest,
+                **path_data
             })
 
-    # Create DataFrame from collected rows
     df = pd.DataFrame(rows)
 
     if df.empty:
         return df
 
-    # Validate paths (no launch facilities as intermediates)
-    def validate_path_nodes(path_nodes: tuple) -> bool:
-        """Ensure no launch facilities in intermediate positions."""
-        if len(path_nodes) <= 2:
-            return True
+    # Deduplicate paths (same O, D, path_str)
+    df = df.drop_duplicates(subset=['origin', 'dest', 'path_str']).reset_index(drop=True)
 
-        for node in path_nodes[1:-1]:  # Check only intermediate nodes
-            if node in fac.index and fac.at[node, "type"] == "launch":
-                return False
-        return True
-
-    initial_count = len(df)
-    df = df[df["path_nodes"].apply(validate_path_nodes)].reset_index(drop=True)
-
-    removed_count = initial_count - len(df)
-    if removed_count > 0:
-        print(f"  Removed {removed_count} invalid paths (launch facility violations)")
-
-    # Remove duplicate paths
-    df = df.drop_duplicates(subset=["origin", "dest", "path_str"]).reset_index(drop=True)
+    # Log path generation statistics
+    paths_per_od = df.groupby(['origin', 'dest']).size()
+    print(f"Path generation complete:")
+    print(f"  Total OD pairs: {len(paths_per_od)}")
+    print(f"  Total candidate paths: {len(df)}")
+    print(f"  Avg paths per OD: {paths_per_od.mean():.1f}")
+    print(f"  Max paths per OD: {paths_per_od.max()}")
+    print(f"  Path type distribution:")
+    for ptype, count in df['path_type'].value_counts().items():
+        print(f"    {ptype}: {count} ({100*count/len(df):.1f}%)")
 
     return df
 
 
-def _build_region_hierarchy(fac: pd.DataFrame) -> Dict[str, List[str]]:
+def _get_valid_intermediate_hubs(fac: pd.DataFrame) -> Set[str]:
     """
-    Build mapping: regional_hub → [facilities in region]
+    Get set of facilities that can serve as intermediate hubs.
 
-    Returns:
-        Dictionary where keys are regional hubs and values are lists of
-        facilities that belong to that region.
+    Rules:
+    - Must be 'hub' or 'hybrid' facility type
+    - Launch-only facilities cannot be intermediates
     """
-    hierarchy = {}
-
-    for facility in fac.index:
-        region_hub = fac.at[facility, 'regional_sort_hub']
-        if pd.isna(region_hub) or region_hub == '':
-            region_hub = facility
-
-        if region_hub not in hierarchy:
-            hierarchy[region_hub] = []
-        hierarchy[region_hub].append(facility)
-
-    return hierarchy
+    valid = set()
+    for facility_name in fac.index:
+        fac_type = str(fac.at[facility_name, 'type']).lower()
+        if fac_type in ('hub', 'hybrid'):
+            valid.add(facility_name)
+    return valid
 
 
-def _generate_paths_for_od(
+def _build_distance_cache(fac: pd.DataFrame) -> Dict[Tuple[str, str], float]:
+    """
+    Pre-compute haversine distances between all facility pairs.
+
+    Returns dict mapping (fac1, fac2) -> distance_miles
+    """
+    cache = {}
+    facilities_list = list(fac.index)
+
+    for i, f1 in enumerate(facilities_list):
+        lat1, lon1 = fac.at[f1, 'lat'], fac.at[f1, 'lon']
+        for f2 in facilities_list[i:]:  # Only compute upper triangle
+            lat2, lon2 = fac.at[f2, 'lat'], fac.at[f2, 'lon']
+            dist = haversine_miles(lat1, lon1, lat2, lon2)
+            cache[(f1, f2)] = dist
+            cache[(f2, f1)] = dist  # Symmetric
+
+    return cache
+
+
+def _get_distance(
+        f1: str,
+        f2: str,
+        distance_cache: Dict[Tuple[str, str], float]
+) -> float:
+    """Get distance between two facilities from cache."""
+    if f1 == f2:
+        return 0.0
+    return distance_cache.get((f1, f2), float('inf'))
+
+
+def _calculate_path_distance(
+        path: List[str],
+        distance_cache: Dict[Tuple[str, str], float]
+) -> float:
+    """Calculate total distance of a path."""
+    if len(path) < 2:
+        return 0.0
+
+    total = 0.0
+    for i in range(len(path) - 1):
+        total += _get_distance(path[i], path[i+1], distance_cache)
+    return total
+
+
+def _generate_all_paths_for_od(
         origin: str,
         dest: str,
         fac: pd.DataFrame,
-        region_hierarchy: Dict[str, List[str]],
-        parent_map: Dict[str, str]
-) -> List[List[str]]:
+        valid_hubs: Set[str],
+        distance_cache: Dict[Tuple[str, str], float],
+        around_factor: float
+) -> List[Dict]:
     """
-    Generate path(s) for a single OD pair with regional hub consistency.
+    Generate candidate paths for a single OD pair - SHORTEST of each path type.
 
-    Returns:
-        List of paths, where each path is a list of facility names.
-        Typically returns 1 path (the canonical path through regional hubs).
+    Returns at most 4 paths:
+        1. Direct (O → D)
+        2. Best 1-touch (shortest O → H → D)
+        3. Best 2-touch (shortest O → H1 → H2 → D) if direct > 300mi
+        4. Best 3-touch (shortest O → H1 → H2 → H3 → D) if direct > 1000mi
+
+    This gives MILP real choices between consolidation strategies without
+    combinatorial explosion.
     """
-    # Special case: O=D (same facility)
+    paths = []
+
+    direct_miles = _get_distance(origin, dest, distance_cache)
+    max_path_miles = direct_miles * around_factor if direct_miles > 0 else float('inf')
+
+    # Special case: O=D
     if origin == dest:
-        return [[origin]]
+        paths.append(_create_path_data(
+            path_nodes=[origin],
+            path_type='direct',
+            direct_miles=0.0,
+            path_miles=0.0
+        ))
+        return paths
 
-    # Determine destination's regional hub
-    dest_region_hub = fac.at[dest, 'regional_sort_hub']
-    if pd.isna(dest_region_hub) or dest_region_hub == '':
-        dest_region_hub = dest
+    # 1. Direct path (always included)
+    paths.append(_create_path_data(
+        path_nodes=[origin, dest],
+        path_type='direct',
+        direct_miles=direct_miles,
+        path_miles=direct_miles
+    ))
 
-    # Build canonical path from origin to destination's regional hub
-    hub_path = _get_origin_to_region_path(origin, dest_region_hub, fac, parent_map)
+    # 2. Best 1-touch path (O → H → D)
+    best_1touch = None
+    best_1touch_miles = float('inf')
 
-    # Extend path to specific destination if needed
-    if dest == dest_region_hub:
-        # Destination IS the regional hub
-        full_path = hub_path
-    else:
-        # Destination is downstream of regional hub
-        full_path = hub_path + [dest]
+    for hub in valid_hubs:
+        if hub == origin or hub == dest:
+            continue
 
-    # Validate no duplicates
-    if len(full_path) != len(set(full_path)):
-        # Remove duplicates while preserving order
-        seen = set()
-        full_path = [x for x in full_path if not (x in seen or seen.add(x))]
+        path_miles = _get_distance(origin, hub, distance_cache) + \
+                     _get_distance(hub, dest, distance_cache)
 
-    return [full_path]
+        if path_miles <= max_path_miles and path_miles < best_1touch_miles:
+            best_1touch = [origin, hub, dest]
+            best_1touch_miles = path_miles
+
+    if best_1touch:
+        paths.append(_create_path_data(
+            path_nodes=best_1touch,
+            path_type='1_touch',
+            direct_miles=direct_miles,
+            path_miles=best_1touch_miles
+        ))
+
+    # 3. Best 2-touch path (O → H1 → H2 → D)
+    best_2touch = None
+    best_2touch_miles = float('inf')
+
+    for hub1 in valid_hubs:
+        if hub1 == origin or hub1 == dest:
+            continue
+
+        leg1 = _get_distance(origin, hub1, distance_cache)
+        if leg1 >= best_2touch_miles:
+            continue
+
+        for hub2 in valid_hubs:
+            if hub2 == origin or hub2 == dest or hub2 == hub1:
+                continue
+
+            path_miles = leg1 + \
+                         _get_distance(hub1, hub2, distance_cache) + \
+                         _get_distance(hub2, dest, distance_cache)
+
+            if path_miles <= max_path_miles and path_miles < best_2touch_miles:
+                best_2touch = [origin, hub1, hub2, dest]
+                best_2touch_miles = path_miles
+
+    if best_2touch:
+        paths.append(_create_path_data(
+            path_nodes=best_2touch,
+            path_type='2_touch',
+            direct_miles=direct_miles,
+            path_miles=best_2touch_miles
+        ))
+
+    # 4. Best 3-touch path (O → H1 → H2 → H3 → D)
+    best_3touch = None
+    best_3touch_miles = float('inf')
+
+    for hub1 in valid_hubs:
+        if hub1 == origin or hub1 == dest:
+            continue
+
+        leg1 = _get_distance(origin, hub1, distance_cache)
+        if leg1 >= best_3touch_miles:
+            continue
+
+        for hub2 in valid_hubs:
+            if hub2 in (origin, dest, hub1):
+                continue
+
+            leg12 = leg1 + _get_distance(hub1, hub2, distance_cache)
+            if leg12 >= best_3touch_miles:
+                continue
+
+            for hub3 in valid_hubs:
+                if hub3 in (origin, dest, hub1, hub2):
+                    continue
+
+                path_miles = leg12 + \
+                             _get_distance(hub2, hub3, distance_cache) + \
+                             _get_distance(hub3, dest, distance_cache)
+
+                if path_miles <= max_path_miles and path_miles < best_3touch_miles:
+                    best_3touch = [origin, hub1, hub2, hub3, dest]
+                    best_3touch_miles = path_miles
+
+    if best_3touch:
+        paths.append(_create_path_data(
+            path_nodes=best_3touch,
+            path_type='3_touch',
+            direct_miles=direct_miles,
+            path_miles=best_3touch_miles
+        ))
+
+    return paths
 
 
-def _get_origin_to_region_path(
-        origin: str,
-        region_hub: str,
-        fac: pd.DataFrame,
-        parent_map: Dict[str, str]
-) -> List[str]:
+def _create_path_data(
+        path_nodes: List[str],
+        path_type: str,
+        direct_miles: float,
+        path_miles: float
+) -> Dict:
+    """Create standardized path data dictionary."""
+    circuity = path_miles / direct_miles if direct_miles > 0 else 1.0
+
+    return {
+        'path_type': path_type,
+        'path_nodes': list(path_nodes),  # Ensure list type
+        'path_str': '->'.join(path_nodes),
+        'strategy_hint': None,
+        'path_miles': round(path_miles, 1),
+        'direct_miles': round(direct_miles, 1),
+        'circuity_ratio': round(circuity, 3)
+    }
+
+
+def _get_regional_hub(facility: str, fac: pd.DataFrame) -> Optional[str]:
+    """Get regional sort hub for a facility."""
+    if facility not in fac.index:
+        return None
+
+    regional = fac.at[facility, 'regional_sort_hub']
+    if pd.isna(regional) or regional == '':
+        return facility  # Self is regional hub
+    return regional
+
+
+def _get_all_regional_hubs(fac: pd.DataFrame) -> Set[str]:
+    """Get set of all unique regional sort hubs."""
+    hubs = set()
+    for facility in fac.index:
+        regional = fac.at[facility, 'regional_sort_hub']
+        if pd.notna(regional) and regional != '':
+            hubs.add(regional)
+        # Also add facilities that are their own regional hub
+        if str(fac.at[facility, 'type']).lower() in ('hub', 'hybrid'):
+            hubs.add(facility)
+    return hubs
+
+
+def validate_paths(
+        candidates: pd.DataFrame,
+        facilities: pd.DataFrame
+) -> pd.DataFrame:
     """
-    Determine THE canonical path from origin to regional hub.
+    Validate candidate paths against business rules.
 
-    Rules:
-    1. If origin == region_hub: [origin]
-    2. If origin is secondary hub: [origin, parent, region_hub]
-    3. If origin is in different region: [origin, origin_region, region_hub]
-    4. Otherwise: [origin, region_hub]
+    Removes paths that:
+    - Have launch facilities as intermediates
+    - Have duplicate nodes (loops)
+    - Reference non-existent facilities
 
-    Returns:
-        List of facility names representing the canonical path.
+    Returns filtered DataFrame.
     """
-    if origin == region_hub:
-        return [origin]
+    fac = get_facility_lookup(facilities)
+    valid_facilities = set(fac.index)
 
-    path = [origin]
+    def is_valid_path(row) -> bool:
+        nodes = row['path_nodes']
 
-    # Check if origin needs to route through its parent first
-    origin_parent = parent_map.get(origin, origin)
-    if origin_parent != origin and origin_parent != region_hub:
-        path.append(origin_parent)
+        if not isinstance(nodes, list):
+            return False
 
-    # Check if origin needs to route through its regional hub first
-    origin_region = fac.at[origin, 'regional_sort_hub']
-    if pd.isna(origin_region) or origin_region == '':
-        origin_region = origin
+        # Check for duplicates
+        if len(nodes) != len(set(nodes)):
+            return False
 
-    if origin_region != origin and origin_region != region_hub:
-        if origin_region not in path:
-            path.append(origin_region)
+        # Check all facilities exist
+        if not all(n in valid_facilities for n in nodes):
+            return False
 
-    # Finally add destination regional hub if not already there
-    if region_hub not in path:
-        path.append(region_hub)
+        # Check intermediates are not launch-only
+        if len(nodes) > 2:
+            for intermediate in nodes[1:-1]:
+                fac_type = str(fac.at[intermediate, 'type']).lower()
+                if fac_type == 'launch':
+                    return False
 
-    return path
+        return True
 
+    valid_mask = candidates.apply(is_valid_path, axis=1)
+    filtered = candidates[valid_mask].reset_index(drop=True)
 
-# ============================================================================
-# HELPER FUNCTIONS (UNCHANGED)
-# ============================================================================
+    removed = len(candidates) - len(filtered)
+    if removed > 0:
+        print(f"Validation removed {removed} invalid paths")
 
-def summarize_od_matrix(od: pd.DataFrame) -> pd.Series:
-    """Generate summary statistics for OD matrix."""
-    summary = pd.Series({
-        'total_od_pairs': len(od),
-        'unique_origins': od['origin'].nunique(),
-        'unique_destinations': od['dest'].nunique(),
-        'total_offpeak_pkgs': od['pkgs_offpeak_day'].sum(),
-        'total_peak_pkgs': od['pkgs_peak_day'].sum(),
-        'avg_pkgs_per_od_offpeak': od['pkgs_offpeak_day'].mean(),
-        'avg_pkgs_per_od_peak': od['pkgs_peak_day'].mean(),
-    })
-
-    return summary
+    return filtered
 
 
-def summarize_paths(paths: pd.DataFrame) -> pd.Series:
-    """Generate summary statistics for candidate paths."""
-    if paths.empty:
-        return pd.Series()
+def add_od_volumes_to_candidates(
+        candidates: pd.DataFrame,
+        od: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Join OD volume data to candidate paths.
 
-    path_type_counts = paths['path_type'].value_counts().to_dict()
+    Each candidate path gets the pkgs_day from its corresponding OD pair.
+    """
+    # Get volume by OD pair
+    od_vols = od.groupby(['origin', 'dest'])['pkgs_day'].sum().reset_index()
 
-    summary = pd.Series({
-        'total_paths': len(paths),
-        'unique_od_pairs': paths.groupby(['origin', 'dest']).ngroups,
-        'avg_paths_per_od': len(paths) / max(paths.groupby(['origin', 'dest']).ngroups, 1),
-        **{f'paths_{k}': v for k, v in path_type_counts.items()}
-    })
+    # Merge to candidates
+    merged = candidates.merge(
+        od_vols,
+        on=['origin', 'dest'],
+        how='left'
+    )
 
-    return summary
+    # Fill missing volumes with 0
+    merged['pkgs_day'] = merged['pkgs_day'].fillna(0)
+
+    return merged

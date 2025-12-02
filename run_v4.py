@@ -277,9 +277,12 @@ def main(input_path: str, output_dir: str):
             print("\n2. Generating candidate paths...")
 
             try:
+                around_factor = float(run_settings_dict["path_around_the_world_factor"])
+
                 paths = candidate_paths(
                     od,
                     dfs["facilities"],
+                    around_factor
                 )
             except Exception as e:
                 print(f"  ERROR: Path generation failed: {e}")
