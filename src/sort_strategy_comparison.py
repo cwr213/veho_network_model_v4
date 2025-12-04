@@ -240,7 +240,10 @@ def _build_facility_sort_comparison(
         timing_params: Dict
 ) -> pd.DataFrame:
     """
-    Build facility-level sort point comparison.
+    Build facility-level sort point utilization for optimized scenario.
+
+    Shows actual sort points used vs capacity constraint.
+    Baseline is unconstrained so not meaningful to compare utilization.
     """
     from .utils import get_facility_lookup
 
@@ -254,30 +257,35 @@ def _build_facility_sort_comparison(
     facility_rows = []
 
     for facility in hub_facilities:
-        baseline_points = _calculate_facility_sort_points(
-            facility, baseline_od, fac_lookup, sort_points_per_dest
-        )
+        if facility not in fac_lookup.index:
+            continue
 
+        # Only calculate optimized (constrained) scenario
         optimized_points = _calculate_facility_sort_points(
             facility, optimized_od, fac_lookup, sort_points_per_dest
         )
 
-        points_saved = baseline_points - optimized_points
+        max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity']
+        if pd.isna(max_capacity) or max_capacity <= 0:
+            continue  # Skip facilities without capacity constraint
 
-        max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity'] if facility in fac_lookup.index else 0
-
-        baseline_util = safe_divide(baseline_points, max_capacity)
+        max_capacity = float(max_capacity)
         optimized_util = safe_divide(optimized_points, max_capacity)
+
+        # Get sort level breakdown for this facility
+        origin_ods = optimized_od[optimized_od['origin'] == facility]
+        sort_counts = origin_ods['chosen_sort_level'].value_counts().to_dict() if not origin_ods.empty else {}
 
         facility_rows.append({
             'facility': facility,
-            'max_capacity': max_capacity,
-            'baseline_points_used': round(baseline_points, 1),
-            'baseline_utilization_pct': round(baseline_util, 4),
-            'optimized_points_used': round(optimized_points, 1),
-            'optimized_utilization_pct': round(optimized_util, 4),
-            'points_freed': round(points_saved, 1),
-            'capacity_freed_pct': round(safe_divide(points_saved, max_capacity), 4)
+            'max_sort_capacity': max_capacity,
+            'sort_points_used': round(optimized_points, 1),
+            'utilization_pct': round(optimized_util, 4),
+            'headroom': round(max_capacity - optimized_points, 1),
+            'num_region': sort_counts.get('region', 0),
+            'num_market': sort_counts.get('market', 0),
+            'num_sort_group': sort_counts.get('sort_group', 0),
+            'total_ods': len(origin_ods)
         })
 
     df = pd.DataFrame(facility_rows)
@@ -285,7 +293,7 @@ def _build_facility_sort_comparison(
     if df.empty:
         return df
 
-    return df.sort_values('points_freed', ascending=False)
+    return df.sort_values('utilization_pct', ascending=False)
 
 
 def _calculate_facility_sort_points(
@@ -296,6 +304,13 @@ def _calculate_facility_sort_points(
 ) -> float:
     """
     Calculate total sort points used at a facility.
+
+    Sort points by level:
+    - region: 1 point per unique regional_sort_hub
+    - market: 1 point per unique destination
+    - sort_group: last_mile_sort_groups_count points per destination
+
+    All multiplied by sort_points_per_dest from config.
     """
     origin_ods = od_df[od_df['origin'] == facility]
 
@@ -340,8 +355,9 @@ def _calculate_facility_sort_points(
 
     return total_points
 
-def _calculate_sort_distribution(od_df: pd.DataFrame) -> Dict[str, float]:
 
+def _calculate_sort_distribution(od_df: pd.DataFrame) -> Dict[str, float]:
+    """Calculate sort level distribution by package volume."""
     if od_df.empty or 'chosen_sort_level' not in od_df.columns:
         return {
             'region_pct': 0.0,
@@ -387,9 +403,9 @@ def create_comparison_summary_report(
         return "No comparison data available"
 
     lines = []
-    lines.append("=" * 100)
+    lines.append("=" * 130)
     lines.append("SORT STRATEGY COMPARISON SUMMARY")
-    lines.append("=" * 100)
+    lines.append("=" * 130)
     lines.append("")
 
     for _, row in comparison_summary.iterrows():
@@ -397,29 +413,42 @@ def create_comparison_summary_report(
                      f"Optimized: {row['optimized']:<15} Delta: {row['delta']:<15}")
 
     lines.append("")
-    lines.append("=" * 100)
+    lines.append("=" * 130)
     lines.append("")
 
     if not facility_comparison.empty:
-        lines.append("FACILITY SORT POINT COMPARISON:")
+        lines.append("FACILITY SORT POINT UTILIZATION (Optimized Scenario):")
         lines.append("")
-        lines.append(f"{'Facility':<15} {'Baseline Util%':<18} {'Optimized Util%':<18} "
-                     f"{'Points Freed':<15}")
-        lines.append("-" * 100)
+        lines.append(f"{'Facility':<12} {'Max Cap':<10} {'Pts Used':<12} {'Util%':<10} "
+                     f"{'Headroom':<10} {'Region':<8} {'Market':<8} {'SortGrp':<8} {'ODs':<6}")
+        lines.append("-" * 130)
 
-        for _, row in facility_comparison.head(10).iterrows():
+        for _, row in facility_comparison.iterrows():
             lines.append(
-                f"{row['facility']:<15} "
-                f"{row['baseline_utilization_pct']:>16.1f}%  "
-                f"{row['optimized_utilization_pct']:>16.1f}%  "
-                f"{row['points_freed']:>13.1f}"
+                f"{row['facility']:<12} "
+                f"{row['max_sort_capacity']:>8.0f}  "
+                f"{row['sort_points_used']:>10.1f}  "
+                f"{row['utilization_pct']*100:>8.1f}%  "
+                f"{row['headroom']:>8.1f}  "
+                f"{row['num_region']:>6}  "
+                f"{row['num_market']:>6}  "
+                f"{row['num_sort_group']:>6}  "
+                f"{row['total_ods']:>4}"
             )
 
-        total_freed = facility_comparison['points_freed'].sum()
-        lines.append("-" * 100)
-        lines.append(f"{'TOTAL':<15} {'':>16}  {'':>16}  {total_freed:>13.1f}")
+        lines.append("-" * 130)
+
+        # Summary stats
+        avg_util = facility_comparison['utilization_pct'].mean() * 100
+        max_util = facility_comparison['utilization_pct'].max() * 100
+        total_headroom = facility_comparison['headroom'].sum()
+
+        lines.append(f"")
+        lines.append(f"  Average utilization: {avg_util:.1f}%")
+        lines.append(f"  Max utilization: {max_util:.1f}%")
+        lines.append(f"  Total headroom: {total_headroom:.0f} points")
 
     lines.append("")
-    lines.append("=" * 100)
+    lines.append("=" * 130)
 
     return "\n".join(lines)
