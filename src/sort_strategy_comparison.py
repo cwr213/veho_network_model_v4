@@ -154,7 +154,7 @@ def run_sort_strategy_comparison(
         print(f"  All OD pairs use same sort level in both scenarios")
 
     facility_comparison = _build_facility_sort_comparison(
-        baseline_od, optimized_od, facilities, timing_params
+        baseline_od, optimized_od, facilities, timing_params, scenario_row
     )
 
     sort_dist_baseline = _calculate_sort_distribution(baseline_od)
@@ -237,7 +237,8 @@ def _build_facility_sort_comparison(
         baseline_od: pd.DataFrame,
         optimized_od: pd.DataFrame,
         facilities: pd.DataFrame,
-        timing_params: Dict
+        timing_params: Dict,
+        scenario_row: pd.Series = None
 ) -> pd.DataFrame:
     """
     Build facility-level sort point utilization for optimized scenario.
@@ -250,6 +251,13 @@ def _build_facility_sort_comparison(
     fac_lookup = get_facility_lookup(facilities)
     sort_points_per_dest = float(timing_params['sort_points_per_destination'])
 
+    # Check for scenario-level capacity override
+    scenario_capacity_override = None
+    if scenario_row is not None and 'max_sort_points_capacity' in scenario_row.index:
+        override_val = scenario_row['max_sort_points_capacity']
+        if pd.notna(override_val) and override_val > 0:
+            scenario_capacity_override = float(override_val)
+
     hub_facilities = facilities[
         facilities['type'].str.lower().isin(['hub', 'hybrid'])
     ]['facility_name'].unique()
@@ -260,32 +268,36 @@ def _build_facility_sort_comparison(
         if facility not in fac_lookup.index:
             continue
 
-        # Only calculate optimized (constrained) scenario
-        optimized_points = _calculate_facility_sort_points(
+        # Calculate optimized points with breakdown
+        points_breakdown = _calculate_facility_sort_points_breakdown(
             facility, optimized_od, fac_lookup, sort_points_per_dest
         )
 
-        max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity']
-        if pd.isna(max_capacity) or max_capacity <= 0:
-            continue  # Skip facilities without capacity constraint
+        # Use scenario override if available, else facility-level
+        if scenario_capacity_override is not None:
+            max_capacity = scenario_capacity_override
+        else:
+            max_capacity = fac_lookup.at[facility, 'max_sort_points_capacity']
+            if pd.isna(max_capacity) or max_capacity <= 0:
+                continue  # Skip facilities without capacity constraint
+            max_capacity = float(max_capacity)
 
-        max_capacity = float(max_capacity)
-        optimized_util = safe_divide(optimized_points, max_capacity)
-
-        # Get sort level breakdown for this facility
-        origin_ods = optimized_od[optimized_od['origin'] == facility]
-        sort_counts = origin_ods['chosen_sort_level'].value_counts().to_dict() if not origin_ods.empty else {}
+        total_points = points_breakdown['total']
+        optimized_util = safe_divide(total_points, max_capacity)
 
         facility_rows.append({
             'facility': facility,
             'max_sort_capacity': max_capacity,
-            'sort_points_used': round(optimized_points, 1),
+            'sort_points_used': round(total_points, 1),
             'utilization_pct': round(optimized_util, 4),
-            'headroom': round(max_capacity - optimized_points, 1),
-            'num_region': sort_counts.get('region', 0),
-            'num_market': sort_counts.get('market', 0),
-            'num_sort_group': sort_counts.get('sort_group', 0),
-            'total_ods': len(origin_ods)
+            'headroom': round(max_capacity - total_points, 1),
+            'region_pts': round(points_breakdown['region_pts'], 1),
+            'market_pts': round(points_breakdown['market_pts'], 1),
+            'sort_group_pts': round(points_breakdown['sort_group_pts'], 1),
+            'num_region_hubs': points_breakdown['num_region_hubs'],
+            'num_markets': points_breakdown['num_markets'],
+            'num_sort_group_ods': points_breakdown['num_sort_group_ods'],
+            'total_ods': points_breakdown['total_ods']
         })
 
     df = pd.DataFrame(facility_rows)
@@ -294,6 +306,76 @@ def _build_facility_sort_comparison(
         return df
 
     return df.sort_values('utilization_pct', ascending=False)
+
+
+def _calculate_facility_sort_points_breakdown(
+        facility: str,
+        od_df: pd.DataFrame,
+        fac_lookup: pd.DataFrame,
+        sort_points_per_dest: float
+) -> Dict:
+    """
+    Calculate sort points with full breakdown.
+
+    Returns dict with points and counts for each sort level.
+    """
+    origin_ods = od_df[od_df['origin'] == facility]
+
+    result = {
+        'region_pts': 0.0,
+        'market_pts': 0.0,
+        'sort_group_pts': 0.0,
+        'total': 0.0,
+        'num_region_hubs': 0,
+        'num_markets': 0,
+        'num_sort_group_ods': 0,
+        'total_ods': len(origin_ods)
+    }
+
+    if origin_ods.empty:
+        return result
+
+    regions_served = set()
+    markets_served = set()
+    sort_group_ods = 0
+
+    for _, od_row in origin_ods.iterrows():
+        dest = od_row['dest']
+        sort_level = od_row.get('chosen_sort_level', 'market')
+
+        if sort_level == 'region':
+            if dest in fac_lookup.index:
+                hub = fac_lookup.at[dest, 'regional_sort_hub']
+                if pd.isna(hub) or hub == '':
+                    hub = dest
+                regions_served.add(hub)
+
+        elif sort_level == 'market':
+            markets_served.add(dest)
+
+        elif sort_level == 'sort_group':
+            sort_group_ods += 1
+            if dest not in fac_lookup.index:
+                raise ValueError(
+                    f"Destination facility '{dest}' not found in facilities master data"
+                )
+
+            groups = fac_lookup.at[dest, 'last_mile_sort_groups_count']
+            if pd.isna(groups) or groups <= 0:
+                raise ValueError(
+                    f"Destination facility '{dest}' missing valid last_mile_sort_groups_count."
+                )
+            result['sort_group_pts'] += sort_points_per_dest * groups
+
+    result['region_pts'] = len(regions_served) * sort_points_per_dest
+    result['market_pts'] = len(markets_served) * sort_points_per_dest
+    result['num_region_hubs'] = len(regions_served)
+    result['num_markets'] = len(markets_served)
+    result['num_sort_group_ods'] = sort_group_ods
+
+    result['total'] = result['region_pts'] + result['market_pts'] + result['sort_group_pts']
+
+    return result
 
 
 def _calculate_facility_sort_points(
@@ -312,48 +394,10 @@ def _calculate_facility_sort_points(
 
     All multiplied by sort_points_per_dest from config.
     """
-    origin_ods = od_df[od_df['origin'] == facility]
-
-    if origin_ods.empty:
-        return 0.0
-
-    total_points = 0.0
-
-    regions_served = set()
-    markets_served = set()
-
-    for _, od_row in origin_ods.iterrows():
-        dest = od_row['dest']
-        sort_level = od_row.get('chosen_sort_level', 'market')
-
-        if sort_level == 'region':
-            if dest in fac_lookup.index:
-                hub = fac_lookup.at[dest, 'regional_sort_hub']
-                if pd.isna(hub) or hub == '':
-                    hub = dest
-                regions_served.add(hub)
-
-        elif sort_level == 'market':
-            markets_served.add(dest)
-
-        elif sort_level == 'sort_group':
-            if dest not in fac_lookup.index:
-                raise ValueError(
-                    f"Destination facility '{dest}' not found in facilities master data"
-                )
-
-            groups = fac_lookup.at[dest, 'last_mile_sort_groups_count']
-            if pd.isna(groups) or groups <= 0:
-                raise ValueError(
-                    f"Destination facility '{dest}' missing valid last_mile_sort_groups_count. "
-                    f"Required for sort point calculation."
-                )
-            total_points += sort_points_per_dest * groups
-
-    total_points += len(regions_served) * sort_points_per_dest
-    total_points += len(markets_served) * sort_points_per_dest
-
-    return total_points
+    breakdown = _calculate_facility_sort_points_breakdown(
+        facility, od_df, fac_lookup, sort_points_per_dest
+    )
+    return breakdown['total']
 
 
 def _calculate_sort_distribution(od_df: pd.DataFrame) -> Dict[str, float]:
@@ -403,9 +447,9 @@ def create_comparison_summary_report(
         return "No comparison data available"
 
     lines = []
-    lines.append("=" * 130)
+    lines.append("=" * 140)
     lines.append("SORT STRATEGY COMPARISON SUMMARY")
-    lines.append("=" * 130)
+    lines.append("=" * 140)
     lines.append("")
 
     for _, row in comparison_summary.iterrows():
@@ -413,42 +457,50 @@ def create_comparison_summary_report(
                      f"Optimized: {row['optimized']:<15} Delta: {row['delta']:<15}")
 
     lines.append("")
-    lines.append("=" * 130)
+    lines.append("=" * 140)
     lines.append("")
 
     if not facility_comparison.empty:
         lines.append("FACILITY SORT POINT UTILIZATION (Optimized Scenario):")
         lines.append("")
-        lines.append(f"{'Facility':<12} {'Max Cap':<10} {'Pts Used':<12} {'Util%':<10} "
-                     f"{'Headroom':<10} {'Region':<8} {'Market':<8} {'SortGrp':<8} {'ODs':<6}")
-        lines.append("-" * 130)
+        lines.append(f"{'Facility':<12} {'Max Cap':<10} {'Pts Used':<10} {'Util%':<10} "
+                     f"{'Headroom':<10} {'Rgn Pts':<10} {'Mkt Pts':<10} {'SG Pts':<10} {'ODs':<6}")
+        lines.append("-" * 140)
 
         for _, row in facility_comparison.iterrows():
             lines.append(
                 f"{row['facility']:<12} "
                 f"{row['max_sort_capacity']:>8.0f}  "
-                f"{row['sort_points_used']:>10.1f}  "
+                f"{row['sort_points_used']:>8.1f}  "
                 f"{row['utilization_pct']*100:>8.1f}%  "
                 f"{row['headroom']:>8.1f}  "
-                f"{row['num_region']:>6}  "
-                f"{row['num_market']:>6}  "
-                f"{row['num_sort_group']:>6}  "
+                f"{row['region_pts']:>8.1f}  "
+                f"{row['market_pts']:>8.1f}  "
+                f"{row['sort_group_pts']:>8.1f}  "
                 f"{row['total_ods']:>4}"
             )
 
-        lines.append("-" * 130)
+        lines.append("-" * 140)
 
         # Summary stats
         avg_util = facility_comparison['utilization_pct'].mean() * 100
         max_util = facility_comparison['utilization_pct'].max() * 100
         total_headroom = facility_comparison['headroom'].sum()
+        total_region_pts = facility_comparison['region_pts'].sum()
+        total_market_pts = facility_comparison['market_pts'].sum()
+        total_sg_pts = facility_comparison['sort_group_pts'].sum()
 
         lines.append(f"")
         lines.append(f"  Average utilization: {avg_util:.1f}%")
         lines.append(f"  Max utilization: {max_util:.1f}%")
         lines.append(f"  Total headroom: {total_headroom:.0f} points")
+        lines.append(f"")
+        lines.append(f"  Network sort points breakdown:")
+        lines.append(f"    Region:     {total_region_pts:>8.0f} pts")
+        lines.append(f"    Market:     {total_market_pts:>8.0f} pts")
+        lines.append(f"    Sort Group: {total_sg_pts:>8.0f} pts")
 
     lines.append("")
-    lines.append("=" * 130)
+    lines.append("=" * 140)
 
     return "\n".join(lines)
